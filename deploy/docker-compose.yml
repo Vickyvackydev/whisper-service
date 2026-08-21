@@ -1,0 +1,62 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: whisper_postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgrespassword
+      POSTGRES_DB: whisper_service
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  whisper_api:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.api
+    container_name: whisper_api
+    environment:
+      PORT: 8080
+      DATABASE_URL: postgres://postgres:postgrespassword@postgres:5432/whisper_service?sslmode=disable
+      AUTH_ENABLED: "true"
+      API_TOKENS: "dev-secret-token-change-in-production"
+      ENVIRONMENT: "production"
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  whisper_worker:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.worker
+    container_name: whisper_worker
+    environment:
+      DATABASE_URL: postgres://postgres:postgrespassword@postgres:5432/whisper_service?sslmode=disable
+      WHISPER_MODEL: "large-v3"
+      WHISPER_DEVICE: "cuda"
+      WHISPER_COMPUTE_TYPE: "float16"
+      HF_TOKEN: "${HF_TOKEN}"
+      ENABLE_DIARIZATION: "true"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  postgres_data:

@@ -1,0 +1,23 @@
+[Unit]
+Description=Whisper Transcription Service - Go API & Orchestrator
+After=network.target postgresql.service
+Wants=postgresql.service
+
+[Service]
+Type=simple
+User=whisper
+Group=whisper
+WorkingDirectory=/opt/whisper-service
+EnvironmentFile=/opt/whisper-service/.env
+ExecStart=/opt/whisper-service/bin/server
+Restart=always
+RestartSec=5s
+LimitNOFILE=65536
+
+# Sandboxing & Security
+ProtectSystem=full
+ProtectHome=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

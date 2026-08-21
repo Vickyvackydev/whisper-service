@@ -1,0 +1,32 @@
+# Virtual environment
+venv/
+.venv/
+env/
+ENV/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Whisper local scratch & cache
+.whisper_scratch/
+*.wav
+*.mp3
+*.ogg
+*.raw_audio
+
+# Environment secrets
+.env
+.env.local
+
+# Go build binaries
+bin/
+*.exe
+*.dll
+
+# IDE
+.vscode/
+.idea/
+*.swp

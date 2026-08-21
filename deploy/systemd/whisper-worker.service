@@ -1,0 +1,22 @@
+[Unit]
+Description=Whisper Transcription Service - Python GPU ML Worker
+After=network.target postgresql.service whisper-api.service
+Wants=postgresql.service
+
+[Service]
+Type=simple
+User=whisper
+Group=whisper
+WorkingDirectory=/opt/whisper-service
+EnvironmentFile=/opt/whisper-service/.env
+ExecStart=/opt/whisper-service/venv/bin/python -m ml_worker.worker
+Restart=always
+RestartSec=5s
+
+# CUDA environment
+Environment="CUDA_VISIBLE_DEVICES=0"
+Environment="PYTHONUNBUFFERED=1"
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
