@@ -22,10 +22,16 @@ class SpeakerDiarizer:
             logger.info(f"Loading Diarization pipeline: {self.model_name}...")
             from pyannote.audio import Pipeline
 
-            self.pipeline = Pipeline.from_pretrained(
-                self.model_name,
-                use_auth_token=self.hf_token
-            )
+            try:
+                self.pipeline = Pipeline.from_pretrained(
+                    self.model_name,
+                    token=self.hf_token
+                )
+            except TypeError:
+                self.pipeline = Pipeline.from_pretrained(
+                    self.model_name,
+                    use_auth_token=self.hf_token
+                )
 
             if torch.cuda.is_available() and WorkerConfig.WHISPER_DEVICE != "cpu":
                 self.pipeline.to(torch.device("cuda"))
@@ -50,7 +56,16 @@ class SpeakerDiarizer:
 
         try:
             logger.info(f"Running speaker diarization on {audio_path.name}...")
-            diarization_output = self.pipeline(str(audio_path))
+            import soundfile as sf
+            data, sample_rate = sf.read(str(audio_path), dtype="float32")
+            if len(data.shape) > 1:
+                data = data.mean(axis=1)
+            waveform_tensor = torch.from_numpy(data).unsqueeze(0)
+
+            try:
+                diarization_output = self.pipeline({"waveform": waveform_tensor, "sample_rate": sample_rate})
+            except Exception:
+                diarization_output = self.pipeline(str(audio_path))
             
             turns = []
             # Pyannote annotation: turn (Segment), track, speaker (str)
