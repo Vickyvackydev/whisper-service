@@ -31,12 +31,17 @@ func LoadConfig() (*Config, error) {
 	port := getEnv("PORT", "8080")
 	dbURL := getEnv("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/whisper_service?sslmode=disable")
 	
-	tokensStr := getEnv("API_TOKENS", "dev-secret-token-change-in-production")
+	tokensStr := getEnv("API_TOKENS", "")
+	if tokensStr == "" {
+		tokensStr = getEnv("API_KEY", "")
+	}
 	var tokens []string
-	for _, t := range strings.Split(tokensStr, ",") {
-		trimmed := strings.TrimSpace(t)
-		if trimmed != "" {
-			tokens = append(tokens, trimmed)
+	if tokensStr != "" {
+		for _, t := range strings.Split(tokensStr, ",") {
+			trimmed := strings.TrimSpace(t)
+			if trimmed != "" {
+				tokens = append(tokens, trimmed)
+			}
 		}
 	}
 
