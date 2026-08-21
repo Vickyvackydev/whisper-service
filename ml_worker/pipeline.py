@@ -74,9 +74,9 @@ class InferencePipeline:
             segments = whisper_result["segments"]
             num_speakers = 1
 
-            # 4. Speaker Diarization (if enabled)
+            # 4. Speaker Diarization (always active when diarizer is loaded)
             logger.info(f"[{job_id}] Diarization check: requested={enable_diarization}, model_loaded={self.diarizer.is_loaded}")
-            if enable_diarization and self.diarizer.is_loaded:
+            if self.diarizer.is_loaded:
                 if progress_updater:
                     progress_updater("diarizing", 80)
                 logger.info(f"[{job_id}] Running speaker diarization on {wav_path}...")
@@ -87,10 +87,8 @@ class InferencePipeline:
                     progress_updater("aligning", 90)
                 segments, num_speakers = self.diarizer.assign_speakers(segments, diarization_turns)
                 logger.info(f"[{job_id}] Alignment complete: assigned {num_speakers} unique speakers.")
-            elif enable_diarization and not self.diarizer.is_loaded:
-                logger.warning(f"[{job_id}] Diarization requested but model is not loaded. Defaulting all speakers to SPEAKER_00.")
             else:
-                logger.info(f"[{job_id}] Diarization was not enabled for this job.")
+                logger.warning(f"[{job_id}] Diarizer is not loaded. Defaulting all speakers to SPEAKER_00.")
 
             # 5. Finalizing Result
             if progress_updater:
