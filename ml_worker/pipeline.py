@@ -79,7 +79,7 @@ class InferencePipeline:
                 if progress_updater:
                     progress_updater("diarizing", 80)
                 logger.info(f"[{job_id}] Running speaker diarization...")
-                diarization_turns = self.diarizer.diarize(wav_path)
+                diarization_turns = self.diarizer.diarize(wav_path, min_speakers=2)
                 
                 if progress_updater:
                     progress_updater("aligning", 90)
