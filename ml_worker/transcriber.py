@@ -4,6 +4,7 @@ from typing import Optional, Dict, Any, List
 from faster_whisper import WhisperModel
 import torch
 from ml_worker.config import WorkerConfig
+from ml_worker.normalizer import normalize_segment, normalize_case_numbers_and_slashes
 
 logger = logging.getLogger("ml_worker.transcriber")
 
@@ -93,8 +94,6 @@ class Transcriber:
 
         for seg in segments_iter:
             text = seg.text.strip()
-            if text:
-                full_text_parts.append(text)
 
             words_data = []
             if seg.words:
@@ -112,14 +111,19 @@ class Transcriber:
                             "mapping_type": None
                         })
 
-            segments_list.append({
+            seg_dict = {
                 "start": round(seg.start, 3),
                 "end": round(seg.end, 3),
                 "text": text,
                 "source_text": None,
                 "speaker": "SPEAKER_00", # default, updated by diarizer
                 "words": words_data
-            })
+            }
+            # Normalize legal symbols (e.g. E-slash-21-slash-2025 -> E/21/2025, ill-health, My Lord)
+            seg_dict = normalize_segment(seg_dict)
+            if seg_dict["text"]:
+                full_text_parts.append(seg_dict["text"])
+            segments_list.append(seg_dict)
 
             if progress_callback:
                 progress_callback(seg.end, duration)
