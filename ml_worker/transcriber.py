@@ -79,7 +79,8 @@ class Transcriber:
             vad_parameters=vad_params,
             condition_on_previous_text=False, # Prevents hallucinations / skipping words
             no_speech_threshold=0.6,
-            compression_ratio_threshold=2.4
+            compression_ratio_threshold=2.4,
+            initial_prompt="Suit No., /, Court, Plaintiff, Defendant, Counsel, Your Lordship, Milord."
         )
 
         detected_language = info.language

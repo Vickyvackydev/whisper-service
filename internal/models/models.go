@@ -43,6 +43,26 @@ type TranscriptionRequest struct {
 	IdempotencyKey      *string `json:"idempotency_key,omitempty"`
 }
 
+func (r *TranscriptionRequest) UnmarshalJSON(data []byte) error {
+	type Alias TranscriptionRequest
+	aux := &struct {
+		DiarizationEnabled *bool `json:"diarization_enabled"`
+		Diarize            *bool `json:"diarize"`
+		*Alias
+	}{
+		Alias: (*Alias)(r),
+	}
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+	if aux.DiarizationEnabled != nil {
+		r.EnableDiarization = *aux.DiarizationEnabled
+	} else if aux.Diarize != nil {
+		r.EnableDiarization = *aux.Diarize
+	}
+	return nil
+}
+
 // API Response Payloads
 
 type GenericAPIResponse struct {
