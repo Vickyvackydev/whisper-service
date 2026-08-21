@@ -46,6 +46,7 @@ type TranscriptionRequest struct {
 func (r *TranscriptionRequest) UnmarshalJSON(data []byte) error {
 	type Alias TranscriptionRequest
 	aux := &struct {
+		EnableDiarization  *bool `json:"enable_diarization"`
 		DiarizationEnabled *bool `json:"diarization_enabled"`
 		Diarize            *bool `json:"diarize"`
 		*Alias
@@ -55,10 +56,15 @@ func (r *TranscriptionRequest) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(data, &aux); err != nil {
 		return err
 	}
-	if aux.DiarizationEnabled != nil {
+	if aux.EnableDiarization != nil {
+		r.EnableDiarization = *aux.EnableDiarization
+	} else if aux.DiarizationEnabled != nil {
 		r.EnableDiarization = *aux.DiarizationEnabled
 	} else if aux.Diarize != nil {
 		r.EnableDiarization = *aux.Diarize
+	} else {
+		// Default to TRUE so standard client requests without explicit flag get diarization automatically
+		r.EnableDiarization = true
 	}
 	return nil
 }
