@@ -16,7 +16,16 @@ class WorkerConfig:
     WHISPER_CPU_THREADS: int = int(os.getenv("WHISPER_CPU_THREADS", "4"))
     
     # Speaker Diarization
-    HF_TOKEN: str = os.getenv("HF_TOKEN", "")
+    @classmethod
+    def get_hf_token(cls) -> str:
+        token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN") or ""
+        if not token:
+            hf_cache = Path.home() / ".cache" / "huggingface" / "token"
+            if hf_cache.exists():
+                token = hf_cache.read_text().strip()
+        return token
+
+    HF_TOKEN: str = get_hf_token.__func__(None)
     DIARIZATION_MODEL: str = os.getenv("DIARIZATION_MODEL", "pyannote/speaker-diarization-3.1")
     ENABLE_DIARIZATION_DEFAULT: bool = os.getenv("ENABLE_DIARIZATION", "true").lower() == "true"
     
