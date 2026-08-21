@@ -106,14 +106,32 @@ class SpeakerDiarizer:
                 logger.warning("Diarization output is empty.")
                 return []
 
+            # Handle DiarizeOutput, Annotation, or tuple return types
+            annotation = diarization_output
+            if hasattr(diarization_output, "speaker_diarization"):
+                annotation = diarization_output.speaker_diarization
+            elif hasattr(diarization_output, "annotation"):
+                annotation = diarization_output.annotation
+            elif isinstance(diarization_output, (tuple, list)) and len(diarization_output) > 0:
+                annotation = diarization_output[0]
+
             turns = []
-            # Pyannote annotation extraction
-            for turn, _, speaker in diarization_output.itertracks(yield_label=True):
-                turns.append({
-                    "start": round(float(turn.start), 3),
-                    "end": round(float(turn.end), 3),
-                    "speaker": str(speaker)
-                })
+            if hasattr(annotation, "itertracks"):
+                for turn, _, speaker in annotation.itertracks(yield_label=True):
+                    turns.append({
+                        "start": round(float(turn.start), 3),
+                        "end": round(float(turn.end), 3),
+                        "speaker": str(speaker)
+                    })
+            elif hasattr(annotation, "itersegments"):
+                for seg in annotation.itersegments():
+                    turns.append({
+                        "start": round(float(seg.start), 3),
+                        "end": round(float(seg.end), 3),
+                        "speaker": str(getattr(seg, "label", "SPEAKER_00"))
+                    })
+            else:
+                logger.warning(f"Unknown annotation structure: {type(annotation)}, attrs={dir(annotation)}")
 
             unique_detected = len(set(t["speaker"] for t in turns))
             logger.info(f"Diarization inference successful: detected {len(turns)} turns across {unique_detected} distinct speakers.")
