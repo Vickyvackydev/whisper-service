@@ -65,15 +65,22 @@ class Transcriber:
         target_lang_arg = target_language.lower().strip() if target_language else None
 
         # Determine task ('translate' vs 'transcribe')
-        # Whisper native translation engine translates ANY spoken language audio into English text
-        is_translation_requested = enable_translation or (target_lang_arg and target_lang_arg == "en" and lang_arg != "en")
-        task = "translate" if is_translation_requested else "transcribe"
+        # Note: exscriptai-backend sends language="en" & target_language="en" when UI source is "Auto-Detect" and target is English.
+        is_translation_requested = (
+            enable_translation or 
+            (target_lang_arg == "en") or 
+            (language and language.lower().strip() == "en")
+        )
 
-        # Safeguard: If translation to English is requested, BUT source language is set to 'en' (e.g. user set language=en on French audio),
-        # clear source language so Whisper auto-detects true audio language (e.g. French 'fr') and translates to English cleanly.
-        if is_translation_requested and lang_arg == "en":
-            logger.info("Translation requested but source language set to 'en'. Clearing source language to allow auto-detection.")
-            lang_arg = None
+        if is_translation_requested:
+            task = "translate"
+            # If source language was specified as 'en' (or mapped by exscriptai-backend from auto),
+            # clear it to None so Whisper auto-detects non-English audio (e.g. French 'fr') and translates to English.
+            if lang_arg == "en":
+                logger.info("Translation/target English requested with source 'en'. Auto-detecting spoken audio language.")
+                lang_arg = None
+        else:
+            task = "transcribe"
 
         logger.info(f"Running Whisper inference: task={task}, source_language={lang_arg}, target_language={target_lang_arg or ('en' if task == 'translate' else lang_arg)}")
 
