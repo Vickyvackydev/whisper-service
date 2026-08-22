@@ -39,15 +39,15 @@ func (r *JobRepository) CreateJob(ctx context.Context, req *models.Transcription
 	query := `
 		INSERT INTO transcription_jobs (
 			id, idempotency_key, status, stage, progress, audio_url,
-			enable_diarization, enable_summarization, language,
+			enable_diarization, enable_translation, enable_summarization, language, target_language,
 			transcription_mode, summary_format, callback_url, max_retries
 		) VALUES (
-			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13
+			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15
 		)
 		ON CONFLICT (idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
 		RETURNING 
 			id, idempotency_key, status, stage, progress, audio_url,
-			enable_diarization, enable_summarization, language,
+			enable_diarization, enable_translation, enable_summarization, language, target_language,
 			transcription_mode, summary_format, callback_url,
 			retry_count, max_retries, worker_id, worker_heartbeat_at,
 			error_message, error_details, result, audio_duration,
@@ -60,11 +60,11 @@ func (r *JobRepository) CreateJob(ctx context.Context, req *models.Transcription
 	var job models.Job
 	err := r.db.Pool.QueryRow(ctx, query,
 		jobID, req.IdempotencyKey, initialStatus, initialStage, 0, req.AudioURL,
-		req.EnableDiarization, req.EnableSummarization, req.Language,
+		req.EnableDiarization, req.EnableTranslation, req.EnableSummarization, req.Language, req.TargetLanguage,
 		req.TranscriptionMode, req.SummaryFormat, req.CallbackURL, maxRetries,
 	).Scan(
 		&job.ID, &job.IdempotencyKey, &job.Status, &job.Stage, &job.Progress, &job.AudioURL,
-		&job.EnableDiarization, &job.EnableSummarization, &job.Language,
+		&job.EnableDiarization, &job.EnableTranslation, &job.EnableSummarization, &job.Language, &job.TargetLanguage,
 		&job.TranscriptionMode, &job.SummaryFormat, &job.CallbackURL,
 		&job.RetryCount, &job.MaxRetries, &job.WorkerID, &job.WorkerHeartbeatAt,
 		&job.ErrorMessage, &job.ErrorDetails, &job.Result, &job.AudioDuration,
@@ -100,7 +100,7 @@ func (r *JobRepository) GetJobByID(ctx context.Context, id uuid.UUID) (*models.J
 	query := `
 		SELECT 
 			id, idempotency_key, status, stage, progress, audio_url,
-			enable_diarization, enable_summarization, language,
+			enable_diarization, enable_translation, enable_summarization, language, target_language,
 			transcription_mode, summary_format, callback_url,
 			retry_count, max_retries, worker_id, worker_heartbeat_at,
 			error_message, error_details, result, audio_duration,
@@ -111,7 +111,7 @@ func (r *JobRepository) GetJobByID(ctx context.Context, id uuid.UUID) (*models.J
 	var job models.Job
 	err := r.db.Pool.QueryRow(ctx, query, id).Scan(
 		&job.ID, &job.IdempotencyKey, &job.Status, &job.Stage, &job.Progress, &job.AudioURL,
-		&job.EnableDiarization, &job.EnableSummarization, &job.Language,
+		&job.EnableDiarization, &job.EnableTranslation, &job.EnableSummarization, &job.Language, &job.TargetLanguage,
 		&job.TranscriptionMode, &job.SummaryFormat, &job.CallbackURL,
 		&job.RetryCount, &job.MaxRetries, &job.WorkerID, &job.WorkerHeartbeatAt,
 		&job.ErrorMessage, &job.ErrorDetails, &job.Result, &job.AudioDuration,
@@ -130,7 +130,7 @@ func (r *JobRepository) GetJobByIdempotencyKey(ctx context.Context, key string) 
 	query := `
 		SELECT 
 			id, idempotency_key, status, stage, progress, audio_url,
-			enable_diarization, enable_summarization, language,
+			enable_diarization, enable_translation, enable_summarization, language, target_language,
 			transcription_mode, summary_format, callback_url,
 			retry_count, max_retries, worker_id, worker_heartbeat_at,
 			error_message, error_details, result, audio_duration,
@@ -141,7 +141,7 @@ func (r *JobRepository) GetJobByIdempotencyKey(ctx context.Context, key string) 
 	var job models.Job
 	err := r.db.Pool.QueryRow(ctx, query, key).Scan(
 		&job.ID, &job.IdempotencyKey, &job.Status, &job.Stage, &job.Progress, &job.AudioURL,
-		&job.EnableDiarization, &job.EnableSummarization, &job.Language,
+		&job.EnableDiarization, &job.EnableTranslation, &job.EnableSummarization, &job.Language, &job.TargetLanguage,
 		&job.TranscriptionMode, &job.SummaryFormat, &job.CallbackURL,
 		&job.RetryCount, &job.MaxRetries, &job.WorkerID, &job.WorkerHeartbeatAt,
 		&job.ErrorMessage, &job.ErrorDetails, &job.Result, &job.AudioDuration,

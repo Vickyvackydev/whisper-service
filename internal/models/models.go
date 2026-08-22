@@ -35,8 +35,10 @@ const (
 type TranscriptionRequest struct {
 	AudioURL            string  `json:"audio_url"`
 	EnableDiarization   bool    `json:"enable_diarization"`
+	EnableTranslation   bool    `json:"enable_translation"`
 	EnableSummarization bool    `json:"enable_summarization"`
 	Language            *string `json:"language,omitempty"`
+	TargetLanguage      *string `json:"target_language,omitempty"`
 	TranscriptionMode   string  `json:"transcription_mode"`
 	CallbackURL         *string `json:"callback_url,omitempty"`
 	SummaryFormat       string  `json:"summary_format"`
@@ -49,6 +51,8 @@ func (r *TranscriptionRequest) UnmarshalJSON(data []byte) error {
 		EnableDiarization  *bool `json:"enable_diarization"`
 		DiarizationEnabled *bool `json:"diarization_enabled"`
 		Diarize            *bool `json:"diarize"`
+		EnableTranslation  *bool `json:"enable_translation"`
+		Translate          *bool `json:"translate"`
 		*Alias
 	}{
 		Alias: (*Alias)(r),
@@ -65,6 +69,12 @@ func (r *TranscriptionRequest) UnmarshalJSON(data []byte) error {
 	} else {
 		// Default to TRUE so standard client requests without explicit flag get diarization automatically
 		r.EnableDiarization = true
+	}
+
+	if aux.EnableTranslation != nil {
+		r.EnableTranslation = *aux.EnableTranslation
+	} else if aux.Translate != nil {
+		r.EnableTranslation = *aux.Translate
 	}
 	return nil
 }
@@ -185,8 +195,10 @@ type Job struct {
 	Progress            int              `json:"progress"`
 	AudioURL            string           `json:"audio_url"`
 	EnableDiarization   bool             `json:"enable_diarization"`
+	EnableTranslation   bool             `json:"enable_translation"`
 	EnableSummarization bool             `json:"enable_summarization"`
 	Language            *string          `json:"language"`
+	TargetLanguage      *string          `json:"target_language"`
 	TranscriptionMode   string           `json:"transcription_mode"`
 	SummaryFormat       string           `json:"summary_format"`
 	CallbackURL         *string          `json:"callback_url"`

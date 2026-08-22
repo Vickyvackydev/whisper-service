@@ -43,6 +43,8 @@ class Transcriber:
         self,
         audio_path: Path,
         language: Optional[str] = None,
+        target_language: Optional[str] = None,
+        enable_translation: bool = False,
         mode: str = "fast",
         progress_callback = None
     ) -> Dict[str, Any]:
@@ -59,7 +61,21 @@ class Transcriber:
             beam_size = 3
             temperature = 0.0
 
-        lang_arg = language if (language and language.lower() not in ("auto", "none")) else None
+        lang_arg = language.lower().strip() if (language and language.lower().strip() not in ("auto", "none")) else None
+        target_lang_arg = target_language.lower().strip() if target_language else None
+
+        # Determine task ('translate' vs 'transcribe')
+        # Whisper native translation engine translates ANY spoken language audio into English text
+        is_translation_requested = enable_translation or (target_lang_arg and target_lang_arg == "en" and lang_arg != "en")
+        task = "translate" if is_translation_requested else "transcribe"
+
+        # Safeguard: If translation to English is requested, BUT source language is set to 'en' (e.g. user set language=en on French audio),
+        # clear source language so Whisper auto-detects true audio language (e.g. French 'fr') and translates to English cleanly.
+        if is_translation_requested and lang_arg == "en":
+            logger.info("Translation requested but source language set to 'en'. Clearing source language to allow auto-detection.")
+            lang_arg = None
+
+        logger.info(f"Running Whisper inference: task={task}, source_language={lang_arg}, target_language={target_lang_arg or ('en' if task == 'translate' else lang_arg)}")
 
         # Optimal VAD and decoding parameters for high accuracy & preserving music/vocals
         vad_params = dict(
@@ -72,7 +88,7 @@ class Transcriber:
         segments_iter, info = self.model.transcribe(
             str(audio_path),
             language=lang_arg,
-            task="transcribe",
+            task=task,
             beam_size=beam_size,
             temperature=temperature,
             word_timestamps=True,
@@ -130,13 +146,19 @@ class Transcriber:
 
         full_text = " ".join(full_text_parts)
 
+        actual_target_lang = "en" if task == "translate" else (target_lang_arg or detected_language)
+        trans_method = "whisper_native" if task == "translate" else None
+
         return {
             "segments": segments_list,
             "transcribed_text": full_text,
+            "source_transcribed_text": None,
             "language": detected_language,
             "language_probability": round(language_probability, 3),
             "duration": round(duration, 3),
             "word_count": total_words,
             "model_used": self.model_name,
-            "transcription_mode": mode
+            "transcription_mode": mode,
+            "target_language": actual_target_lang,
+            "translation_method": trans_method
         }

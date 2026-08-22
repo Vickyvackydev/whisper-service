@@ -29,7 +29,9 @@ class InferencePipeline:
         job_id: str,
         audio_url: str,
         enable_diarization: bool = True,
+        enable_translation: bool = False,
         language: Optional[str] = None,
+        target_language: Optional[str] = None,
         transcription_mode: str = "fast",
         progress_updater: Optional[Callable[[str, int], None]] = None
     ) -> Dict[str, Any]:
@@ -57,7 +59,7 @@ class InferencePipeline:
             # 3. Whisper Transcription
             if progress_updater:
                 progress_updater("transcribing", 40)
-            logger.info(f"[{job_id}] Running Whisper inference (mode={transcription_mode})...")
+            logger.info(f"[{job_id}] Running Whisper inference (mode={transcription_mode}, enable_translation={enable_translation}, lang={language}, target={target_language})...")
 
             def transcribe_progress_cb(current_sec, total_sec):
                 if total_sec > 0 and progress_updater:
@@ -67,6 +69,8 @@ class InferencePipeline:
             whisper_result = self.transcriber.transcribe(
                 wav_path,
                 language=language,
+                target_language=target_language,
+                enable_translation=enable_translation,
                 mode=transcription_mode,
                 progress_callback=transcribe_progress_cb
             )
@@ -101,7 +105,7 @@ class InferencePipeline:
                 "segments": segments,
                 "language": whisper_result["language"],
                 "transcribed_text": whisper_result["transcribed_text"],
-                "source_transcribed_text": None,
+                "source_transcribed_text": whisper_result.get("source_transcribed_text"),
                 "transcription_mode": transcription_mode,
                 "model_used": whisper_result["model_used"],
                 "duration": round(audio_duration, 3),
@@ -110,8 +114,8 @@ class InferencePipeline:
                 "processing_time": round(processing_time, 4),
                 "processing_time_formatted": f"{processing_time:.1f}s",
                 "word_count": whisper_result["word_count"],
-                "target_language": None,
-                "translation_method": None
+                "target_language": whisper_result.get("target_language"),
+                "translation_method": whisper_result.get("translation_method")
             }
 
             logger.info(f"[{job_id}] Transcription completed successfully in {processing_time:.2f}s (Audio duration: {audio_duration:.2f}s, RTF: {processing_time/audio_duration:.3f})")

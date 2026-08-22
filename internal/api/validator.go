@@ -75,5 +75,19 @@ func ValidateTranscriptionRequest(req *models.TranscriptionRequest) error {
 		}
 	}
 
+	// Target language code trimming
+	if req.TargetLanguage != nil {
+		trimmedTarget := strings.ToLower(strings.TrimSpace(*req.TargetLanguage))
+		if trimmedTarget != "" {
+			req.TargetLanguage = &trimmedTarget
+			// If target_language is explicitly provided, auto-enable translation if target differs or is en
+			if req.Language == nil || *req.Language != trimmedTarget {
+				req.EnableTranslation = true
+			}
+		} else {
+			req.TargetLanguage = nil
+		}
+	}
+
 	return nil
 }

@@ -119,7 +119,9 @@ class MLWorker:
                     self.db.update_job_progress(job_id, stage, progress, self.config.WORKER_ID)
 
                 enable_diarize = bool(job.get("enable_diarization", False))
+                enable_translate = bool(job.get("enable_translation", False))
                 lang = job.get("language")
+                target_lang = job.get("target_language")
                 mode = job.get("transcription_mode", "fast")
                 callback_url = job.get("callback_url")
 
@@ -128,7 +130,9 @@ class MLWorker:
                         job_id=job_id,
                         audio_url=job["audio_url"],
                         enable_diarization=enable_diarize,
+                        enable_translation=enable_translate,
                         language=lang,
+                        target_language=target_lang,
                         transcription_mode=mode,
                         progress_updater=update_progress
                     )

@@ -60,9 +60,9 @@ class Database:
                     )
                     RETURNING 
                         id, idempotency_key, status, stage, progress, audio_url,
-                        enable_diarization, enable_summarization, language,
-                        transcription_mode, summary_format, callback_url,
-                        retry_count, max_retries;
+                        enable_diarization, enable_translation, enable_summarization,
+                        language, target_language, transcription_mode, summary_format,
+                        callback_url, retry_count, max_retries;
                 """
                 cur.execute(query, (worker_id,))
                 job = cur.fetchone()
