@@ -22,6 +22,9 @@ type Config struct {
 	WebhookMaxAttempts int
 	WebhookTimeout     time.Duration
 	Environment        string
+	RunPodAPIKey       string
+	RunPodPodID        string
+	AutoStartGPU       bool
 }
 
 func LoadConfig() (*Config, error) {
@@ -50,6 +53,10 @@ func LoadConfig() (*Config, error) {
 	maxRetries := getEnvAsInt("MAX_RETRIES", 3)
 	webhookMaxAttempts := getEnvAsInt("WEBHOOK_MAX_ATTEMPTS", 5)
 
+	runpodAPIKey := getEnv("RUNPOD_API_KEY", "")
+	runpodPodID := getEnv("RUNPOD_POD_ID", "")
+	autoStartGPU := getEnvAsBool("AUTO_START_GPU", true)
+
 	return &Config{
 		Port:               port,
 		DatabaseURL:        dbURL,
@@ -63,6 +70,9 @@ func LoadConfig() (*Config, error) {
 		WebhookMaxAttempts: webhookMaxAttempts,
 		WebhookTimeout:     time.Duration(getEnvAsInt("WEBHOOK_TIMEOUT_SECONDS", 15)) * time.Second,
 		Environment:        getEnv("ENVIRONMENT", "development"),
+		RunPodAPIKey:       runpodAPIKey,
+		RunPodPodID:        runpodPodID,
+		AutoStartGPU:       autoStartGPU,
 	}, nil
 }
 

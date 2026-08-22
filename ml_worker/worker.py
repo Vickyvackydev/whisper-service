@@ -99,15 +99,25 @@ class MLWorker:
         self.heartbeat_thread = threading.Thread(target=self.heartbeat_loop, daemon=True)
         self.heartbeat_thread.start()
 
-        logger.info(f"Worker {self.config.WORKER_ID} listening for transcription jobs on PostgreSQL queue...")
+        logger.info(f"Worker {self.config.WORKER_ID} listening for transcription jobs on PostgreSQL queue (Idle shutdown after {self.config.IDLE_SHUTDOWN_MINUTES}m)...")
+        last_active_time = time.time()
 
         while self.is_running:
             try:
                 # 1. Atomic job dequeue
                 job = self.db.dequeue_job(self.config.WORKER_ID)
                 if not job:
+                    idle_seconds = time.time() - last_active_time
+                    if self.config.IDLE_SHUTDOWN_MINUTES > 0 and idle_seconds >= (self.config.IDLE_SHUTDOWN_MINUTES * 60):
+                        logger.info(f"Worker idle for {int(idle_seconds // 60)}m (>= {self.config.IDLE_SHUTDOWN_MINUTES}m threshold). Triggering RunPod auto-stop...")
+                        self.trigger_runpod_auto_stop()
+                        self.stop()
+                        sys.exit(0)
                     time.sleep(self.config.POLL_INTERVAL)
                     continue
+
+                # Reset idle timer when a job is dequeued
+                last_active_time = time.time()
 
                 job_id = str(job["id"])
                 self.current_job_id = job_id
@@ -171,6 +181,38 @@ class MLWorker:
             finally:
                 self.current_job_id = None
                 self.worker_status = "idle"
+
+    def trigger_runpod_auto_stop(self):
+        api_key = self.config.RUNPOD_API_KEY
+        pod_id = self.config.RUNPOD_POD_ID
+        if not api_key or not pod_id:
+            logger.info("RunPod API key or Pod ID not set. Skipping automated podStop mutation.")
+            return
+
+        try:
+            import urllib.request
+            import json
+
+            mutation = f'''
+            mutation {{
+                podStop(input: {{podId: "{pod_id}"}}) {{
+                    id
+                    desiredStatus
+                }}
+            }}
+            '''
+            req_data = json.dumps({"query": mutation}).encode("utf-8")
+            url = f"https://api.runpod.io/graphql?api_key={api_key}"
+            req = urllib.request.Request(
+                url,
+                data=req_data,
+                headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
+                method="POST"
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                logger.info(f"Successfully triggered RunPod podStop mutation for Pod ID: {pod_id} (HTTP {resp.status})")
+        except Exception as e:
+            logger.error(f"Failed to send RunPod podStop mutation: {e}")
 
     def stop(self):
         logger.info("Stopping ML Worker...")

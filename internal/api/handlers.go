@@ -1,8 +1,10 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"log"
 	"net/http"
 	"time"
 
@@ -11,19 +13,23 @@ import (
 	"whisper-service/internal/config"
 	"whisper-service/internal/models"
 	"whisper-service/internal/repository"
+	"whisper-service/internal/supervisor"
 )
 
 type Handler struct {
-	cfg     *config.Config
-	jobRepo *repository.JobRepository
-	db      *repository.DB
+	cfg          *config.Config
+	jobRepo      *repository.JobRepository
+	db           *repository.DB
+	runpodClient *supervisor.RunPodClient
 }
 
 func NewHandler(cfg *config.Config, jobRepo *repository.JobRepository, db *repository.DB) *Handler {
+	runpodClient := supervisor.NewRunPodClient(cfg.RunPodAPIKey, cfg.RunPodPodID)
 	return &Handler{
-		cfg:     cfg,
-		jobRepo: jobRepo,
-		db:      db,
+		cfg:          cfg,
+		jobRepo:      jobRepo,
+		db:           db,
+		runpodClient: runpodClient,
 	}
 }
 
@@ -211,6 +217,21 @@ func (h *Handler) SubmitTranscription(c echo.Context) error {
 	msg := "Transcription job submitted successfully"
 	if isExisting {
 		msg = "Transcription job already exists for the given idempotency key"
+	}
+
+	// Auto-Start GPU Pod if enabled and no active GPU workers are reporting heartbeats
+	if h.cfg.AutoStartGPU && h.runpodClient != nil && h.runpodClient.IsConfigured() {
+		workers, err := h.jobRepo.GetActiveWorkers(c.Request().Context(), 45*time.Second)
+		if err != nil || len(workers) == 0 {
+			log.Printf("[Auto-Start GPU] No active GPU worker detected. Asynchronously resuming RunPod GPU Pod %s...", h.cfg.RunPodPodID)
+			go func() {
+				bgCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+				defer cancel()
+				if err := h.runpodClient.StartPod(bgCtx); err != nil {
+					log.Printf("[Auto-Start GPU Error] Failed to resume RunPod GPU Pod: %v", err)
+				}
+			}()
+		}
 	}
 
 	// Return immediate HTTP 202 Accepted

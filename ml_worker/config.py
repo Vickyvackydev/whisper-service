@@ -39,6 +39,11 @@ class WorkerConfig:
     MAX_AUDIO_DOWNLOAD_BYTES: int = int(os.getenv("MAX_AUDIO_DOWNLOAD_BYTES", str(1024 * 1024 * 1024 * 2)))  # 2 GB
     SCRATCH_DIR: Path = Path(os.getenv("SCRATCH_DIR", os.path.join(os.path.expanduser("~"), ".whisper_scratch")))
 
+    # RunPod Auto-Stop & Cost Management
+    IDLE_SHUTDOWN_MINUTES: int = int(os.getenv("IDLE_SHUTDOWN_MINUTES", "15"))
+    RUNPOD_API_KEY: str = os.getenv("RUNPOD_API_KEY", "")
+    RUNPOD_POD_ID: str = os.getenv("RUNPOD_POD_ID", os.getenv("RUNPOD_POD_ID_ENV", ""))
+
     @classmethod
     def ensure_scratch_dir(cls):
         cls.SCRATCH_DIR.mkdir(parents=True, exist_ok=True)
