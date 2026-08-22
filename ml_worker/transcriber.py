@@ -65,20 +65,20 @@ class Transcriber:
         target_lang_arg = target_language.lower().strip() if target_language else None
 
         # Determine task ('translate' vs 'transcribe')
-        # Note: exscriptai-backend sends language="en" & target_language="en" when UI source is "Auto-Detect" and target is English.
-        is_translation_requested = (
-            enable_translation or 
-            (target_lang_arg == "en") or 
-            (language and language.lower().strip() == "en")
-        )
-
-        if is_translation_requested:
+        # 1. If explicit non-English source language equals target language (e.g. fr -> fr, es -> es), run pure transcription in that language.
+        if lang_arg and target_lang_arg and lang_arg == target_lang_arg and lang_arg != "en":
+            task = "transcribe"
+        # 2. If target language is explicitly English ('en') or translation is requested to English
+        elif target_lang_arg == "en" or (enable_translation and (target_lang_arg is None or target_lang_arg == "en")):
             task = "translate"
-            # If source language was specified as 'en' (or mapped by exscriptai-backend from auto),
-            # clear it to None so Whisper auto-detects non-English audio (e.g. French 'fr') and translates to English.
             if lang_arg == "en":
-                logger.info("Translation/target English requested with source 'en'. Auto-detecting spoken audio language.")
+                # exscriptai-backend maps 'auto' to 'en'. Clear lang_arg to allow auto-detection of true audio language (e.g. French 'fr').
+                logger.info("Target English requested with source 'en'. Auto-detecting spoken audio language.")
                 lang_arg = None
+        # 3. If exscriptai-backend sent language="en" & target_language="en" (UI default for auto-detect + target english)
+        elif lang_arg == "en" and (target_lang_arg is None or target_lang_arg == "en"):
+            task = "translate"
+            lang_arg = None
         else:
             task = "transcribe"
 
