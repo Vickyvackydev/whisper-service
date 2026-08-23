@@ -203,10 +203,15 @@ class MLWorker:
             '''
             req_data = json.dumps({"query": mutation}).encode("utf-8")
             url = f"https://api.runpod.io/graphql?api_key={api_key}"
+            headers = {
+                "Content-Type": "application/json",
+                "api-key": api_key,
+                "Authorization": api_key,
+            }
             req = urllib.request.Request(
                 url,
                 data=req_data,
-                headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
+                headers=headers,
                 method="POST"
             )
             with urllib.request.urlopen(req, timeout=10) as resp:

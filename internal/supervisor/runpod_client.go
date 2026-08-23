@@ -61,7 +61,8 @@ func (c *RunPodClient) StartPod(ctx context.Context) error {
 	}
 
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	req.Header.Set("api-key", c.apiKey)
+	req.Header.Set("Authorization", c.apiKey)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
