@@ -183,51 +183,42 @@ class MLWorker:
                 self.worker_status = "idle"
 
     def trigger_runpod_auto_stop(self):
+        pod_id = self.config.RUNPOD_POD_ID or "yf989jc63uke3g"
         api_key = self.config.RUNPOD_API_KEY
-        pod_id = self.config.RUNPOD_POD_ID
-        if not api_key or not pod_id:
-            logger.info("RunPod API key or Pod ID not set. Skipping automated pod stop.")
-            return
+        
+        logger.info(f"Initiating auto-stop for RunPod Pod ID: {pod_id}...")
 
-        # Attempt 1: RunPod REST API v2 (Official Standard)
+        # Method 1: Native runpodctl CLI tool (built into every RunPod container)
         try:
-            import urllib.request
-            import json
-
-            url = f"https://api.runpod.io/v2/pods/{pod_id}/action"
-            req_data = json.dumps({"action": "stop"}).encode("utf-8")
-            headers = {
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {api_key}",
-            }
-            req = urllib.request.Request(url, data=req_data, headers=headers, method="POST")
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                logger.info(f"Successfully triggered RunPod REST API v2 stop for Pod ID: {pod_id} (HTTP {resp.status})")
+            import subprocess
+            cmd = ["runpodctl", "stop", "pod", pod_id]
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            if res.returncode == 0:
+                logger.info(f"Successfully stopped pod using runpodctl CLI: {res.stdout.strip()}")
                 return
-        except Exception as e:
-            logger.warning(f"REST API v2 stop attempt failed ({e}). Trying GraphQL fallback...")
+            else:
+                logger.warning(f"runpodctl stop pod returned code {res.returncode}: {res.stderr.strip() or res.stdout.strip()}")
+        except Exception as cli_err:
+            logger.warning(f"runpodctl CLI execution failed ({cli_err}). Trying REST API v2...")
 
-        # Attempt 2: GraphQL API fallback
-        try:
-            import urllib.request
-            import json
+        # Method 2: RunPod REST API v2
+        if api_key:
+            try:
+                import urllib.request
+                import json
 
-            mutation = f'''
-            mutation {{
-                podStop(input: {{podId: "{pod_id}"}}) {{
-                    id
-                    desiredStatus
-                }}
-            }}
-            '''
-            req_data = json.dumps({"query": mutation}).encode("utf-8")
-            url = f"https://api.runpod.io/graphql?api_key={api_key}"
-            headers = {"Content-Type": "application/json"}
-            req = urllib.request.Request(url, data=req_data, headers=headers, method="POST")
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                logger.info(f"Successfully triggered RunPod GraphQL podStop for Pod ID: {pod_id} (HTTP {resp.status})")
-        except Exception as e2:
-            logger.error(f"Failed to send RunPod podStop mutation: {e2}")
+                url = f"https://api.runpod.io/v2/pods/{pod_id}/action"
+                req_data = json.dumps({"action": "stop"}).encode("utf-8")
+                headers = {
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {api_key}",
+                }
+                req = urllib.request.Request(url, data=req_data, headers=headers, method="POST")
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    logger.info(f"Successfully triggered RunPod REST API v2 stop for Pod ID: {pod_id} (HTTP {resp.status})")
+                    return
+            except Exception as api_err:
+                logger.error(f"REST API v2 stop failed: {api_err}")
 
     def stop(self):
         logger.info("Stopping ML Worker...")
