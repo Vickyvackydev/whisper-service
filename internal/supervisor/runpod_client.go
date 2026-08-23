@@ -30,23 +30,15 @@ func (c *RunPodClient) IsConfigured() bool {
 	return c.apiKey != "" && c.podID != ""
 }
 
-// StartPod sends a GraphQL mutation to RunPod API to resume/start the GPU pod
+// StartPod sends a REST API v2 request to start/resume the GPU pod
 func (c *RunPodClient) StartPod(ctx context.Context) error {
 	if !c.IsConfigured() {
 		return fmt.Errorf("runpod API key or pod ID not configured")
 	}
 
-	mutation := fmt.Sprintf(`
-		mutation {
-			podResume(input: {podId: "%s"}) {
-				id
-				desiredStatus
-			}
-		}
-	`, c.podID)
-
+	url := fmt.Sprintf("https://api.runpod.io/v2/pods/%s/action", c.podID)
 	reqBody := map[string]string{
-		"query": mutation,
+		"action": "start",
 	}
 
 	jsonBody, err := json.Marshal(reqBody)
@@ -54,15 +46,13 @@ func (c *RunPodClient) StartPod(ctx context.Context) error {
 		return fmt.Errorf("failed to marshal runpod start request: %w", err)
 	}
 
-	url := fmt.Sprintf("https://api.runpod.io/graphql?api_key=%s", c.apiKey)
 	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer(jsonBody))
 	if err != nil {
 		return fmt.Errorf("failed to create runpod request: %w", err)
 	}
 
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("api-key", c.apiKey)
-	req.Header.Set("Authorization", c.apiKey)
+	req.Header.Set("Authorization", "Bearer "+c.apiKey)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -71,9 +61,9 @@ func (c *RunPodClient) StartPod(ctx context.Context) error {
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("runpod API returned non-200 status code: %d", resp.StatusCode)
+		return fmt.Errorf("runpod REST API v2 returned non-200 status code: %d", resp.StatusCode)
 	}
 
-	log.Printf("[RunPod Client] Successfully sent podResume signal for Pod ID: %s", c.podID)
+	log.Printf("[RunPod Client] Successfully sent REST API v2 start action for Pod ID: %s", c.podID)
 	return nil
 }
