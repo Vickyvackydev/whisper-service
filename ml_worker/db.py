@@ -28,12 +28,19 @@ class Database:
         return self.pool.getconn()
 
     def put_conn(self, conn):
-        if self.pool and conn:
-            self.pool.putconn(conn)
+        if self.pool and not getattr(self.pool, 'closed', False) and conn:
+            try:
+                self.pool.putconn(conn)
+            except Exception:
+                pass
 
     def close(self):
         if self.pool:
-            self.pool.closeall()
+            try:
+                self.pool.closeall()
+            except Exception:
+                pass
+
 
     def dequeue_job(self, worker_id: str) -> Optional[Dict[str, Any]]:
         """
