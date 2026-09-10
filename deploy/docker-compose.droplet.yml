@@ -1,0 +1,42 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: whisper_postgres
+    restart: always
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgrespassword}
+      POSTGRES_DB: whisper_service
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  whisper_api:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.api
+    container_name: whisper_api
+    restart: always
+    environment:
+      PORT: 8080
+      DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD:-postgrespassword}@postgres:5432/whisper_service?sslmode=disable
+      AUTH_ENABLED: "true"
+      API_TOKENS: "${API_TOKENS:-whp_live_9f83a7c6e4b2d109f582bc194a0d8e72fa91cb45}"
+      ENVIRONMENT: "production"
+      AUTO_START_GPU: "false"
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
