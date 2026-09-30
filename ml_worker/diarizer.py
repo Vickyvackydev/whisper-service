@@ -74,6 +74,8 @@ class SpeakerDiarizer:
             
             # Prepare kwargs for min/max speakers
             params = {}
+            if min_speakers is None:
+                min_speakers = 2
             if min_speakers is not None and min_speakers > 0:
                 params["min_speakers"] = min_speakers
             if max_speakers is not None and max_speakers > 0:
@@ -257,6 +259,170 @@ class SpeakerDiarizer:
                 })
                 current_speaker = curr_sub_speaker
 
-        num_speakers = len(ordered_speakers) if ordered_speakers else 1
+        # Check if single speaker dominates (>= 85%) or only 1 speaker detected
+        speaker_word_counts = {}
+        for seg in new_segments:
+            for w in seg.get("words", []):
+                spk = w.get("speaker", "SPEAKER_00")
+                speaker_word_counts[spk] = speaker_word_counts.get(spk, 0) + 1
+        
+        total_w_count = sum(speaker_word_counts.values())
+        max_w_count = max(speaker_word_counts.values()) if speaker_word_counts else 0
+        is_dominant_single = (len(speaker_word_counts) <= 1) or (total_w_count > 0 and (max_w_count / total_w_count) >= 0.85)
+
+        if is_dominant_single:
+            new_segments, num_speakers = self.disambiguate_court_dialogue(new_segments)
+        else:
+            num_speakers = len(ordered_speakers) if ordered_speakers else 1
+
         logger.info(f"Assigned {num_speakers} unique speakers across {len(new_segments)} refined segments.")
         return new_segments, num_speakers
+
+    def disambiguate_court_dialogue(self, segments: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], int]:
+        all_words = []
+        for seg in segments:
+            for w in seg.get("words", []):
+                all_words.append(w)
+
+        if not all_words:
+            return segments, 1
+
+        full_text = " ".join(str(w.get("word", "")).lower() for w in all_words)
+        has_counsel_cues = any(k in full_text for k in [
+            "my lord", "your honour", "your honor", "your lordship", "your worship",
+            "court pleases", "sir?", "sought from the court", "may it please"
+        ])
+
+        if not has_counsel_cues:
+            return segments, 1
+
+        utterances = []
+        curr_start = 0
+
+        def is_turn_boundary(prev_w, curr_w):
+            pause = float(curr_w.get("start", 0)) - float(prev_w.get("end", 0))
+            if pause >= 0.35:
+                return True
+            txt = str(prev_w.get("word", "")).strip()
+            if (txt.endswith(".") or txt.endswith("?") or txt.endswith("!")) and pause >= 0.15:
+                return True
+            w_curr = str(curr_w.get("word", "")).lower().strip()
+            if w_curr in ["sir?", "sir", "well,"]:
+                return True
+            return False
+
+        for i in range(1, len(all_words)):
+            prev_w = all_words[i-1]
+            curr_w = all_words[i]
+
+            is_cue_start = False
+            w_curr = str(curr_w.get("word", "")).lower().strip()
+            if w_curr in ["sir?", "sir", "well,"]:
+                is_cue_start = True
+            elif i + 1 < len(all_words):
+                w_next = str(all_words[i+1].get("word", "")).lower().strip()
+                if (w_curr == "my" and w_next in ["lord", "noble"]) or                    (w_curr == "your" and w_next in ["honour", "honor", "lordship", "worship"]) or                    (w_curr == "can" and w_next == "i") or                    (w_curr == "what" and w_next == "are") or                    (w_curr == "so" and w_next == "the") or                    (w_curr == "as" and w_next == "the"):
+                    is_cue_start = True
+                elif (w_curr in ["yes", "no"]) and (w_next in ["my", "sir", "the", "it's", "well"]):
+                    is_cue_start = True
+
+            if is_turn_boundary(prev_w, curr_w) or is_cue_start:
+                utterances.append({
+                    "start_idx": curr_start,
+                    "end_idx": i - 1
+                })
+                curr_start = i
+
+        utterances.append({
+            "start_idx": curr_start,
+            "end_idx": len(all_words) - 1
+        })
+
+        last_established = "SPEAKER_01"
+
+        counsel_keywords = [
+            "my lord", "your honour", "your honor", "your lordship", "your worship",
+            "court pleases", "sir?", "may it please", "what i'm trying to say",
+            "what i'm saying in essence", "we said by alternative", "i did question",
+            "sought from the court"
+        ]
+        bench_keywords = [
+            "what are you talking about", "can i see", "choose the one you want",
+            "so the order", "your understanding of", "why did you say",
+            "what justice said granted", "what you ask for is what you granted",
+            "what you ask for", "what you asked for", "order you asked for",
+            "please call out", "the judge said", "the judge it's not fair",
+            "is there subsequent", "subsequent process"
+        ]
+
+        for u in utterances:
+            u_words = all_words[u["start_idx"] : u["end_idx"] + 1]
+            u_text = " ".join(str(w.get("word", "")).lower() for w in u_words).strip()
+
+            is_counsel = any(k in u_text for k in counsel_keywords)
+            is_bench = any(k in u_text for k in bench_keywords)
+
+            if is_counsel and not is_bench:
+                u_spk = "SPEAKER_01"
+                last_established = "SPEAKER_01"
+            elif is_bench and not is_counsel:
+                u_spk = "SPEAKER_00"
+                last_established = "SPEAKER_00"
+            else:
+                w_count = len(u_words)
+                is_short_response = w_count <= 4 and (u_text.startswith("yes") or u_text.startswith("no") or u_text.startswith("yeah"))
+                if is_short_response:
+                    u_spk = "SPEAKER_01" if last_established == "SPEAKER_00" else "SPEAKER_00"
+                    last_established = u_spk
+                else:
+                    prev_idx = utterances.index(u)
+                    prev_ended_with_question = False
+                    if prev_idx > 0:
+                        prev_w = all_words[utterances[prev_idx-1]["end_idx"]]
+                        prev_ended_with_question = str(prev_w.get("word", "")).strip().endswith("?")
+
+                    if prev_ended_with_question:
+                        u_spk = "SPEAKER_01" if last_established == "SPEAKER_00" else "SPEAKER_00"
+                        last_established = u_spk
+                    else:
+                        u_spk = last_established
+
+            u["speaker"] = u_spk
+            for w in u_words:
+                w["speaker"] = u_spk
+
+        refined_segments = []
+        curr_sub_words = []
+        curr_speaker = all_words[0]["speaker"]
+
+        for w in all_words:
+            w_spk = w.get("speaker", curr_speaker)
+            if w_spk != curr_speaker and curr_sub_words:
+                sub_text = " ".join(str(sw.get("word", "")).strip() for sw in curr_sub_words).strip()
+                refined_segments.append({
+                    "start": curr_sub_words[0].get("start", 0.0),
+                    "end": curr_sub_words[-1].get("end", 0.0),
+                    "text": sub_text,
+                    "source_text": None,
+                    "speaker": curr_speaker,
+                    "words": curr_sub_words
+                })
+                curr_sub_words = [w]
+                curr_speaker = w_spk
+            else:
+                curr_sub_words.append(w)
+
+        if curr_sub_words:
+            sub_text = " ".join(str(sw.get("word", "")).strip() for sw in curr_sub_words).strip()
+            refined_segments.append({
+                "start": curr_sub_words[0].get("start", 0.0),
+                "end": curr_sub_words[-1].get("end", 0.0),
+                "text": sub_text,
+                "source_text": None,
+                "speaker": curr_speaker,
+                "words": curr_sub_words
+            })
+
+        unique_speakers = len(set(s["speaker"] for s in refined_segments))
+        logger.info(f"Court dialogue disambiguated into {unique_speakers} speakers across {len(refined_segments)} segments.")
+        return refined_segments, unique_speakers
