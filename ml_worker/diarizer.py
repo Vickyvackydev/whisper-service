@@ -349,7 +349,10 @@ class SpeakerDiarizer:
                       (w_curr == "this" and w_next in ["matter", "thing"]) or
                       (w_curr in ["16th", "15th"]) or
                       (w_curr == "please" and w_next in ["call", "tell", "show"]) or
-                      (w_curr in ["i", "we"] and w_next in ["didn't", "did", "said"])):
+                      (w_curr in ["i", "we"] and w_next in ["didn't", "did", "said"]) or
+                      (w_curr == "how" and w_next in ["was", "is", "did"]) or
+                      (w_curr == "it" and w_next in ["was", "is"]) or
+                      (w_curr == "pressure" or (w_curr == "court" and w_next in ["places", "place"]))):
                     if not (i > 0 and prev_text_low in ["and", "so"]):
                         is_cue_start = True
                 elif (w_curr in ["yes", "no", "yeah"]) and (prev_text_low not in non_leading_preps) and (prev_text_low not in ["no", "yes", "yeah"]):
@@ -375,7 +378,9 @@ class SpeakerDiarizer:
             "court pleases", "sir?", "may it please", "grateful", "what i'm trying to say",
             "what i'm saying in essence", "we said by alternative", "we didn't serve it personally",
             "we shall be asking", "may i orally apply", "convenient", "i did question",
-            "sought from the court", "i didn't ask", "we didn't ask"
+            "sought from the court", "i didn't ask", "we didn't ask",
+            "court places", "court place", "pressure as",
+            "it was served", "to the sheriffs", "sheriffs of the", "sheriff of the"
         ]
         bench_keywords = [
             "what are you talking about", "can i see", "choose the one you want",
@@ -387,7 +392,9 @@ class SpeakerDiarizer:
             "is there subsequent", "file a motion",
             "tell me why", "put it in writing", "what's the court date", "court date",
             "16th november", "matter is adjourned", "adjourned to", "where's the hearing notice",
-            "proof of service", "was it served", "how was it served", "is that proper service",
+            "proof of service", "was it served", "how was it served",
+            "so this thing", "you served now", "judge had a discretion", "had a discretion",
+            "is that proper service",
             "so can we proceed", "there are two defendants", "there was an order",
             "which file is still waiting", "mr. joshua", "mr joshua", "mr. komolafe", "mr komolafe",
             "mr. kamala", "mr kamala",
