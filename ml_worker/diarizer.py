@@ -1,4 +1,4 @@
-import logging
+﻿import logging
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Tuple
 import torch
@@ -148,6 +148,7 @@ class SpeakerDiarizer:
     ) -> Tuple[List[Dict[str, Any]], int]:
         """
         Maps diarized speaker intervals to Whisper transcription segments and words.
+        Subdivides segments if words within transition across different speakers.
         """
         if not diarization_turns:
             logger.warning("No diarization turns available. Defaulting all segments to SPEAKER_00.")
@@ -203,20 +204,59 @@ class SpeakerDiarizer:
 
         current_speaker = normalized_turns[0]["speaker"] if normalized_turns else "SPEAKER_00"
 
+        new_segments = []
         for seg in segments:
             seg_start = float(seg.get("start", 0.0))
             seg_end = float(seg.get("end", 0.0))
-            
-            seg_speaker = get_best_speaker(seg_start, seg_end, current_speaker)
-            seg["speaker"] = seg_speaker
-            current_speaker = seg_speaker
+            words = seg.get("words", [])
+
+            if not words:
+                seg_speaker = get_best_speaker(seg_start, seg_end, current_speaker)
+                seg["speaker"] = seg_speaker
+                current_speaker = seg_speaker
+                new_segments.append(seg)
+                continue
 
             # Word-level speaker assignment
-            for w in seg.get("words", []):
+            for w in words:
                 w_start = float(w.get("start", seg_start))
                 w_end = float(w.get("end", seg_end))
-                w["speaker"] = get_best_speaker(w_start, w_end, seg_speaker)
+                w["speaker"] = get_best_speaker(w_start, w_end, current_speaker)
+
+            # Subdivide segment if words transition across different speakers
+            sub_words = []
+            curr_sub_speaker = words[0].get("speaker", current_speaker)
+
+            for w in words:
+                w_spk = w.get("speaker", curr_sub_speaker)
+                if w_spk != curr_sub_speaker and sub_words:
+                    # Flush previous sub-segment
+                    sub_text = " ".join(str(sw.get("word", "")).strip() for sw in sub_words).strip()
+                    new_segments.append({
+                        "start": sub_words[0].get("start", seg_start),
+                        "end": sub_words[-1].get("end", seg_end),
+                        "text": sub_text,
+                        "source_text": None,
+                        "speaker": curr_sub_speaker,
+                        "words": sub_words
+                    })
+                    sub_words = [w]
+                    curr_sub_speaker = w_spk
+                else:
+                    sub_words.append(w)
+
+            if sub_words:
+                sub_text = " ".join(str(sw.get("word", "")).strip() for sw in sub_words).strip()
+                new_segments.append({
+                    "start": sub_words[0].get("start", seg_start),
+                    "end": sub_words[-1].get("end", seg_end),
+                    "text": sub_text,
+                    "source_text": None,
+                    "speaker": curr_sub_speaker,
+                    "words": sub_words
+                })
+                current_speaker = curr_sub_speaker
 
         num_speakers = len(ordered_speakers) if ordered_speakers else 1
-        logger.info(f"Assigned {num_speakers} unique speakers across {len(segments)} segments.")
-        return segments, num_speakers
+        logger.info(f"Assigned {num_speakers} unique speakers across {len(new_segments)} refined segments.")
+        return new_segments, num_speakers
