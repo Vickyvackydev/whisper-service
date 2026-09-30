@@ -192,7 +192,7 @@ class SpeakerDiarizer:
         ]
 
         def get_best_speaker(start: float, end: float, fallback: str = "SPEAKER_00") -> str:
-            best_speaker = fallback
+            best_speaker = None
             max_overlap = 0.0
 
             # 1. Look for maximum temporal overlap
@@ -204,16 +204,12 @@ class SpeakerDiarizer:
                     max_overlap = overlap
                     best_speaker = turn["speaker"]
 
-            # 2. If no direct overlap, find closest turn in time
-            if max_overlap == 0.0 and normalized_turns:
-                mid = (start + end) / 2.0
-                closest_turn = min(
-                    normalized_turns,
-                    key=lambda t: abs(mid - ((t["start"] + t["end"]) / 2.0))
-                )
-                best_speaker = closest_turn["speaker"]
+            if best_speaker is not None and max_overlap > 0.0:
+                return best_speaker
 
-            return best_speaker
+            # 2. If no direct overlap (silence, breath pause, low energy), persist the active speaker!
+            # Do NOT jump to a future turn of another speaker.
+            return fallback
 
         current_speaker = normalized_turns[0]["speaker"] if normalized_turns else "SPEAKER_00"
 
@@ -235,6 +231,15 @@ class SpeakerDiarizer:
                 w_start = float(w.get("start", seg_start))
                 w_end = float(w.get("end", seg_end))
                 w["speaker"] = get_best_speaker(w_start, w_end, current_speaker)
+
+            # Apply 1-word smoothing collar to eliminate transient acoustic blips/chattering:
+            if len(words) > 2:
+                for idx in range(1, len(words) - 1):
+                    prev_spk = words[idx - 1].get("speaker")
+                    next_spk = words[idx + 1].get("speaker")
+                    curr_spk = words[idx].get("speaker")
+                    if prev_spk == next_spk and curr_spk != prev_spk:
+                        words[idx]["speaker"] = prev_spk
 
             # Subdivide segment if words transition across different speakers
             sub_words = []
@@ -277,7 +282,10 @@ class SpeakerDiarizer:
             "my lord", "your honour", "your honor", "your lordship", "your worship",
             "court pleases", "sir?", "sought from the court", "may it please"
         ])
-        if has_counsel_cues:
+        # Only run text-based courtroom turn disambiguation if acoustic diarization collapsed (< 2 speakers).
+        # If acoustic diarization already separated 2 or more distinct speakers, TRUST THE ACOUSTIC VOICES!
+        if len(ordered_speakers) < 2 and has_counsel_cues:
+            logger.info("Acoustic diarization collapsed into single speaker; applying courtroom turn disambiguation.")
             new_segments, num_speakers = self.disambiguate_court_dialogue(new_segments)
         else:
             num_speakers = len(ordered_speakers) if ordered_speakers else 1
