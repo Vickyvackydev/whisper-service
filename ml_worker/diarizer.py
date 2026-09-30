@@ -347,7 +347,9 @@ class SpeakerDiarizer:
                       (w_curr in ["where's", "where"]) or
                       (w_curr == "was" and w_next == "it") or
                       (w_curr == "this" and w_next in ["matter", "thing"]) or
-                      (w_curr in ["16th", "15th"])):
+                      (w_curr in ["16th", "15th"]) or
+                      (w_curr == "please" and w_next in ["call", "tell", "show"]) or
+                      (w_curr in ["i", "we"] and w_next in ["didn't", "did", "said"])):
                     if not (i > 0 and prev_text_low in ["and", "so"]):
                         is_cue_start = True
                 elif (w_curr in ["yes", "no", "yeah"]) and (prev_text_low not in non_leading_preps) and (prev_text_low not in ["no", "yes", "yeah"]):
@@ -373,21 +375,23 @@ class SpeakerDiarizer:
             "court pleases", "sir?", "may it please", "grateful", "what i'm trying to say",
             "what i'm saying in essence", "we said by alternative", "we didn't serve it personally",
             "we shall be asking", "may i orally apply", "convenient", "i did question",
-            "sought from the court"
+            "sought from the court", "i didn't ask", "we didn't ask"
         ]
         bench_keywords = [
             "what are you talking about", "can i see", "choose the one you want",
             "so the order", "your understanding of", "why did you say",
             "what justice said granted", "what you ask for is what you granted",
+            "you ask for is what you granted", "you ask for is what",
             "what you ask for", "what you asked for", "order you asked for",
             "please call out", "the judge said", "the judge it's not fair",
-            "is there subsequent", "subsequent process", "file a motion",
+            "is there subsequent", "file a motion",
             "tell me why", "put it in writing", "what's the court date", "court date",
             "16th november", "matter is adjourned", "adjourned to", "where's the hearing notice",
             "proof of service", "was it served", "how was it served", "is that proper service",
             "so can we proceed", "there are two defendants", "there was an order",
             "which file is still waiting", "mr. joshua", "mr joshua", "mr. komolafe", "mr komolafe",
-            "don't know you so well", "mode of service"
+            "mr. kamala", "mr kamala",
+            "don't know you so well", "mode of service", "idea of council", "idea of counsel"
         ]
 
         for u in utterances:
@@ -426,11 +430,6 @@ class SpeakerDiarizer:
                             should_toggle = True
                         elif "court pleases" in prev_u_text or "grateful" in prev_u_text:
                             if last_established == "SPEAKER_01":
-                                should_toggle = True
-                        elif last_established == "SPEAKER_00":
-                            prev_end = float(prev_w.get("end", 0.0))
-                            curr_start_t = float(u_words[0].get("start", 0.0))
-                            if curr_start_t - prev_end >= 0.25:
                                 should_toggle = True
 
                     if should_toggle:
