@@ -41,6 +41,16 @@ class SpeakerDiarizer:
                 logger.info("Pyannote Diarization pipeline loaded on CUDA GPU.")
             else:
                 logger.info("Pyannote Diarization pipeline loaded on CPU.")
+
+            # Calibrate clustering threshold for discriminating distinct speakers in real-world audio
+            # Default Pyannote threshold of 0.60 often merges speakers in shared room acoustics.
+            # 0.52 separates distinct speakers cleanly across general meetings/interviews/courts while keeping single-speaker audio intact.
+            try:
+                threshold = float(getattr(WorkerConfig, "DIARIZATION_THRESHOLD", 0.52))
+                self.pipeline.instantiate({"clustering": {"threshold": threshold}})
+                logger.info(f"Pyannote clustering threshold calibrated to {threshold}.")
+            except Exception as thresh_err:
+                logger.debug(f"Note on clustering threshold setting: {thresh_err}")
             
             self.is_loaded = True
         except Exception as e:
@@ -72,10 +82,8 @@ class SpeakerDiarizer:
             # Ensure 1D float32 array
             data = np.ascontiguousarray(data, dtype=np.float32)
             
-            # Prepare kwargs for min/max speakers
+            # Prepare kwargs for min/max speakers (optional overrides)
             params = {}
-            if min_speakers is None:
-                min_speakers = 2
             if min_speakers is not None and min_speakers > 0:
                 params["min_speakers"] = min_speakers
             if max_speakers is not None and max_speakers > 0:
