@@ -267,18 +267,14 @@ class SpeakerDiarizer:
                 })
                 current_speaker = curr_sub_speaker
 
-        # Check if single speaker dominates (>= 85%) or only 1 speaker detected
-        speaker_word_counts = {}
-        for seg in new_segments:
-            for w in seg.get("words", []):
-                spk = w.get("speaker", "SPEAKER_00")
-                speaker_word_counts[spk] = speaker_word_counts.get(spk, 0) + 1
-        
-        total_w_count = sum(speaker_word_counts.values())
-        max_w_count = max(speaker_word_counts.values()) if speaker_word_counts else 0
-        is_dominant_single = (len(speaker_word_counts) <= 1) or (total_w_count > 0 and (max_w_count / total_w_count) >= 0.85)
-
-        if is_dominant_single:
+        # Check if court honorific cues are present anywhere in the transcript.
+        # If present, always disambiguate interlocution turns between Bench and Counsel for clean dialogue separation.
+        all_text_lower = " ".join(str(w.get("word", "")).lower() for seg in new_segments for w in seg.get("words", []))
+        has_counsel_cues = any(k in all_text_lower for k in [
+            "my lord", "your honour", "your honor", "your lordship", "your worship",
+            "court pleases", "sir?", "sought from the court", "may it please"
+        ])
+        if has_counsel_cues:
             new_segments, num_speakers = self.disambiguate_court_dialogue(new_segments)
         else:
             num_speakers = len(ordered_speakers) if ordered_speakers else 1
@@ -309,10 +305,12 @@ class SpeakerDiarizer:
 
         def is_turn_boundary(prev_w, curr_w):
             pause = float(curr_w.get("start", 0)) - float(prev_w.get("end", 0))
-            if pause >= 0.30:
-                return True
             txt = str(prev_w.get("word", "")).strip()
-            if (txt.endswith(".") or txt.endswith("?") or txt.endswith("!")) and pause >= 0.12:
+            if txt.endswith("?") and pause >= 0.0:
+                return True
+            if pause >= 0.28:
+                return True
+            if (txt.endswith(".") or txt.endswith("!")) and pause >= 0.10:
                 return True
             w_prev_low = str(prev_w.get("word", "")).lower().strip()
             if "pleases" in w_prev_low or "grateful" in w_prev_low:
@@ -333,7 +331,8 @@ class SpeakerDiarizer:
             elif i + 1 < len(all_words):
                 w_next = str(all_words[i+1].get("word", "")).lower().strip()
                 prev_text_low = str(prev_w.get("word", "")).lower().strip()
-                if (w_curr in ["and", "so"]) and (w_next in ["tell", "file", "put"]):
+                non_leading_preps = {"is", "was", "has", "have", "had", "with", "for", "by", "of", "to", "there", "make", "take", "give", "said", "say"}
+                if (w_curr in ["and", "so"]) and (w_next in ["tell", "file", "put", "why", "what", "can"]):
                     is_cue_start = True
                 elif ((w_curr == "my" and w_next in ["lord", "noble"]) or
                       (w_curr == "your" and w_next in ["honour", "honor", "lordship", "worship"]) or
@@ -349,10 +348,11 @@ class SpeakerDiarizer:
                       (w_curr == "was" and w_next == "it") or
                       (w_curr == "this" and w_next in ["matter", "thing"]) or
                       (w_curr in ["16th", "15th"])):
-                    if not (i > 0 and prev_text_low == "and"):
+                    if not (i > 0 and prev_text_low in ["and", "so"]):
                         is_cue_start = True
-                elif (w_curr in ["yes", "no"]) and (w_next in ["my", "sir", "the", "it's", "well"]):
-                    is_cue_start = True
+                elif (w_curr in ["yes", "no", "yeah"]) and (prev_text_low not in non_leading_preps) and (prev_text_low not in ["no", "yes", "yeah"]):
+                    if w_next in ["no", "yes", "my", "sir", "the", "it's", "it", "well", "i", "we", "that", "what"]:
+                        is_cue_start = True
 
             if is_turn_boundary(prev_w, curr_w) or is_cue_start:
                 utterances.append({
