@@ -374,40 +374,48 @@ class SpeakerDiarizer:
         last_established = "SPEAKER_01"
 
         counsel_keywords = [
-            "my lord", "your honour", "your honor", "your lordship", "your worship",
-            "court pleases", "sir?", "may it please", "grateful", "what i'm trying to say",
-            "what i'm saying in essence", "we said by alternative", "we didn't serve it personally",
-            "we shall be asking", "may i orally apply", "convenient", "i did question",
-            "sought from the court", "i didn't ask", "we didn't ask",
-            "court places", "court place", "pressure as",
-            "it was served", "to the sheriffs", "sheriffs of the", "sheriff of the"
+            "my lord", "your honour", "your honor", "your lordship", "your lordships",
+            "your ladyship", "your worship", "court pleases", "court places", "court place",
+            "pressure as", "may it please", "if the court pleases", "grateful", "with respect",
+            "humbly submit", "humbly apply", "we pray", "we are asking", "we are applying",
+            "we are seeking", "our application", "my application", "my submission", "we submit",
+            "we filed", "we have filed", "i filed", "i have filed", "we served", "we have served",
+            "it was served", "may i orally apply", "orally apply", "sought from the court",
+            "what i'm trying to say", "what i am trying to say", "i didn't ask", "we didn't ask",
+            "convenient", "sir?"
         ]
         bench_keywords = [
-            "what are you talking about", "can i see", "choose the one you want",
-            "so the order", "your understanding of", "why did you say",
-            "what justice said granted", "what you ask for is what you granted",
-            "you ask for is what you granted", "you ask for is what",
-            "what you ask for", "what you asked for", "order you asked for",
-            "please call out", "the judge said", "the judge it's not fair",
-            "is there subsequent", "file a motion",
-            "tell me why", "put it in writing", "what's the court date", "court date",
-            "16th november", "matter is adjourned", "adjourned to", "where's the hearing notice",
-            "proof of service", "was it served", "how was it served",
-            "so this thing", "you served now", "judge had a discretion", "had a discretion",
-            "is that proper service",
-            "so can we proceed", "there are two defendants", "there was an order",
-            "which file is still waiting", "mr. joshua", "mr joshua", "mr. komolafe", "mr komolafe",
-            "mr. kamala", "mr kamala",
-            "don't know you so well", "mode of service", "idea of council", "idea of counsel"
+            "learned silk", "learned counsel", "learned friend",
+            "matter is adjourned", "case is adjourned", "adjourned to",
+            "ruling is reserved", "judgment is reserved",
+            "call the matter", "call the next",
+            "file a motion", "file an application", "put it in writing", "put that in writing",
+            "tell me why", "tell the court", "explain to the court",
+            "what is your", "where is your", "where is the",
+            "why did you", "why do you", "why have you",
+            "how did you", "how was it", "was it served", "proof of service", "is that proper service",
+            "so can we proceed", "so the order", "can i see", "let me see", "choose the one you want",
+            "what are you asking", "what are you saying", "what are you talking about",
+            "your understanding of", "what you ask for", "what you asked for", "you ask for is what",
+            "order you asked for", "order that was made",
+            "the judge said", "the judge it's not fair",
+            "what's the court date", "court date", "take a date", "give us a date",
+            "please call out", "mr. ", "mrs. ", "barrister ",
+            "had a discretion", "discretion", "don't know you so well"
         ]
 
-        for u in utterances:
+        months = ["january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december"]
+        ordinals = ["1st", "2nd", "3rd", "th"]
+
+        for u_idx, u in enumerate(utterances):
             u_words = all_words[u["start_idx"] : u["end_idx"] + 1]
             u_text = " ".join(str(w.get("word", "")).lower() for w in u_words).strip()
 
             is_counsel = any(k in u_text for k in counsel_keywords)
             is_bench = any(k in u_text for k in bench_keywords)
-            is_date_turn = ("15th" in u_text) or ("16th" in u_text and "adjourned" not in u_text)
+            has_month = any(m in u_text for m in months)
+            has_ord = any(o in u_text for o in ordinals)
+            is_date_turn = (len(u_words) <= 8) and ("adjourned" not in u_text) and (has_month or has_ord)
 
             if is_counsel and not is_bench:
                 u_spk = "SPEAKER_01"
@@ -425,7 +433,7 @@ class SpeakerDiarizer:
                     u_spk = "SPEAKER_01" if last_established == "SPEAKER_00" else "SPEAKER_00"
                     last_established = u_spk
                 else:
-                    prev_idx = utterances.index(u)
+                    prev_idx = u_idx
                     should_toggle = False
                     if prev_idx > 0:
                         prev_u = utterances[prev_idx-1]
