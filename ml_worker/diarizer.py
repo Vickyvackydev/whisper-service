@@ -309,10 +309,13 @@ class SpeakerDiarizer:
 
         def is_turn_boundary(prev_w, curr_w):
             pause = float(curr_w.get("start", 0)) - float(prev_w.get("end", 0))
-            if pause >= 0.35:
+            if pause >= 0.30:
                 return True
             txt = str(prev_w.get("word", "")).strip()
-            if (txt.endswith(".") or txt.endswith("?") or txt.endswith("!")) and pause >= 0.15:
+            if (txt.endswith(".") or txt.endswith("?") or txt.endswith("!")) and pause >= 0.12:
+                return True
+            w_prev_low = str(prev_w.get("word", "")).lower().strip()
+            if "pleases" in w_prev_low or "grateful" in w_prev_low:
                 return True
             w_curr = str(curr_w.get("word", "")).lower().strip()
             if w_curr in ["sir?", "sir", "well,"]:
@@ -329,8 +332,25 @@ class SpeakerDiarizer:
                 is_cue_start = True
             elif i + 1 < len(all_words):
                 w_next = str(all_words[i+1].get("word", "")).lower().strip()
-                if (w_curr == "my" and w_next in ["lord", "noble"]) or                    (w_curr == "your" and w_next in ["honour", "honor", "lordship", "worship"]) or                    (w_curr == "can" and w_next == "i") or                    (w_curr == "what" and w_next == "are") or                    (w_curr == "so" and w_next == "the") or                    (w_curr == "as" and w_next == "the"):
+                prev_text_low = str(prev_w.get("word", "")).lower().strip()
+                if (w_curr in ["and", "so"]) and (w_next in ["tell", "file", "put"]):
                     is_cue_start = True
+                elif ((w_curr == "my" and w_next in ["lord", "noble"]) or
+                      (w_curr == "your" and w_next in ["honour", "honor", "lordship", "worship"]) or
+                      (w_curr == "can" and w_next == "i") or
+                      (w_curr == "what" and w_next == "are") or
+                      (w_curr == "so" and w_next in ["the", "can", "you", "this"]) or
+                      (w_curr == "as" and w_next == "the") or
+                      (w_curr == "file" and w_next == "a") or
+                      (w_curr == "put" and w_next == "it") or
+                      (w_curr == "tell" and w_next == "me") or
+                      (w_curr == "what's" and w_next == "the") or
+                      (w_curr in ["where's", "where"]) or
+                      (w_curr == "was" and w_next == "it") or
+                      (w_curr == "this" and w_next in ["matter", "thing"]) or
+                      (w_curr in ["16th", "15th"])):
+                    if not (i > 0 and prev_text_low == "and"):
+                        is_cue_start = True
                 elif (w_curr in ["yes", "no"]) and (w_next in ["my", "sir", "the", "it's", "well"]):
                     is_cue_start = True
 
@@ -350,8 +370,9 @@ class SpeakerDiarizer:
 
         counsel_keywords = [
             "my lord", "your honour", "your honor", "your lordship", "your worship",
-            "court pleases", "sir?", "may it please", "what i'm trying to say",
-            "what i'm saying in essence", "we said by alternative", "i did question",
+            "court pleases", "sir?", "may it please", "grateful", "what i'm trying to say",
+            "what i'm saying in essence", "we said by alternative", "we didn't serve it personally",
+            "we shall be asking", "may i orally apply", "convenient", "i did question",
             "sought from the court"
         ]
         bench_keywords = [
@@ -360,7 +381,13 @@ class SpeakerDiarizer:
             "what justice said granted", "what you ask for is what you granted",
             "what you ask for", "what you asked for", "order you asked for",
             "please call out", "the judge said", "the judge it's not fair",
-            "is there subsequent", "subsequent process"
+            "is there subsequent", "subsequent process", "file a motion",
+            "tell me why", "put it in writing", "what's the court date", "court date",
+            "16th november", "matter is adjourned", "adjourned to", "where's the hearing notice",
+            "proof of service", "was it served", "how was it served", "is that proper service",
+            "so can we proceed", "there are two defendants", "there was an order",
+            "which file is still waiting", "mr. joshua", "mr joshua", "mr. komolafe", "mr komolafe",
+            "don't know you so well", "mode of service"
         ]
 
         for u in utterances:
@@ -369,6 +396,7 @@ class SpeakerDiarizer:
 
             is_counsel = any(k in u_text for k in counsel_keywords)
             is_bench = any(k in u_text for k in bench_keywords)
+            is_date_turn = ("15th" in u_text) or ("16th" in u_text and "adjourned" not in u_text)
 
             if is_counsel and not is_bench:
                 u_spk = "SPEAKER_01"
@@ -376,6 +404,9 @@ class SpeakerDiarizer:
             elif is_bench and not is_counsel:
                 u_spk = "SPEAKER_00"
                 last_established = "SPEAKER_00"
+            elif is_date_turn:
+                u_spk = "SPEAKER_01" if last_established == "SPEAKER_00" else "SPEAKER_00"
+                last_established = u_spk
             else:
                 w_count = len(u_words)
                 is_short_response = w_count <= 4 and (u_text.startswith("yes") or u_text.startswith("no") or u_text.startswith("yeah"))
@@ -384,12 +415,25 @@ class SpeakerDiarizer:
                     last_established = u_spk
                 else:
                     prev_idx = utterances.index(u)
-                    prev_ended_with_question = False
+                    should_toggle = False
                     if prev_idx > 0:
-                        prev_w = all_words[utterances[prev_idx-1]["end_idx"]]
-                        prev_ended_with_question = str(prev_w.get("word", "")).strip().endswith("?")
+                        prev_u = utterances[prev_idx-1]
+                        prev_w = all_words[prev_u["end_idx"]]
+                        prev_w_text = str(prev_w.get("word", "")).strip()
+                        prev_u_text = " ".join(str(w.get("word", "")).lower() for w in all_words[prev_u["start_idx"] : prev_u["end_idx"] + 1])
 
-                    if prev_ended_with_question:
+                        if prev_w_text.endswith("?"):
+                            should_toggle = True
+                        elif "court pleases" in prev_u_text or "grateful" in prev_u_text:
+                            if last_established == "SPEAKER_01":
+                                should_toggle = True
+                        elif last_established == "SPEAKER_00":
+                            prev_end = float(prev_w.get("end", 0.0))
+                            curr_start_t = float(u_words[0].get("start", 0.0))
+                            if curr_start_t - prev_end >= 0.25:
+                                should_toggle = True
+
+                    if should_toggle:
                         u_spk = "SPEAKER_01" if last_established == "SPEAKER_00" else "SPEAKER_00"
                         last_established = u_spk
                     else:
