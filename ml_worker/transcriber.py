@@ -97,7 +97,7 @@ class Transcriber:
             beam_size=beam_size,
             temperature=temperature,
             word_timestamps=True,
-            vad_filter=True,
+            vad_filter=False,
             vad_parameters=vad_params,
             condition_on_previous_text=False, # Prevents hallucinations / skipping words
             no_speech_threshold=0.8,          # Preserves words even if background laughter raises no-speech score

@@ -1,5 +1,25 @@
-﻿import re
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
+import re
+
+PUNCT_CHARS = '.,!?;:"\'()[]{}'
+
+def apply_proper_case(token: str, proper_word: str) -> str:
+    if not token:
+        return proper_word
+    trimmed = token.strip(PUNCT_CHARS)
+    if not trimmed:
+        return token
+    start_pos = token.find(trimmed)
+    if start_pos == -1:
+        return proper_word
+    prefix = token[:start_pos]
+    suffix = token[start_pos + len(trimmed):]
+    if proper_word.endswith(".") and suffix.startswith("."):
+        suffix = suffix[1:]
+    return f"{prefix}{proper_word}{suffix}"
+
+def clean_token(s: str) -> str:
+    return str(s).strip(PUNCT_CHARS).lower()
 
 COURT_REPLACEMENTS = [
     # Honorifics & Court Address
@@ -202,21 +222,26 @@ def normalize_segment(segment: Dict[str, Any]) -> Dict[str, Any]:
         # 2. Contextual honorific casing for two-word sequences (e.g. "my" + "lord" -> "My" + "Lord")
         words = segment["words"]
         for idx in range(len(words) - 1):
-            w1 = str(words[idx].get("word", "")).lower()
-            w2 = str(words[idx+1].get("word", "")).lower()
+            w1_clean = clean_token(words[idx].get("word", ""))
+            w2_clean = clean_token(words[idx+1].get("word", ""))
 
-            if w1 == "my" and w2 in ("lord", "noble"):
-                words[idx]["word"] = "My"
-                words[idx+1]["word"] = "Lord" if w2 == "lord" else "Noble"
-            elif w1 == "your" and w2 in ("honour", "honor", "lordship", "lordships", "ladyship", "ladyships", "worship", "highness"):
-                words[idx]["word"] = "Your"
-                if w2 in ("honour", "honor"):
-                    words[idx+1]["word"] = "Honour"
-                else:
-                    words[idx+1]["word"] = w2.capitalize()
-            elif w1 == "learned" and w2 in ("silk", "friend", "counsel", "colleague"):
-                words[idx]["word"] = "Learned"
-                words[idx+1]["word"] = w2.capitalize()
+            if (w1_clean in ("my", "me")) and (w2_clean in ("lord", "noble")):
+                words[idx]["word"] = apply_proper_case(words[idx]["word"], "My")
+                words[idx+1]["word"] = apply_proper_case(words[idx+1]["word"], "Lord" if w2_clean == "lord" else "Noble")
+            elif w1_clean == "your":
+                if w2_clean in ("honour", "honor"):
+                    words[idx]["word"] = apply_proper_case(words[idx]["word"], "Your")
+                    words[idx+1]["word"] = apply_proper_case(words[idx+1]["word"], "Honour")
+                elif w2_clean in ("lordship", "lordships", "ladyship", "ladyships", "worship", "highness"):
+                    words[idx]["word"] = apply_proper_case(words[idx]["word"], "Your")
+                    words[idx+1]["word"] = apply_proper_case(words[idx+1]["word"], w2_clean.capitalize())
+            elif w1_clean == "learned" and w2_clean in ("silk", "friend", "counsel", "colleague"):
+                words[idx]["word"] = apply_proper_case(words[idx]["word"], "Learned")
+                words[idx+1]["word"] = apply_proper_case(words[idx+1]["word"], w2_clean.capitalize())
+            elif w1_clean in ("mr", "mrs", "justice", "barrister") and len(w2_clean) > 1:
+                title = "Mr." if w1_clean == "mr" else ("Mrs." if w1_clean == "mrs" else w1_clean.capitalize())
+                words[idx]["word"] = apply_proper_case(words[idx]["word"], title)
+                words[idx+1]["word"] = apply_proper_case(words[idx+1]["word"], w2_clean.capitalize())
 
         # 3. Merge slash tokens for suit numbers (e.g. FHC / L / CS / 485 / 2026 -> FHC/L/CS/485/2026)
         segment["words"] = merge_slashed_words(words)

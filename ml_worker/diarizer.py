@@ -303,63 +303,69 @@ class SpeakerDiarizer:
         utterances = []
         curr_start = 0
 
-        def is_turn_boundary(prev_w, curr_w):
-            pause = float(curr_w.get("start", 0)) - float(prev_w.get("end", 0))
-            txt = str(prev_w.get("word", "")).strip()
-            if txt.endswith("?") and pause >= 0.0:
-                return True
-            if pause >= 0.28:
-                return True
-            if (txt.endswith(".") or txt.endswith("!")) and pause >= 0.10:
-                return True
-            w_prev_low = str(prev_w.get("word", "")).lower().strip()
-            if "pleases" in w_prev_low or "grateful" in w_prev_low:
-                return True
-            w_curr = str(curr_w.get("word", "")).lower().strip()
-            if w_curr in ["sir?", "sir", "well,"]:
-                return True
-            return False
+        punct_chars = '.,!?;:"\'()[]{}'
+        def clean_tok(s: str) -> str:
+            return str(s).strip(punct_chars).lower()
+
+        non_leading_preps = {"is", "was", "has", "have", "had", "with", "for", "by", "of", "to", "there", "make", "take", "give", "said", "say"}
 
         for i in range(1, len(all_words)):
             prev_w = all_words[i-1]
             curr_w = all_words[i]
+            pause = float(curr_w.get("start", 0)) - float(prev_w.get("end", 0))
+            prev_txt = str(prev_w.get("word", "")).strip()
+
+            w_prev = clean_tok(prev_w.get("word", ""))
+            w_curr = clean_tok(curr_w.get("word", ""))
+            w_next = clean_tok(all_words[i+1].get("word", "")) if i + 1 < len(all_words) else ""
+            w_next2 = clean_tok(all_words[i+2].get("word", "")) if i + 2 < len(all_words) else ""
 
             is_cue_start = False
-            w_curr = str(curr_w.get("word", "")).lower().strip()
-            if w_curr in ["sir?", "sir", "well,"]:
+
+            # 1. Direct conversational turn boundary after question or floor surrender
+            if prev_txt.endswith("?") and pause >= 0.0:
                 is_cue_start = True
-            elif i + 1 < len(all_words):
-                w_next = str(all_words[i+1].get("word", "")).lower().strip()
-                prev_text_low = str(prev_w.get("word", "")).lower().strip()
-                non_leading_preps = {"is", "was", "has", "have", "had", "with", "for", "by", "of", "to", "there", "make", "take", "give", "said", "say"}
-                if (w_curr in ["and", "so"]) and (w_next in ["tell", "file", "put", "why", "what", "can"]):
+            elif (w_prev in ("lord", "pleases", "grateful", "honour", "honor", "sir")) and (prev_txt.endswith(".") or prev_txt.endswith("!") or prev_txt.endswith("?") or pause >= 0.05) and (w_curr not in ("my", "noble")):
+                # Counsel acknowledgment finished -> next word starts new speaker!
+                is_cue_start = True
+            elif pause >= 0.28:
+                is_cue_start = True
+            elif (prev_txt.endswith(".") or prev_txt.endswith("!")) and pause >= 0.08:
+                is_cue_start = True
+
+            # 2. Turn boundary triggers starting on curr
+            if not is_cue_start:
+                if w_curr in ("sir", "well"):
                     is_cue_start = True
-                elif ((w_curr == "my" and w_next in ["lord", "noble"]) or
-                      (w_curr == "your" and w_next in ["honour", "honor", "lordship", "worship"]) or
-                      (w_curr == "can" and w_next == "i") or
-                      (w_curr == "what" and w_next == "are") or
-                      (w_curr == "so" and w_next in ["the", "can", "you", "this"]) or
-                      (w_curr == "as" and w_next == "the") or
-                      (w_curr == "file" and w_next == "a") or
-                      (w_curr == "put" and w_next == "it") or
-                      (w_curr == "tell" and w_next == "me") or
-                      (w_curr == "what's" and w_next == "the") or
-                      (w_curr in ["where's", "where"]) or
-                      (w_curr == "was" and w_next == "it") or
-                      (w_curr == "this" and w_next in ["matter", "thing"]) or
-                      (w_curr in ["16th", "15th"]) or
-                      (w_curr == "please" and w_next in ["call", "tell", "show"]) or
-                      (w_curr in ["i", "we"] and w_next in ["didn't", "did", "said"]) or
-                      (w_curr == "how" and w_next in ["was", "is", "did"]) or
-                      (w_curr == "it" and w_next in ["was", "is"]) or
-                      (w_curr == "pressure" or (w_curr == "court" and w_next in ["places", "place"]))):
-                    if not (i > 0 and prev_text_low in ["and", "so"]):
+                elif (w_curr in ("yes", "no", "yeah")) and (w_prev not in non_leading_preps) and (w_prev not in ("no", "yes", "yeah")):
+                    if w_next in ("no", "yes", "my", "lord", "sir", "your", "it", "its", "we", "i", "that", "what", "well"):
                         is_cue_start = True
-                elif (w_curr in ["yes", "no", "yeah"]) and (prev_text_low not in non_leading_preps) and (prev_text_low not in ["no", "yes", "yeah"]):
-                    if w_next in ["no", "yes", "my", "sir", "the", "it's", "it", "well", "i", "we", "that", "what"]:
+                    elif prev_txt.endswith(".") or prev_txt.endswith("?") or prev_txt.endswith("!") or pause >= 0.05:
+                        is_cue_start = True
+                elif (w_curr in ("im", "i'm", "i")) and (w_next in ("grateful", "humbly", "submit", "pray", "apply")):
+                    is_cue_start = True
+                elif (w_curr == "my" and w_next in ("lord", "noble")) or \
+                     (w_curr == "your" and w_next in ("honour", "honor", "lordship", "worship")) or \
+                     (w_curr == "as" and w_next == "the" and w_next2 in ("court", "places", "pleases")) or \
+                     (w_curr == "grateful") or \
+                     (w_curr == "court" and w_next in ("pleases", "places", "place")) or \
+                     (w_curr == "pressure" and w_next == "as"):
+                    if not (i > 0 and w_prev in ("and", "so", "that")):
+                        is_cue_start = True
+                elif (w_curr == "please" and w_next in ("mr", "mrs", "counsel", "barrister", "call")) or \
+                     (w_curr in ("mr", "mrs", "barrister", "counsel") and (prev_txt.endswith(".") or prev_txt.endswith("?") or pause >= 0.05)):
+                    is_cue_start = True
+                elif (w_curr == "can" and w_next == "i") or \
+                     (w_curr == "what" and w_next in ("are", "you", "is")) or \
+                     (w_curr == "why" and w_next in ("did", "do", "have")) or \
+                     (w_curr == "how" and w_next in ("was", "did", "is")) or \
+                     (w_curr == "file" and w_next == "a") or \
+                     (w_curr == "put" and w_next == "it") or \
+                     (w_curr == "tell" and w_next in ("me", "the")):
+                    if prev_txt.endswith(".") or prev_txt.endswith("?") or pause >= 0.05:
                         is_cue_start = True
 
-            if is_turn_boundary(prev_w, curr_w) or is_cue_start:
+            if is_cue_start:
                 utterances.append({
                     "start_idx": curr_start,
                     "end_idx": i - 1
