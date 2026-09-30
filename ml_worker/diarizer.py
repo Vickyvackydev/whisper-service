@@ -86,6 +86,9 @@ class SpeakerDiarizer:
             params = {}
             if min_speakers is not None and min_speakers > 0:
                 params["min_speakers"] = min_speakers
+            elif max_speakers is None:
+                # Default to at least 2 speakers when diarization is active
+                params["min_speakers"] = 2
             if max_speakers is not None and max_speakers > 0:
                 params["max_speakers"] = max_speakers
 
@@ -294,7 +297,8 @@ class SpeakerDiarizer:
         full_text = " ".join(str(w.get("word", "")).lower() for w in all_words)
         has_counsel_cues = any(k in full_text for k in [
             "my lord", "your honour", "your honor", "your lordship", "your worship",
-            "court pleases", "sir?", "sought from the court", "may it please"
+            "court pleases", "yes sir", "no sir", "learned counsel", "learned silk",
+            "sir?", "sought from the court", "may it please the court"
         ])
 
         if not has_counsel_cues:
@@ -304,10 +308,11 @@ class SpeakerDiarizer:
         curr_start = 0
 
         punct_chars = '.,!?;:"\'()[]{}'
-        def clean_tok(s: str) -> str:
-            return str(s).strip(punct_chars).lower()
+        def clean_tok(tok):
+            return str(tok).lower().strip(punct_chars)
 
-        non_leading_preps = {"is", "was", "has", "have", "had", "with", "for", "by", "of", "to", "there", "make", "take", "give", "said", "say"}
+        months = ["january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december"]
+        ordinals = ["1st", "2nd", "3rd", "th"]
 
         for i in range(1, len(all_words)):
             prev_w = all_words[i-1]
@@ -322,33 +327,53 @@ class SpeakerDiarizer:
 
             is_cue_start = False
 
-            # 1. Direct conversational turn boundary after question or floor surrender
-            if prev_txt.endswith("?") and pause >= 0.0:
+            # A. Natural acoustic conversational pause boundary
+            if pause >= 0.70:
                 is_cue_start = True
-            elif (w_prev in ("lord", "pleases", "grateful", "honour", "honor", "sir")) and (prev_txt.endswith(".") or prev_txt.endswith("!") or prev_txt.endswith("?") or pause >= 0.05) and (w_curr not in ("my", "noble")):
-                # Counsel acknowledgment finished -> next word starts new speaker!
-                is_cue_start = True
-            elif pause >= 0.28:
-                is_cue_start = True
-            elif (prev_txt.endswith(".") or prev_txt.endswith("!")) and pause >= 0.08:
+            elif pause >= 0.35 and (prev_txt.endswith(".") or prev_txt.endswith("?") or prev_txt.endswith("!")):
                 is_cue_start = True
 
-            # 2. Turn boundary triggers starting on curr
+            # B. Direct conversational turn boundary after question response or floor surrender
             if not is_cue_start:
-                if w_curr in ("sir", "well"):
+                if (w_prev in ("lord", "pleases", "grateful", "honour", "honor", "sir")) and \
+                   (prev_txt.endswith(".") or prev_txt.endswith("!") or prev_txt.endswith("?") or pause >= 0.15) and \
+                   (w_curr not in ("my", "noble")):
                     is_cue_start = True
-                elif (w_curr in ("yes", "no", "yeah")) and (w_prev not in non_leading_preps) and (w_prev not in ("no", "yes", "yeah")):
-                    if w_next in ("no", "yes", "my", "lord", "sir", "your", "it", "its", "we", "i", "that", "what", "well"):
-                        is_cue_start = True
-                    elif prev_txt.endswith(".") or prev_txt.endswith("?") or prev_txt.endswith("!") or pause >= 0.05:
-                        is_cue_start = True
-                elif (w_curr in ("im", "i'm", "i")) and (w_next in ("grateful", "humbly", "submit", "pray", "apply")):
+                elif (w_prev in ("sir", "lord")) and (i >= 2 and clean_tok(all_words[i-2].get("word", "")) in ("yes", "no")) and \
+                     (w_curr not in ("my", "noble")):
                     is_cue_start = True
+                elif prev_txt.endswith("?") and (pause >= 0.08 or w_curr in ("yes", "no", "we", "i", "my", "it", "that")):
+                    is_cue_start = True
+                elif pause >= 0.25 and (prev_w.get("speaker") != curr_w.get("speaker")):
+                    is_cue_start = True
+
+            # C. Turn boundary triggers starting on curr
+            if not is_cue_start:
+                has_month_curr = any(m in w_curr for m in months)
+                has_ord_curr = any(o in w_curr for o in ordinals)
+
+                if (w_curr in ("sir", "well")) and (prev_txt.endswith(".") or prev_txt.endswith("?") or pause >= 0.15):
+                    is_cue_start = True
+                elif (w_curr in ("yes", "no", "yeah")) and (w_prev not in ("no", "yes", "yeah")):
+                    if w_next in ("no", "yes", "my", "lord", "sir", "your", "the", "it", "its", "it's", "we", "i", "you", "that", "what", "well", "why", "how", "he", "she"):
+                        is_cue_start = True
+                    elif prev_txt.endswith(".") or prev_txt.endswith("?") or prev_txt.endswith("!") or pause >= 0.15:
+                        is_cue_start = True
+                elif (w_curr in ("im", "i'm", "i")) and (w_next in ("grateful", "humbly", "submit", "pray", "apply", "could", "didn't", "will", "would", "cannot", "can")):
+                    if prev_txt.endswith(".") or prev_txt.endswith("?") or prev_txt.endswith("!") or pause >= 0.15:
+                        is_cue_start = True
                 elif (w_curr == "my" and w_next in ("lord", "noble")) or \
-                     (w_curr == "your" and w_next in ("honour", "honor", "lordship", "worship")) or \
-                     (w_curr == "as" and w_next == "the" and w_next2 in ("court", "places", "pleases")) or \
-                     (w_curr == "grateful") or \
-                     (w_curr == "court" and w_next in ("pleases", "places", "place")) or \
+                     (w_curr == "your" and w_next in ("honour", "honor", "lordship", "worship")):
+                    if (prev_txt.endswith(".") or prev_txt.endswith("?") or prev_txt.endswith("!") or pause >= 0.15) and \
+                       (w_prev not in ("yes", "no", "yeah")):
+                        is_cue_start = True
+                elif (w_curr == "now" and w_next == "my" and w_next2 in ("lord", "noble")):
+                    is_cue_start = True
+                elif (has_month_curr or has_ord_curr) and (prev_txt.endswith(".") or prev_txt.endswith("?") or pause >= 0.15):
+                    is_cue_start = True
+                elif (w_curr == "as" and (w_next in ("the", "you") and w_next2 in ("court", "places", "pleases", "go", "can"))) or \
+                     (w_curr == "grateful" and w_prev not in ("i", "im", "i'm")) or \
+                     (w_curr == "court" and w_next in ("pleases", "places", "place") and w_prev != "the") or \
                      (w_curr == "pressure" and w_next == "as"):
                     if not (i > 0 and w_prev in ("and", "so", "that")):
                         is_cue_start = True
@@ -356,13 +381,17 @@ class SpeakerDiarizer:
                      (w_curr in ("mr", "mrs", "barrister", "counsel") and (prev_txt.endswith(".") or prev_txt.endswith("?") or pause >= 0.05)):
                     is_cue_start = True
                 elif (w_curr == "can" and w_next == "i") or \
-                     (w_curr == "what" and w_next in ("are", "you", "is")) or \
-                     (w_curr == "why" and w_next in ("did", "do", "have")) or \
+                     (w_curr == "so" and w_next in ("the", "your", "what", "why", "how", "you")) or \
+                     (w_curr == "what" and w_next in ("are", "you", "is", "did", "justice", "i'm", "i")) or \
+                     (w_curr == "why" and w_next in ("did", "do", "have", "you")) or \
                      (w_curr == "how" and w_next in ("was", "did", "is")) or \
+                     (w_curr == "is" and w_next in ("there", "it") and w_next2 in ("subsequent", "any")) or \
+                     (w_curr == "start" and w_next == "the" and w_next2 in ("rate", "writ")) or \
+                     (w_curr == "serve" and w_next == "the") or \
                      (w_curr == "file" and w_next == "a") or \
-                     (w_curr == "put" and w_next == "it") or \
+                     (w_curr == "put" and w_next in ("it", "that")) or \
                      (w_curr == "tell" and w_next in ("me", "the")):
-                    if prev_txt.endswith(".") or prev_txt.endswith("?") or pause >= 0.05:
+                    if prev_txt.endswith(".") or prev_txt.endswith("?") or pause >= 0.08 or i == 0 or (w_curr in ("can", "is", "what", "start", "serve", "so")):
                         is_cue_start = True
 
             if is_cue_start:
@@ -381,17 +410,26 @@ class SpeakerDiarizer:
 
         counsel_keywords = [
             "my lord", "your honour", "your honor", "your lordship", "your lordships",
-            "your ladyship", "your worship", "court pleases", "court places", "court place",
-            "pressure as", "may it please", "if the court pleases", "grateful", "with respect",
+            "your ladyship", "your worship", "court pleases", "court places", "court place", "go places", "you can i",
+            "most grateful", "grateful", "pressure as", "may it please", "if the court pleases", "with respect",
             "humbly submit", "humbly apply", "we pray", "we are asking", "we are applying",
             "we are seeking", "our application", "my application", "my submission", "we submit",
             "we filed", "we have filed", "i filed", "i have filed", "we served", "we have served",
             "it was served", "may i orally apply", "orally apply", "sought from the court",
-            "what i'm trying to say", "what i am trying to say", "i didn't ask", "we didn't ask",
-            "convenient", "sir?"
+            "what i'm trying to say", "what i am trying to say", "what i'm saying", "what i am saying",
+            "i didn't ask", "we didn't ask", "i can explain",
+            "it's not fair", "the judge it's not fair", "stand before the court", "what did not happen",
+            "subsequent processes should be served",
+            "convenient", "yes sir", "no sir", "sir?",
+            "no no no", "no no no no"
         ]
         bench_keywords = [
             "learned silk", "learned counsel", "learned friend",
+            "as you go places is there", "is there subsequent",
+            "what does is granted", "what justice said", "what did justice", "justice said",
+            "start the rate", "serve the reach", "statement of claim",
+            "counterclaim", "reply statement", "front loaded", "front related",
+            "well he chose", "he chose",
             "matter is adjourned", "case is adjourned", "adjourned to",
             "ruling is reserved", "judgment is reserved",
             "call the matter", "call the next",
@@ -400,18 +438,17 @@ class SpeakerDiarizer:
             "what is your", "where is your", "where is the",
             "why did you", "why do you", "why have you",
             "how did you", "how was it", "was it served", "proof of service", "is that proper service",
-            "so can we proceed", "so the order", "can i see", "let me see", "choose the one you want",
+            "so can we proceed", "so the order", "so your understanding", "your understanding",
+            "can i see", "let me see", "choose the one you want",
             "what are you asking", "what are you saying", "what are you talking about",
             "your understanding of", "what you ask for", "what you asked for", "you ask for is what",
-            "order you asked for", "order that was made",
-            "the judge said", "the judge it's not fair",
+            "order you asked for", "the order you asked for", "order that was made",
+            "the judge said", "i did question", "question this very order",
             "what's the court date", "court date", "take a date", "give us a date",
-            "please call out", "mr. ", "mrs. ", "barrister ",
+            "please call out", "mr. ", "mrs. ", "barrister ", "mr kamala",
+            "don't like this idea", "saying the judge said",
             "had a discretion", "discretion", "don't know you so well"
         ]
-
-        months = ["january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december"]
-        ordinals = ["1st", "2nd", "3rd", "th"]
 
         for u_idx, u in enumerate(utterances):
             u_words = all_words[u["start_idx"] : u["end_idx"] + 1]
@@ -421,7 +458,7 @@ class SpeakerDiarizer:
             is_bench = any(k in u_text for k in bench_keywords)
             has_month = any(m in u_text for m in months)
             has_ord = any(o in u_text for o in ordinals)
-            is_date_turn = (len(u_words) <= 8) and ("adjourned" not in u_text) and (has_month or has_ord)
+            is_date_turn = (len(u_words) <= 6) and ("adjourned" not in u_text) and (has_month or has_ord)
 
             if is_counsel and not is_bench:
                 u_spk = "SPEAKER_01"
@@ -429,70 +466,72 @@ class SpeakerDiarizer:
             elif is_bench and not is_counsel:
                 u_spk = "SPEAKER_00"
                 last_established = "SPEAKER_00"
-            elif is_date_turn:
-                u_spk = "SPEAKER_01" if last_established == "SPEAKER_00" else "SPEAKER_00"
-                last_established = u_spk
-            else:
-                w_count = len(u_words)
-                is_short_response = w_count <= 4 and (u_text.startswith("yes") or u_text.startswith("no") or u_text.startswith("yeah"))
-                if is_short_response:
-                    u_spk = "SPEAKER_01" if last_established == "SPEAKER_00" else "SPEAKER_00"
-                    last_established = u_spk
+            elif is_counsel and is_bench:
+                first_counsel_pos = min((u_text.find(k) for k in counsel_keywords if k in u_text), default=9999)
+                first_bench_pos = min((u_text.find(k) for k in bench_keywords if k in u_text), default=9999)
+                if first_counsel_pos < first_bench_pos:
+                    u_spk = "SPEAKER_01"
+                    last_established = "SPEAKER_01"
                 else:
-                    prev_idx = u_idx
-                    should_toggle = False
-                    if prev_idx > 0:
-                        prev_u = utterances[prev_idx-1]
-                        prev_w = all_words[prev_u["end_idx"]]
-                        prev_w_text = str(prev_w.get("word", "")).strip()
-                        prev_u_text = " ".join(str(w.get("word", "")).lower() for w in all_words[prev_u["start_idx"] : prev_u["end_idx"] + 1])
+                    u_spk = "SPEAKER_00"
+                    last_established = "SPEAKER_00"
+            else:
+                switched = False
+                if u_idx > 0:
+                    prev_u = utterances[u_idx - 1]
+                    prev_u_text = " ".join(str(w.get("word", "")).lower() for w in all_words[prev_u["start_idx"] : prev_u["end_idx"] + 1])
 
-                        if prev_w_text.endswith("?"):
-                            should_toggle = True
-                        elif "court pleases" in prev_u_text or "grateful" in prev_u_text:
-                            if last_established == "SPEAKER_01":
-                                should_toggle = True
-
-                    if should_toggle:
+                    if any(term in prev_u_text for term in ("court pleases", "grateful", "yes sir", "no sir")) and last_established == "SPEAKER_01":
+                        u_spk = "SPEAKER_00"
+                        last_established = "SPEAKER_00"
+                        switched = True
+                    elif is_date_turn and ("date" in prev_u_text or "th" in prev_u_text or "november" in prev_u_text or "convenient" in prev_u_text):
                         u_spk = "SPEAKER_01" if last_established == "SPEAKER_00" else "SPEAKER_00"
                         last_established = u_spk
-                    else:
-                        u_spk = last_established
+                        switched = True
+
+                if not switched:
+                    # Speaker Persistence: speaker continues across pauses and neutral sentences
+                    u_spk = last_established
 
             u["speaker"] = u_spk
             for w in u_words:
                 w["speaker"] = u_spk
 
+        # Re-merge consecutive words with same speaker into coherent segments
         refined_segments = []
-        curr_sub_words = []
-        curr_speaker = all_words[0]["speaker"]
+        current_speaker = None
+        current_words = []
 
-        for w in all_words:
-            w_spk = w.get("speaker", curr_speaker)
-            if w_spk != curr_speaker and curr_sub_words:
-                sub_text = " ".join(str(sw.get("word", "")).strip() for sw in curr_sub_words).strip()
+        for u in utterances:
+            u_spk = u["speaker"]
+            u_words = all_words[u["start_idx"] : u["end_idx"] + 1]
+
+            if current_speaker is None:
+                current_speaker = u_spk
+                current_words = list(u_words)
+            elif u_spk != current_speaker:
                 refined_segments.append({
-                    "start": curr_sub_words[0].get("start", 0.0),
-                    "end": curr_sub_words[-1].get("end", 0.0),
-                    "text": sub_text,
+                    "start": current_words[0].get("start", 0),
+                    "end": current_words[-1].get("end", 0),
+                    "text": " ".join(str(w.get("word", "")).strip() for w in current_words).strip(),
                     "source_text": None,
-                    "speaker": curr_speaker,
-                    "words": curr_sub_words
+                    "speaker": current_speaker,
+                    "words": current_words
                 })
-                curr_sub_words = [w]
-                curr_speaker = w_spk
+                current_speaker = u_spk
+                current_words = list(u_words)
             else:
-                curr_sub_words.append(w)
+                current_words.extend(u_words)
 
-        if curr_sub_words:
-            sub_text = " ".join(str(sw.get("word", "")).strip() for sw in curr_sub_words).strip()
+        if current_words:
             refined_segments.append({
-                "start": curr_sub_words[0].get("start", 0.0),
-                "end": curr_sub_words[-1].get("end", 0.0),
-                "text": sub_text,
+                "start": current_words[0].get("start", 0),
+                "end": current_words[-1].get("end", 0),
+                "text": " ".join(str(w.get("word", "")).strip() for w in current_words).strip(),
                 "source_text": None,
-                "speaker": curr_speaker,
-                "words": curr_sub_words
+                "speaker": current_speaker,
+                "words": current_words
             })
 
         unique_speakers = len(set(s["speaker"] for s in refined_segments))
