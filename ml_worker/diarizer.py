@@ -79,7 +79,7 @@ class SpeakerDiarizer:
             
             # Prepare kwargs for min/max speakers (optional overrides)
             params = {}
-            target_min = min_speakers if min_speakers is not None else getattr(WorkerConfig, "MIN_SPEAKERS", None)
+            target_min = min_speakers if min_speakers is not None else getattr(WorkerConfig, "MIN_SPEAKERS", 2)
             if target_min is not None and target_min > 0:
                 params["min_speakers"] = target_min
             target_max = max_speakers if max_speakers is not None else getattr(WorkerConfig, "MAX_SPEAKERS", None)
@@ -356,7 +356,7 @@ class SpeakerDiarizer:
             if w.get("speaker") in chrono_map:
                 w["speaker"] = chrono_map[w["speaker"]]
 
-        # 8. Reconstruct segments: Group consecutive words by speaker
+        # 8. Reconstruct segments: Group consecutive words by speaker and natural sentence/pause boundaries
         refined_segments = []
         curr_speaker = None
         curr_words = []
@@ -366,8 +366,22 @@ class SpeakerDiarizer:
             if curr_speaker is None:
                 curr_speaker = spk
                 curr_words = [w]
-            elif spk != curr_speaker:
-                # Flush segment
+                continue
+
+            last_w = curr_words[-1]
+            gap = float(w.get("start", 0.0)) - float(last_w.get("end", 0.0))
+            seg_duration = float(w.get("end", 0.0)) - float(curr_words[0].get("start", 0.0))
+            last_text = str(last_w.get("word", "")).strip()
+            ends_sentence = any(last_text.endswith(p) for p in (".", "?", "!"))
+
+            should_split = (
+                (spk != curr_speaker) or
+                (gap >= 1.2) or
+                (ends_sentence and (seg_duration >= 6.0 or gap >= 0.4)) or
+                (seg_duration >= 20.0)
+            )
+
+            if should_split:
                 seg_text = " ".join(str(cw.get("word", "")).strip() for cw in curr_words).strip()
                 refined_segments.append({
                     "start": curr_words[0].get("start", 0.0),
