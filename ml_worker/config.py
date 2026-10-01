@@ -2,6 +2,7 @@ import os
 import uuid
 import socket
 from pathlib import Path
+from typing import Optional
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -27,8 +28,7 @@ class WorkerConfig:
 
     HF_TOKEN: str = get_hf_token.__func__(None)
     DIARIZATION_MODEL: str = os.getenv("DIARIZATION_MODEL", "pyannote/speaker-diarization-3.1")
-    ENABLE_DIARIZATION_DEFAULT: bool = os.getenv("ENABLE_DIARIZATION", "true").lower() == "true"
-    DIARIZATION_THRESHOLD: float = float(os.getenv("DIARIZATION_THRESHOLD", "0.52"))
+    DIARIZATION_THRESHOLD: Optional[float] = float(os.getenv("DIARIZATION_THRESHOLD")) if os.getenv("DIARIZATION_THRESHOLD") else None
     
     # Worker Identifiers & Concurrency
     WORKER_ID: str = os.getenv("WORKER_ID", f"gpu-worker-{socket.gethostname()}-{uuid.uuid4().hex[:6]}")
