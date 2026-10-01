@@ -102,12 +102,7 @@ class Transcriber:
             condition_on_previous_text=False, # Prevents hallucinations / skipping words
             no_speech_threshold=0.8,          # Preserves words even if background laughter raises no-speech score
             compression_ratio_threshold=2.4,
-            initial_prompt=(
-                "High Court proceedings. Legal terms: suit number, writ of summons, statement of claim, "
-                "front-loaded processes, statement of defence, counterclaim, motion on notice, motion ex parte, "
-                "substituted service, interpleader summons, Order 8 Rule 6, My Lord, Your Lordship, Learned Silk, "
-                "Justice Saidu, Mr. Komolafe, Counsel, adjourned for mention, ill-health."
-            )
+            initial_prompt="Suit No., /, Court, Plaintiff, Defendant, Counsel, Your Lordship, Milord."
         )
 
         detected_language = info.language

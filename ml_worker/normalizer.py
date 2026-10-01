@@ -39,22 +39,23 @@ COURT_REPLACEMENTS = [
     (r'(?i)\blearned\s+counsel\b', 'Learned Counsel'),
     (r'(?i)\blearned\s+colleague\b', 'Learned Colleague'),
     (r'(?i)\bas\s+the\s+court\s+pleases\b', 'As the Court pleases'),
-    (r'(?i)\bas\s+you\s+call\s+places?\b', 'As the Court pleases'),
+    (r'(?i)\bas\s+(?:you\s+call|equal)\s+places?\b', 'As the Court pleases'),
     (r'(?i)\bcall\s+places?\b', 'Court pleases'),
     (r'(?i)\bmay\s+it\s+please\s+the\s+court\b', 'May it please the Court'),
     (r'(?i)\bsenior\s+advocate\s+of\s+nigeria\b', 'Senior Advocate of Nigeria'),
     (r'(?i)\bmotion\s+on\s+notice\b', 'Motion on Notice'),
     (r'(?i)\bmotion\s+and\s+notice\b', 'Motion on Notice'),
     (r'(?i)\bmotion\s+ex\s+parte\b', 'Motion Ex Parte'),
-    (r'(?i)\bright\s+of\s+summons\b', 'writ of summons'),
-    (r'(?i)\brate\s+of\s+summons\b', 'writ of summons'),
-    (r'(?i)\bfront(?:al)?[\s-]+(?:ended|layer|dead)\s+processes\b', 'front-loaded processes'),
-    (r'(?i)\bfront[\s-]+(?:ended|layer|dead)\b', 'front-loaded'),
+    (r'(?i)\b(?:right|rate)\s+of\s+(?:summons|someone\'?s)\b', 'writ of summons'),
+    (r'(?i)\bfrontogect\b', 'front-loaded'),
+    (r'(?i)\bfront(?:al)?[\s-]+(?:ended|layer|dead|loaded)\s+processes\b', 'front-loaded processes'),
+    (r'(?i)\bfront[\s-]+(?:ended|layer|dead|loaded)\b', 'front-loaded'),
     (r'(?i)\bsubsets?\s+service\b', 'substituted service'),
     (r'(?i)\binterpleader\s+summon\b', 'interpleader summons'),
-    (r'(?i)\b(?:uncom|outcome)\s+proceedings\b', 'ongoing proceedings'),
-    (r'(?i)\b(?:Lord\s+)?Justice\s+(?:Seydoux|Seyidu|Seydu)\b', 'Justice Saidu'),
-    (r'(?i)\b(?:Seydoux|Seyidu|Seydu)\b', 'Saidu'),
+    (r'(?i)\b(?:uncom|outcome|ancor)\s+proceedings\b', 'ongoing proceedings'),
+    (r'(?i)\b(?:Lord\s+)?Justice\s+Said(?:\s+you)?\b', 'Justice Saidu'),
+    (r'(?i)\b(?:Lord\s+)?Justice\s+(?:Seydoux|Seyidu|Seydu|Zeydo)\b', 'Justice Saidu'),
+    (r'(?i)\b(?:Seydoux|Seyidu|Seydu|Zeydo)\b', 'Saidu'),
     (r'(?i)\bMr\.?\s+Komolafe\b', 'Mr. Komolafe'),
     (r'(?i)\bKamolafe\b', 'Komolafe'),
     (r'(?i)\badjourned\s+for\s+mentioned\b', 'adjourned for mention'),
@@ -262,25 +263,37 @@ def normalize_segment(segment: Dict[str, Any]) -> Dict[str, Any]:
             w_clean = clean_token(words[idx].get("word", ""))
             if w_clean == "kamolafe":
                 words[idx]["word"] = apply_proper_case(words[idx]["word"], "Komolafe")
-            elif w_clean in ("seydoux", "seyidu", "seydu"):
+            elif w_clean in ("seydoux", "seyidu", "seydu", "zeydo"):
                 words[idx]["word"] = apply_proper_case(words[idx]["word"], "Saidu")
+            elif w_clean == "frontogect":
+                words[idx]["word"] = apply_proper_case(words[idx]["word"], "front-loaded")
 
             if idx + 1 < len(words):
                 w1_clean = w_clean
                 w2_clean = clean_token(words[idx+1].get("word", ""))
-                if w1_clean in ("right", "rate") and w2_clean == "of" and idx + 2 < len(words) and clean_token(words[idx+2].get("word", "")) == "summons":
+                if w1_clean in ("right", "rate") and w2_clean == "of" and idx + 2 < len(words) and (clean_token(words[idx+2].get("word", "")) == "summons" or clean_token(words[idx+2].get("word", "")).startswith("someone")):
                     words[idx]["word"] = apply_proper_case(words[idx]["word"], "writ")
-                elif w1_clean == "front" and w2_clean in ("ended", "-ended", "layer", "-layer", "dead", "-dead"):
+                    words[idx+2]["word"] = apply_proper_case(words[idx+2]["word"], "summons")
+                elif w1_clean == "front" and (w2_clean in ("ended", "-ended", "layer", "-layer", "dead", "-dead", "loaded", "-loaded")):
                     words[idx]["word"] = apply_proper_case(words[idx]["word"], "front-loaded")
                     words[idx+1]["word"] = ""
-                elif w1_clean in ("front-ended", "front-layer", "front-dead"):
+                elif w1_clean in ("front-ended", "front-layer", "front-dead", "front-loaded", "frontloaded"):
                     words[idx]["word"] = apply_proper_case(words[idx]["word"], "front-loaded")
                 elif w1_clean in ("subsets", "subset") and w2_clean == "service":
                     words[idx]["word"] = apply_proper_case(words[idx]["word"], "substituted")
                 elif w1_clean == "interpleader" and w2_clean == "summon":
                     words[idx+1]["word"] = apply_proper_case(words[idx+1]["word"], "summons")
-                elif w1_clean in ("uncom", "outcome") and w2_clean == "proceedings":
+                elif w1_clean in ("uncom", "outcome", "ancor") and w2_clean == "proceedings":
                     words[idx]["word"] = apply_proper_case(words[idx]["word"], "ongoing")
+                elif (w1_clean in ("as", "equal") and w2_clean in ("equal", "call") and idx + 2 < len(words) and clean_token(words[idx+2].get("word", "")) in ("places", "place")):
+                    words[idx]["word"] = "As"
+                    words[idx+1]["word"] = "the"
+                    words[idx+2]["word"] = "Court pleases"
+                elif w1_clean == "justice" and w2_clean == "said" and idx + 2 < len(words) and clean_token(words[idx+2].get("word", "")) in ("you", "u"):
+                    words[idx+1]["word"] = "Saidu"
+                    words[idx+2]["word"] = ""
+                elif w1_clean == "justice" and w2_clean == "said":
+                    words[idx+1]["word"] = "Saidu"
                 elif w1_clean == "for" and w2_clean == "mentioned":
                     words[idx+1]["word"] = apply_proper_case(words[idx+1]["word"], "mention")
 
