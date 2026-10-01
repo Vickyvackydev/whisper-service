@@ -1,4 +1,4 @@
-﻿import time
+import time
 import logging
 from pathlib import Path
 from typing import Dict, Any, Optional, Callable
@@ -6,6 +6,7 @@ from ml_worker.config import WorkerConfig
 from ml_worker.audio import safe_download_audio, convert_to_wav_16k_mono, cleanup_file
 from ml_worker.transcriber import Transcriber
 from ml_worker.diarizer import SpeakerDiarizer
+from ml_worker.llm_diarizer import LLMRealignmentEngine
 
 logger = logging.getLogger("ml_worker.pipeline")
 
@@ -22,6 +23,7 @@ class InferencePipeline:
     def __init__(self, transcriber: Transcriber, diarizer: SpeakerDiarizer):
         self.transcriber = transcriber
         self.diarizer = diarizer
+        self.llm_engine = LLMRealignmentEngine()
         WorkerConfig.ensure_scratch_dir()
 
     def process(
@@ -93,6 +95,12 @@ class InferencePipeline:
                 logger.info(f"[{job_id}] Alignment complete: assigned {num_speakers} unique speakers.")
             else:
                 logger.warning(f"[{job_id}] Diarizer is not loaded. Defaulting all speakers to SPEAKER_00.")
+
+            # 4b. Layer 3 LLM Discourse & Legal Text Realignment Pass
+            if segments and self.llm_engine.enabled:
+                logger.info(f"[{job_id}] Running Layer 3 LLM Post-Processing pass...")
+                segments = self.llm_engine.process(segments)
+                num_speakers = len(set(s.get("speaker", "SPEAKER_00") for s in segments))
 
             # 5. Finalizing Result
             if progress_updater:
