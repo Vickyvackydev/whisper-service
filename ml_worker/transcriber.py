@@ -82,10 +82,10 @@ class Transcriber:
 
         # Optimal VAD and decoding parameters for high accuracy & preserving music/vocals
         vad_params = dict(
-            threshold=0.20,                # High sensitivity: captures quick remarks & speech mixed with laughter
+            threshold=0.20,                # High sensitivity: captures quick remarks & courtroom interjections
             min_speech_duration_ms=100,    # Catch rapid interjections (e.g. 100ms+)
-            min_silence_duration_ms=800,
-            speech_pad_ms=800              # Pad 800ms to ensure words before/after laughter are never dropped
+            min_silence_duration_ms=250,    # Isolate rapid micro-pauses between speaker interchanges
+            speech_pad_ms=300              # Pad 300ms to preserve leading/trailing word boundaries
         )
 
         segments_iter, info = self.model.transcribe(
@@ -95,12 +95,12 @@ class Transcriber:
             beam_size=beam_size,
             temperature=temperature,
             word_timestamps=True,
-            vad_filter=False,
+            vad_filter=True,
             vad_parameters=vad_params,
             condition_on_previous_text=False, # Prevents hallucinations / skipping words
-            no_speech_threshold=0.8,          # Preserves words even if background laughter raises no-speech score
+            no_speech_threshold=0.8,
             compression_ratio_threshold=2.4,
-            initial_prompt="Suit No., /, Court, Plaintiff, Defendant, Counsel, Your Lordship, Milord."
+            initial_prompt="Suit No., /, Court, Plaintiff, Defendant, Counsel, Your Lordship, Milord, My Lord."
         )
 
         detected_language = info.language

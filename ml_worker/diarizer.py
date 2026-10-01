@@ -340,7 +340,78 @@ class SpeakerDiarizer:
                 if gap_prev < 0.25 and gap_next < 0.25:
                     curr_w["speaker"] = prev_spk
 
-        # 7b. Re-index speakers chronologically so the first spoken word is strictly SPEAKER_00
+        # 7c. Legal Discourse Semantic Pass: Identify Judge vs Counsel acoustic roles and correct acoustic cross-talk
+        speaker_scores = {}
+        for w in flat_words:
+            spk = w.get("speaker")
+            if not spk:
+                continue
+            if spk not in speaker_scores:
+                speaker_scores[spk] = {"judge_score": 0, "counsel_score": 0}
+
+        n_w = len(flat_words)
+        for i in range(n_w):
+            w = flat_words[i]
+            spk = w.get("speaker")
+            if not spk:
+                continue
+
+            txt = str(w.get("word", "")).lower().strip(".,!?;:\"'()[]{}")
+
+            # Counsel markers: addressing the court/bench
+            if txt in ("milord", "lordship"):
+                speaker_scores[spk]["counsel_score"] += 5
+            elif txt == "my" and i + 1 < n_w:
+                next_txt = str(flat_words[i + 1].get("word", "")).lower().strip(".,!?;:\"'()[]{}")
+                if next_txt in ("lord", "lordship", "honor", "honour", "worship", "lady", "learned"):
+                    speaker_scores[spk]["counsel_score"] += 5
+            elif txt == "your" and i + 1 < n_w:
+                next_txt = str(flat_words[i + 1].get("word", "")).lower().strip(".,!?;:\"'()[]{}")
+                if next_txt in ("honor", "honour", "lordship", "worship"):
+                    speaker_scores[spk]["counsel_score"] += 5
+
+            # Judge markers: issuing rulings, bench commands, adjournment dates
+            elif txt in ("sustained", "overruled", "adjourned", "struckout"):
+                speaker_scores[spk]["judge_score"] += 4
+            elif txt in ("court", "president") and i > 0:
+                prev_txt = str(flat_words[i - 1].get("word", "")).lower().strip(".,!?;:\"'()[]{}")
+                if prev_txt in ("the", "this", "honorable", "honourable"):
+                    speaker_scores[spk]["judge_score"] += 3
+
+        judge_speakers = set()
+        counsel_speakers = set()
+        for spk, scores in speaker_scores.items():
+            if scores["judge_score"] > scores["counsel_score"] and scores["judge_score"] >= 3:
+                judge_speakers.add(spk)
+            elif scores["counsel_score"] > scores["judge_score"] and scores["counsel_score"] >= 3:
+                counsel_speakers.add(spk)
+
+        # Realign Honorific Addresses: If a phrase starts with "My Lord" / "Your Honor" and is assigned to a Judge speaker,
+        # realign that honorific and its immediate spoken clause to Counsel!
+        if judge_speakers and counsel_speakers:
+            primary_counsel = list(counsel_speakers)[0]
+            idx = 0
+            while idx < n_w - 1:
+                w1 = flat_words[idx]
+                w2 = flat_words[idx + 1]
+                t1 = str(w1.get("word", "")).lower().strip(".,!?;:\"'()[]{}")
+                t2 = str(w2.get("word", "")).lower().strip(".,!?;:\"'()[]{}")
+
+                is_honorific = (t1 in ("my", "your") and t2 in ("lord", "lordship", "honor", "honour", "worship")) or (t1 in ("milord", "milord,"))
+                if is_honorific and w1.get("speaker") in judge_speakers:
+                    j = idx
+                    while j < min(n_w, idx + 12):
+                        wj = flat_words[j]
+                        wj["speaker"] = primary_counsel
+                        txt_j = str(wj.get("word", "")).strip()
+                        if any(txt_j.endswith(p) for p in (".", "?", "!")):
+                            break
+                        j += 1
+                    idx = max(idx + 1, j)
+                else:
+                    idx += 1
+
+        # 7d. Re-index speakers chronologically so the first spoken word is strictly SPEAKER_00
         first_appearance = []
         for w in flat_words:
             spk = w.get("speaker")
