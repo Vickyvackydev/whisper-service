@@ -64,10 +64,8 @@ class Transcriber:
         lang_arg = language.lower().strip() if (language and language.lower().strip() not in ("auto", "none")) else None
         target_lang_arg = target_language.lower().strip() if target_language else None
 
-        # exscriptai-backend maps 'auto' to 'en'. If lang_arg is 'en', clear it to None so Whisper auto-detects 
-        # the true spoken audio language (e.g. French 'fr', Spanish 'es', German 'de').
-        if lang_arg == "en":
-            logger.info("Source language passed as 'en'. Clearing to None for auto-detection of true spoken audio language.")
+        # If lang_arg is 'en', preserve it so Whisper transcribes cleanly without language auto-detection misclassifications
+        if lang_arg in ("auto", "none", ""):
             lang_arg = None
 
         # Determine task ('translate' vs 'transcribe')

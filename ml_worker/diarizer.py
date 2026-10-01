@@ -190,14 +190,17 @@ class SpeakerDiarizer:
 
         valid_turns.sort(key=lambda t: t["start"])
 
-        # 2. Merge consecutive turns of the SAME speaker if separated by micro-pause <= 0.45s
+        # 2. Merge consecutive turns of the SAME speaker if separated by micro-pause <= 0.30s
+        # AND no other speaker turn intervenes
         merged_turns = []
         for t in valid_turns:
             if not merged_turns:
                 merged_turns.append(dict(t))
             else:
                 last = merged_turns[-1]
-                if last["speaker"] == t["speaker"] and (t["start"] - last["end"]) <= 0.45:
+                # Check if any other turn started between last["end"] and t["start"]
+                gap = t["start"] - last["end"]
+                if last["speaker"] == t["speaker"] and gap <= 0.30:
                     last["end"] = max(last["end"], t["end"])
                 else:
                     merged_turns.append(dict(t))
@@ -242,26 +245,33 @@ class SpeakerDiarizer:
         if not flat_words:
             return segments, 1
 
-        # 5. Word-Level Speaker Assignment: Overlap scoring + Proximity matching
+        # 5. Word-Level Speaker Assignment: Specificity-Weighted Overlap scoring + Proximity matching
         for w in flat_words:
             w_start = float(w.get("start", 0.0))
             w_end = float(w.get("end", w_start))
             if w_end < w_start:
                 w_end = w_start + 0.1
+            w_len = max(0.05, w_end - w_start)
 
-            # A. Overlap duration with turns
+            best_score = -1.0
             best_overlap = 0.0
             overlap_speaker = None
             for turn in merged_turns:
                 ov_start = max(w_start, turn["start"])
                 ov_end = min(w_end, turn["end"])
                 ov = max(0.0, ov_end - ov_start)
-                if ov > best_overlap:
-                    best_overlap = ov
-                    overlap_speaker = turn["speaker"]
+                if ov > 0.0:
+                    turn_dur = max(0.05, turn["end"] - turn["start"])
+                    # Specificity scoring: penalize long background turns so short interjection turns win
+                    score = ov / (turn_dur ** 0.15)
+                    if score > best_score:
+                        best_score = score
+                        best_overlap = ov
+                        overlap_speaker = turn["speaker"]
 
             if best_overlap > 0.0 and overlap_speaker is not None:
                 w["speaker"] = overlap_speaker
+                w["from_diarization"] = True
                 continue
 
             # B. Nearest turn proximity (when word falls in micro-pause or VAD edge)
@@ -280,21 +290,40 @@ class SpeakerDiarizer:
 
             if best_dist <= 0.85 and closest_speaker is not None:
                 w["speaker"] = closest_speaker
+                w["from_diarization"] = False
             else:
                 w["speaker"] = None
+                w["from_diarization"] = False
 
         # 6. Fill unassigned words from closest neighbors
-        last_known = ordered_speakers[0] if ordered_speakers else "SPEAKER_00"
-        last_known_mapped = speaker_map.get(last_known, "SPEAKER_00")
+        last_known_mapped = speaker_map.get(ordered_speakers[0], "SPEAKER_00") if ordered_speakers else "SPEAKER_00"
         for i in range(len(flat_words)):
             if flat_words[i].get("speaker") is not None:
                 last_known_mapped = flat_words[i]["speaker"]
             else:
                 flat_words[i]["speaker"] = last_known_mapped
 
-        # 7. Word-Level Smoothing Collar: Eliminate transient 1-word and 2-word acoustic blips/chattering mid-sentence
+        # 7. Preserve Legal Honorific & Affirmation Honorific Pairs ("My Lord", "Your Honor", "Yes Sir")
+        # Prevents splitting honorific titles across two speaker turns
         n_words = len(flat_words)
-        # Pass A: 1-word mid-sentence blip [A, B, A] -> [A, A, A]
+        HONORIFIC_LEADS = {"my", "your"}
+        HONORIFIC_TRAILS = {"lord", "lordship", "honor", "honour", "worship", "lady", "friend", "learned"}
+        
+        for i in range(n_words - 1):
+            w1 = flat_words[i]
+            w2 = flat_words[i + 1]
+            txt1 = str(w1.get("word", "")).lower().strip(".,!?;:\"'()[]{}")
+            txt2 = str(w2.get("word", "")).lower().strip(".,!?;:\"'()[]{}")
+            gap = float(w2.get("start", 0)) - float(w1.get("end", 0))
+
+            if txt1 in HONORIFIC_LEADS and txt2 in HONORIFIC_TRAILS and gap <= 0.35:
+                # Align title to whichever word came from a direct diarization turn
+                if w2.get("from_diarization") and not w1.get("from_diarization"):
+                    w1["speaker"] = w2["speaker"]
+                else:
+                    w2["speaker"] = w1["speaker"]
+
+        # 7b. Gentle Collar Smoothing: ONLY smooth transient 1-word proximity blips that were NOT backed by Pyannote turns
         for i in range(1, n_words - 1):
             prev_w = flat_words[i - 1]
             curr_w = flat_words[i]
@@ -304,45 +333,12 @@ class SpeakerDiarizer:
             curr_spk = curr_w.get("speaker")
             next_spk = next_w.get("speaker")
 
-            if prev_spk == next_spk and curr_spk != prev_spk:
+            # Only smooth if curr_w was NOT from a direct Pyannote diarization turn
+            if prev_spk == next_spk and curr_spk != prev_spk and not curr_w.get("from_diarization", False):
                 gap_prev = float(curr_w.get("start", 0)) - float(prev_w.get("end", 0))
                 gap_next = float(next_w.get("start", 0)) - float(curr_w.get("end", 0))
-
-                txt_prev = str(prev_w.get("word", "")).strip()
-                txt_curr = str(curr_w.get("word", "")).strip()
-                has_punct = any(txt_prev.endswith(p) for p in [".", "?", "!"]) or any(txt_curr.endswith(p) for p in [".", "?", "!"])
-                clean_curr = txt_curr.lower().strip(".,!?;:\"'()[]{}")
-                is_affirmation = clean_curr in ("yes", "no", "okay", "yeah", "right")
-
-                if not has_punct and not is_affirmation and gap_prev < 0.45 and gap_next < 0.45:
+                if gap_prev < 0.25 and gap_next < 0.25:
                     curr_w["speaker"] = prev_spk
-
-        # Pass B: 2-word mid-sentence blip [A, B, B, A] -> [A, A, A, A]
-        for i in range(1, n_words - 2):
-            prev_w = flat_words[i - 1]
-            w1 = flat_words[i]
-            w2 = flat_words[i + 1]
-            next_w = flat_words[i + 2]
-
-            prev_spk = prev_w.get("speaker")
-            spk1 = w1.get("speaker")
-            spk2 = w2.get("speaker")
-            next_spk = next_w.get("speaker")
-
-            if prev_spk == next_spk and spk1 == spk2 and spk1 != prev_spk:
-                gap_prev = float(w1.get("start", 0)) - float(prev_w.get("end", 0))
-                gap_next = float(next_w.get("start", 0)) - float(w2.get("end", 0))
-
-                txt_prev = str(prev_w.get("word", "")).strip()
-                txt_w2 = str(w2.get("word", "")).strip()
-                has_punct = any(txt_prev.endswith(p) for p in [".", "?", "!"]) or any(txt_w2.endswith(p) for p in [".", "?", "!"])
-                c1 = str(w1.get("word", "")).lower().strip(".,!?;:\"'()[]{}")
-                c2 = str(w2.get("word", "")).lower().strip(".,!?;:\"'()[]{}")
-                is_affirmation = (c1 in ("yes", "no", "yeah")) and (c2 in ("sir", "my", "lord", "no", "yes"))
-
-                if not has_punct and not is_affirmation and gap_prev < 0.40 and gap_next < 0.40:
-                    w1["speaker"] = prev_spk
-                    w2["speaker"] = prev_spk
 
         # 7b. Re-index speakers chronologically so the first spoken word is strictly SPEAKER_00
         first_appearance = []

@@ -108,11 +108,38 @@ def convert_to_wav_16k_mono(input_path: Path, output_dir: Path) -> Tuple[Path, f
                 duration = float(info.duration)
                 if duration > 0:
                     logger.info(f"Converted audio via FFmpeg: duration={duration:.2f}s, path={wav_path}")
-                    return wav_path, duration
         except Exception as ffmpeg_err:
-            logger.warning(f"FFmpeg attempt failed ({ffmpeg_err}). Using pure-Python soundfile...")
+            logger.warning(f"FFmpeg attempt failed ({ffmpeg_err}). Using PyAV fallback...")
 
-    # 2. Pure Python fallback using soundfile & numpy
+    # 2. Try PyAV (bundled FFmpeg in Python) if system FFmpeg is missing
+    try:
+        import av
+        logger.info(f"Decoding audio container via PyAV engine: {input_path.name}")
+        container = av.open(str(input_path))
+        audio_stream = next((s for s in container.streams if s.type == 'audio'), None)
+        if audio_stream is not None:
+            resampler = av.AudioResampler(format='flt', layout='mono', rate=16000)
+            pcm_chunks = []
+            for frame in container.decode(audio_stream):
+                frame.pts = None
+                resampled_frames = resampler.resample(frame)
+                for rframe in resampled_frames:
+                    pcm_chunks.append(rframe.to_ndarray())
+            flushed = resampler.resample(None)
+            if flushed:
+                for rframe in flushed:
+                    pcm_chunks.append(rframe.to_ndarray())
+            if pcm_chunks:
+                data = np.concatenate(pcm_chunks, axis=1).squeeze(0)
+                duration = float(len(data) / 16000.0)
+                if duration > 0:
+                    sf.write(str(wav_path), data.astype(np.float32), 16000, subtype="PCM_16")
+                    logger.info(f"Converted audio via PyAV: duration={duration:.2f}s, path={wav_path}")
+                    return wav_path, duration
+    except Exception as av_err:
+        logger.warning(f"PyAV attempt failed ({av_err}). Falling back to pure-Python soundfile...")
+
+    # 3. Pure Python fallback using soundfile & numpy
     try:
         logger.info(f"Converting audio using pure-Python soundfile engine: {input_path.name}")
         data, sample_rate = sf.read(str(input_path), dtype="float32")
