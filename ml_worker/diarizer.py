@@ -79,10 +79,12 @@ class SpeakerDiarizer:
             
             # Prepare kwargs for min/max speakers (optional overrides)
             params = {}
-            if min_speakers is not None and min_speakers > 0:
-                params["min_speakers"] = min_speakers
-            if max_speakers is not None and max_speakers > 0:
-                params["max_speakers"] = max_speakers
+            target_min = min_speakers if min_speakers is not None else getattr(WorkerConfig, "MIN_SPEAKERS", 2)
+            if target_min is not None and target_min > 0:
+                params["min_speakers"] = target_min
+            target_max = max_speakers if max_speakers is not None else getattr(WorkerConfig, "MAX_SPEAKERS", None)
+            if target_max is not None and target_max > 0:
+                params["max_speakers"] = target_max
 
             diarization_output = None
 
