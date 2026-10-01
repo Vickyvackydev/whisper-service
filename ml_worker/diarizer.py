@@ -344,6 +344,18 @@ class SpeakerDiarizer:
                     w1["speaker"] = prev_spk
                     w2["speaker"] = prev_spk
 
+        # 7b. Re-index speakers chronologically so the first spoken word is strictly SPEAKER_00
+        first_appearance = []
+        for w in flat_words:
+            spk = w.get("speaker")
+            if spk and spk not in first_appearance:
+                first_appearance.append(spk)
+
+        chrono_map = {orig: f"SPEAKER_{idx:02d}" for idx, orig in enumerate(first_appearance)}
+        for w in flat_words:
+            if w.get("speaker") in chrono_map:
+                w["speaker"] = chrono_map[w["speaker"]]
+
         # 8. Reconstruct segments: Group consecutive words by speaker
         refined_segments = []
         curr_speaker = None

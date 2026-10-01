@@ -46,7 +46,7 @@ class MLWorker:
         self.transcriber.load_model()
 
         # 3. Load Diarization Pipeline (once at startup if enabled)
-        if self.config.ENABLE_DIARIZATION_DEFAULT:
+        if getattr(self.config, "ENABLE_DIARIZATION_DEFAULT", True):
             self.diarizer.load_model()
 
         # 4. Initialize Inference Pipeline
