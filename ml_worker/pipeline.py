@@ -122,6 +122,10 @@ class InferencePipeline:
                     aligned_result = {"segments": segments}
 
             # Diarization & Word Midpoint Stitching
+            total_align_segs = len(aligned_result.get("segments", []))
+            failed_align_segs = sum(1 for s in aligned_result.get("segments", []) if not s.get("words"))
+            logger.info(f"[{job_id}] [DIAGNOSTIC] Alignment status: {total_align_segs - failed_align_segs}/{total_align_segs} segments have word-level timestamps ({failed_align_segs} failed alignment).")
+
             logger.info(f"[{job_id}] Diarization check: requested={enable_diarization}, model_loaded={self.diarizer.is_loaded}")
             if self.diarizer.is_loaded and enable_diarization:
                 if progress_updater:
@@ -132,9 +136,35 @@ class InferencePipeline:
 
                 if len(diarize_df) > 0:
                     try:
+                        # 1. Dump raw Pyannote intervals for the first 35 seconds
+                        if hasattr(diarize_df, "iterrows"):
+                            early_df = diarize_df[diarize_df["start"] <= 35.0] if "start" in diarize_df.columns else diarize_df.head(15)
+                            pyannote_intervals = "\n".join([
+                                f"    [{row.get('start', 0.0):.2f}s -> {row.get('end', 0.0):.2f}s] {row.get('speaker', 'UNKNOWN')}"
+                                for _, row in early_df.iterrows()
+                            ])
+                            logger.info(f"[{job_id}] [DIAGNOSTIC 1: Raw Pyannote intervals (first 35s)]:\n{pyannote_intervals}")
+
                         import whisperx
                         stitched = whisperx.assign_word_speakers(diarize_df, aligned_result, fill_nearest=True)
+
+                        # 2. Dump raw word speakers directly after whisperx.assign_word_speakers
+                        raw_early_words = []
+                        for s in stitched.get("segments", []):
+                            for w in s.get("words", []):
+                                if float(w.get("start", 0.0)) <= 35.0:
+                                    raw_early_words.append(f"{w.get('word', '')}[{w.get('speaker', 'NONE')}]")
+                        logger.info(f"[{job_id}] [DIAGNOSTIC 2: Raw Word Speakers from WhisperX (first 35s)]:\n" + " ".join(raw_early_words[:80]))
+
                         segments, num_speakers = self.reconstruct_speaker_turns(stitched)
+
+                        # 3. Dump final reconstructed turns for first 35 seconds
+                        final_early_turns = []
+                        for s in segments:
+                            if float(s.get("start", 0.0)) <= 35.0:
+                                final_early_turns.append(f"    [{s.get('start', 0.0):.2f}s -> {s.get('end', 0.0):.2f}s] {s.get('speaker')}: \"{s.get('text', '')}\"")
+                        logger.info(f"[{job_id}] [DIAGNOSTIC 3: Final Reconstructed Turns (first 35s)]:\n" + "\n".join(final_early_turns))
+
                         logger.info(f"[{job_id}] AssemblyAI-grade speaker alignment complete: {num_speakers} unique speakers, {len(segments)} turns.")
                     except ImportError as ix_err:
                         logger.warning(f"[{job_id}] whisperx is not installed in the worker's environment ({ix_err}). Falling back to standard turn assignment.")
