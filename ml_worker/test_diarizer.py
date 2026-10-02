@@ -190,20 +190,21 @@ class TestSpeakerDiarizer(unittest.TestCase):
         unique_spks = set(t["speaker"] for t in consolidated)
         self.assertEqual(len(unique_spks), 2, f"Expected 2 speakers preserved, got: {unique_spks}")
 
-    def test_dominant_speaker_absorbs_micro_noise_blip(self):
+    def test_short_interjection_preserved_in_dialogue(self):
         """
-        One speaker speaks for 45s (95% of speech). A 0.8s micro-fragment is detected.
-        It should be absorbed into the dominant speaker.
+        One speaker speaks for 20s, another interjects for 0.8s ("Bring money"), then the first speaker continues.
+        The 0.8s interjection must be preserved as SPEAKER_01, not absorbed by dominant speaker.
         """
         turns = [
             {"start": 0.0, "end": 20.0, "speaker": "SPEAKER_00"},
-            {"start": 20.5, "end": 21.3, "speaker": "SPEAKER_01"}, # 0.8s artifact
+            {"start": 20.5, "end": 21.3, "speaker": "SPEAKER_01"}, # 0.8s interjection
             {"start": 22.0, "end": 45.0, "speaker": "SPEAKER_00"},
         ]
         consolidated = self.diarizer._consolidate_fragmented_speakers(turns)
         unique_spks = set(t["speaker"] for t in consolidated)
-        self.assertEqual(len(unique_spks), 1)
+        self.assertEqual(len(unique_spks), 2)
         self.assertIn("SPEAKER_00", unique_spks)
+        self.assertIn("SPEAKER_01", unique_spks)
 
 class TestReconstructSpeakerTurns(unittest.TestCase):
     def setUp(self):

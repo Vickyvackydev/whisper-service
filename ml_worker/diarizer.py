@@ -40,9 +40,9 @@ class SpeakerDiarizer:
             # IMPORTANT ORDER: call instantiate() FIRST (applies via Pyannote schema),
             # then override attributes DIRECTLY AFTER so our values are never overwritten.
             try:
-                thresh  = getattr(WorkerConfig, "DIARIZATION_THRESHOLD", 0.70)
-                min_off = getattr(WorkerConfig, "MIN_DURATION_OFF", 0.35)
-                min_on  = getattr(WorkerConfig, "MIN_DURATION_ON", 0.20)
+                thresh  = getattr(WorkerConfig, "DIARIZATION_THRESHOLD", 0.63)
+                min_off = getattr(WorkerConfig, "MIN_DURATION_OFF", 0.20)
+                min_on  = getattr(WorkerConfig, "MIN_DURATION_ON", 0.08)
 
                 # Step 1: pipeline.instantiate() — respects Pyannote's internal schema
                 instantiate_params = {}
@@ -350,49 +350,17 @@ class SpeakerDiarizer:
                 curr = to_merge[curr]
             return curr
 
-        # 1. Acoustic Similarity Merging (sim >= 0.72)
-        for i in range(len(ranked_speakers)):
-            spk_main = ranked_speakers[i]
-            target = get_root_target(spk_main)
-            for j in range(i + 1, len(ranked_speakers)):
-                spk_other = ranked_speakers[j]
-                if spk_other in to_merge:
-                    continue
-                if spk_main in speaker_centroids and spk_other in speaker_centroids:
-                    sim = float(np.dot(speaker_centroids[spk_main], speaker_centroids[spk_other]))
-                    if sim >= 0.72:
-                        to_merge[spk_other] = target
-                        logger.info(f"[CONSOLIDATION] Merging '{spk_other}' into '{target}' — acoustic similarity {sim:.3f}")
-
-        # 2. Pure Sequential Monologue Detection (Zero Conversational Returns)
+        # Pure Sequential Monologue Detection (Zero Conversational Returns)
         # In a real conversation, speakers alternate (return_speaker_count >= 1).
-        # If returns == 0 and audio duration <= 120s, non-dominant sequential blocks are acoustic splits of one speaker!
-        if return_speaker_count == 0 and total_audio_dur <= 120.0 and n_speakers >= 2:
+        # If returns == 0 and audio duration <= 60s, non-dominant sequential blocks are acoustic splits of one speaker reading/speaking continuously.
+        # NOTE: Dominance (>85%), fragment (<2s), and similarity (>=0.72) heuristics were removed per consultant recommendations
+        # to ensure that short interjections (e.g. mother's 1-2s remarks) and distinct room voices (father vs judge) are never merged.
+        if return_speaker_count == 0 and total_audio_dur <= 60.0 and n_speakers >= 2:
             target = get_root_target(dominant)
             for spk in ranked_speakers:
                 if spk != target and spk not in to_merge:
                     to_merge[spk] = target
-                    logger.info(f"[CONSOLIDATION] Merging '{spk}' into dominant '{target}' — pure sequential short audio (returns=0, dur={total_audio_dur:.1f}s)")
-
-        # 3. Dominant Speaker Dominance Check (>= 85% speech time)
-        dom_fraction = speaker_durations[dominant] / total_speech
-        if dom_fraction >= 0.85:
-            target = get_root_target(dominant)
-            for spk, dur in speaker_durations.items():
-                if spk != target and spk not in to_merge:
-                    if speaker_runs.get(spk, 0) <= 1 or dur < 3.0:
-                        to_merge[spk] = target
-                        logger.info(f"[CONSOLIDATION] Merging '{spk}' into dominant '{target}' — dominant speaker holds {dom_fraction*100:.1f}%")
-
-        # 4. Tiny Fragment Pruning
-        adaptive_fraction = max(0.015, base_min_fraction / max(1.0, n_speakers / 2.0))
-        target = get_root_target(dominant)
-        for spk, dur in speaker_durations.items():
-            if spk != target and spk not in to_merge:
-                fraction = dur / total_speech
-                if fraction < adaptive_fraction and dur < min_seconds:
-                    to_merge[spk] = target
-                    logger.info(f"[CONSOLIDATION] Merging tiny fragment '{spk}' ({dur:.1f}s, {fraction*100:.1f}%) into '{target}'")
+                    logger.info(f"[CONSOLIDATION] Merging '{spk}' into dominant '{target}' — pure sequential short monologue (returns=0, dur={total_audio_dur:.1f}s)")
 
         # 5. Apply Merges
         merged_turns = []
@@ -606,94 +574,6 @@ class SpeakerDiarizer:
                     w1["speaker"] = w2["speaker"]
                 else:
                     w2["speaker"] = w1["speaker"]
-
-        # 7b. Gentle Collar Smoothing: ONLY smooth transient 1-word proximity blips that were NOT backed by Pyannote turns
-        for i in range(1, n_words - 1):
-            prev_w = flat_words[i - 1]
-            curr_w = flat_words[i]
-            next_w = flat_words[i + 1]
-
-            prev_spk = prev_w.get("speaker")
-            curr_spk = curr_w.get("speaker")
-            next_spk = next_w.get("speaker")
-
-            # Only smooth if curr_w was NOT from a direct Pyannote diarization turn
-            if prev_spk == next_spk and curr_spk != prev_spk and not curr_w.get("from_diarization", False):
-                gap_prev = float(curr_w.get("start", 0)) - float(prev_w.get("end", 0))
-                gap_next = float(next_w.get("start", 0)) - float(curr_w.get("end", 0))
-                if gap_prev < 0.25 and gap_next < 0.25:
-                    curr_w["speaker"] = prev_spk
-
-        # 7c. Legal Discourse Semantic Pass: Identify Judge vs Counsel acoustic roles and correct acoustic cross-talk
-        speaker_scores = {}
-        for w in flat_words:
-            spk = w.get("speaker")
-            if not spk:
-                continue
-            if spk not in speaker_scores:
-                speaker_scores[spk] = {"judge_score": 0, "counsel_score": 0}
-
-        n_w = len(flat_words)
-        for i in range(n_w):
-            w = flat_words[i]
-            spk = w.get("speaker")
-            if not spk:
-                continue
-
-            txt = str(w.get("word", "")).lower().strip(".,!?;:\"'()[]{}")
-
-            # Counsel markers: addressing the court/bench
-            if txt in ("milord", "lordship"):
-                speaker_scores[spk]["counsel_score"] += 5
-            elif txt == "my" and i + 1 < n_w:
-                next_txt = str(flat_words[i + 1].get("word", "")).lower().strip(".,!?;:\"'()[]{}")
-                if next_txt in ("lord", "lordship", "honor", "honour", "worship", "lady", "learned"):
-                    speaker_scores[spk]["counsel_score"] += 5
-            elif txt == "your" and i + 1 < n_w:
-                next_txt = str(flat_words[i + 1].get("word", "")).lower().strip(".,!?;:\"'()[]{}")
-                if next_txt in ("honor", "honour", "lordship", "worship"):
-                    speaker_scores[spk]["counsel_score"] += 5
-
-            # Judge markers: issuing rulings, bench commands, adjournment dates
-            elif txt in ("sustained", "overruled", "adjourned", "struckout"):
-                speaker_scores[spk]["judge_score"] += 4
-            elif txt in ("court", "president") and i > 0:
-                prev_txt = str(flat_words[i - 1].get("word", "")).lower().strip(".,!?;:\"'()[]{}")
-                if prev_txt in ("the", "this", "honorable", "honourable"):
-                    speaker_scores[spk]["judge_score"] += 3
-
-        judge_speakers = set()
-        counsel_speakers = set()
-        for spk, scores in speaker_scores.items():
-            if scores["judge_score"] > scores["counsel_score"] and scores["judge_score"] >= 3:
-                judge_speakers.add(spk)
-            elif scores["counsel_score"] > scores["judge_score"] and scores["counsel_score"] >= 3:
-                counsel_speakers.add(spk)
-
-        # Realign Honorific Addresses: If a phrase starts with "My Lord" / "Your Honor" and is assigned to a Judge speaker,
-        # realign that honorific and its immediate spoken clause to Counsel!
-        if judge_speakers and counsel_speakers:
-            primary_counsel = list(counsel_speakers)[0]
-            idx = 0
-            while idx < n_w - 1:
-                w1 = flat_words[idx]
-                w2 = flat_words[idx + 1]
-                t1 = str(w1.get("word", "")).lower().strip(".,!?;:\"'()[]{}")
-                t2 = str(w2.get("word", "")).lower().strip(".,!?;:\"'()[]{}")
-
-                is_honorific = (t1 in ("my", "your") and t2 in ("lord", "lordship", "honor", "honour", "worship")) or (t1 in ("milord", "milord,"))
-                if is_honorific and w1.get("speaker") in judge_speakers:
-                    j = idx
-                    while j < min(n_w, idx + 12):
-                        wj = flat_words[j]
-                        wj["speaker"] = primary_counsel
-                        txt_j = str(wj.get("word", "")).strip()
-                        if any(txt_j.endswith(p) for p in (".", "?", "!")):
-                            break
-                        j += 1
-                    idx = max(idx + 1, j)
-                else:
-                    idx += 1
 
         # 7d. Re-index speakers chronologically so the first spoken word is strictly SPEAKER_00
         first_appearance = []
