@@ -127,10 +127,15 @@ class InferencePipeline:
                 logger.info(f"[{job_id}] Diarization generated {len(diarize_df)} intervals.")
 
                 if len(diarize_df) > 0:
-                    import whisperx
-                    stitched = whisperx.assign_word_speakers(diarize_df, aligned_result, fill_nearest=True)
-                    segments, num_speakers = self.reconstruct_speaker_turns(stitched)
-                    logger.info(f"[{job_id}] AssemblyAI-grade speaker alignment complete: {num_speakers} unique speakers, {len(segments)} turns.")
+                    try:
+                        import whisperx
+                        stitched = whisperx.assign_word_speakers(diarize_df, aligned_result, fill_nearest=True)
+                        segments, num_speakers = self.reconstruct_speaker_turns(stitched)
+                        logger.info(f"[{job_id}] AssemblyAI-grade speaker alignment complete: {num_speakers} unique speakers, {len(segments)} turns.")
+                    except ImportError as ix_err:
+                        logger.warning(f"[{job_id}] whisperx is not installed in the worker's environment ({ix_err}). Falling back to standard turn assignment.")
+                        turns = diarize_df.to_dict(orient="records") if hasattr(diarize_df, "to_dict") else []
+                        segments, num_speakers = self.diarizer.assign_speakers(aligned_result.get("segments", segments), turns)
                 else:
                     logger.warning(f"[{job_id}] Diarization produced 0 turns. Defaulting to SPEAKER_00.")
                     segments = aligned_result.get("segments", segments)
