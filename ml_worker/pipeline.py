@@ -262,101 +262,35 @@ class InferencePipeline:
         if not all_words:
             return stitched_result.get("segments", []), 1
 
-        # PASS 1: Sentence Continuity Protection
-        # A speaker NEVER switches mid-sentence across a sub-450ms pause when previous word has no punctuation
+        # PASS 1: Acoustic Jitter Smoothing (Single Isolated Word Glitch Removal)
+        # If a single short word (<0.22s) with minimal silence (<0.15s) is flanked on BOTH
+        # sides by the SAME speaker (e.g. A -> B -> A), smooth it to avoid phoneme alignment edge artifacts.
         n = len(all_words)
-        for i in range(n - 1):
+        for i in range(1, n - 1):
+            w_prev = all_words[i - 1]
             w_curr = all_words[i]
             w_next = all_words[i + 1]
-            gap = w_next["start"] - w_curr["end"]
-            curr_text = str(w_curr["word"]).strip()
-            ends_sentence = any(curr_text.endswith(p) for p in (".", "?", "!"))
             
-            if not ends_sentence and gap < 0.45:
-                if w_next["speaker"] != w_curr["speaker"]:
-                    w_next["speaker"] = w_curr["speaker"]
+            spk_prev = w_prev["speaker"]
+            spk_curr = w_curr["speaker"]
+            spk_next = w_next["speaker"]
+            
+            if spk_prev == spk_next and spk_curr != spk_prev:
+                dur = w_curr["end"] - w_curr["start"]
+                gap_before = w_curr["start"] - w_prev["end"]
+                gap_after = w_next["start"] - w_curr["end"]
+                prev_text = str(w_prev["word"]).strip()
+                ends_sentence = any(prev_text.endswith(p) for p in (".", "?", "!"))
+                
+                if dur < 0.22 and gap_before < 0.15 and gap_after < 0.15 and not ends_sentence:
+                    w_curr["speaker"] = spk_prev
 
-        # PASS 2: Courtroom Role Semantic Identification
-        judge_patterns = [
-            r"\b(?:my|the)\s+judgement\b",
-            r"\b(?:my|the)\s+ruling\b",
-            r"\bout\s+of\s+the\s+courtroom\b",
-            r"\bstop\s+interjecting\b",
-            r"\bkeep\s+quiet\b",
-            r"\bwatch\s+what\s+you\s+are\s+saying\b",
-            r"\blet'?s\s+resolve\s+this\b",
-            r"\blet\s+him\s+finish\b",
-            r"\blet\s+me\s+listen\b",
-            r"\bwho\s+was\s+paying\b",
-            r"\byou\s+want\s+to\s+be\s+a\s+judge\b",
-            r"\bstand\s+down\b",
-            r"\badjourned\b",
-            r"\bsustained\b",
-            r"\boverruled\b",
-            r"\border\s+in\s+court\b",
-            r"\bthis\s+court\b",
-            r"\bthe\s+court\s+rules\b",
-            r"\bmy\s+orders?\b",
-            r"\bask\s+him\s+not\s+to\b"
-        ]
-        addressing_court_patterns = [
-            r"\byour\s+honou?r\b",
-            r"\bmy\s+lord\b",
-            r"\byour\s+lordship\b",
-            r"\bmilord\b",
-            r"\bmy\s+ladyship\b",
-            r"\byour\s+worship\b"
-        ]
-
-        # The primary presiding judicial speaker is SPEAKER_00 (or whichever speaker initiates court proceedings)
-        judge_spk = all_words[0]["speaker"]
-
-        # PASS 3: Sentence-Level Clause Realignment
-        # Chunk words into clauses based on punctuation and conversational pauses (>= 0.6s)
-        clauses = []
-        curr_clause = []
-        for i, w in enumerate(all_words):
-            curr_clause.append(w)
-            txt = str(w["word"]).strip()
-            is_punc = any(txt.endswith(p) for p in (".", "?", "!"))
-            next_gap = (all_words[i + 1]["start"] - w["end"]) if (i + 1 < n) else 999.0
-
-            if is_punc or next_gap >= 0.6:
-                clauses.append(curr_clause)
-                curr_clause = []
-        if curr_clause:
-            clauses.append(curr_clause)
-
-        # Realignment of each clause based on semantic role cues
-        for clause in clauses:
-            clause_text = " ".join(w["word"] for w in clause).lower()
-            has_judge_cue = any(re.search(pat, clause_text) for pat in judge_patterns)
-            has_address_cue = any(re.search(pat, clause_text) for pat in addressing_court_patterns)
-
-            if has_judge_cue and not has_address_cue:
-                for w in clause:
-                    w["speaker"] = judge_spk
-            elif has_address_cue:
-                # Counsel addressing the Bench cannot be the Judge
-                target_advocate = "SPEAKER_01" if judge_spk == "SPEAKER_00" else "SPEAKER_00"
-                for w in clause:
-                    w["speaker"] = target_advocate
-
-        # PASS 4: Backward Lag Correction for Judicial Interventions
-        # When Judge speaks in clause k, pull any immediate judicial command in clause k-1 into Judge tag
-        for k in range(1, len(clauses)):
-            curr_c = clauses[k]
-            prev_c = clauses[k - 1]
-            curr_spk = curr_c[0]["speaker"]
-            prev_text = " ".join(w["word"] for w in prev_c).lower()
-            gap = curr_c[0]["start"] - prev_c[-1]["end"]
-
-            if curr_spk == judge_spk and gap < 0.8:
-                if any(re.search(pat, prev_text) for pat in judge_patterns):
-                    for w in prev_c:
-                        w["speaker"] = judge_spk
-
-        # PASS 5: Conversational Turn Re-segmentation
+        # PASS 2: Conversational Turn Re-segmentation (Generic Word-Level Utterance Building)
+        # Builds clean, natural conversational turns for any audio based on:
+        # - Speaker transitions (ALWAYS split immediately)
+        # - Conversational silence gaps (>= 1.2s thinking/breathing pause)
+        # - Natural sentence completion with pause (ends with . ? ! and gap >= 0.4s or duration >= 7.0s)
+        # - Maximum block duration guard (>= 18.0s) to prevent runaway paragraphs
         refined_segments = []
         curr_speaker = None
         curr_words = []
@@ -374,15 +308,12 @@ class InferencePipeline:
             last_text = last_w["word"]
             ends_sentence = any(last_text.endswith(p) for p in (".", "?", "!"))
 
-            # Boundary rules:
-            # - Speaker transition: ALWAYS split immediately
-            # - Same speaker thinking pause: split if silence gap >= 1.8s
-            # - Same speaker long paragraph: split at sentence end if duration >= 8s
+            # Generic boundary rules:
             should_split = (
                 (spk != curr_speaker) or
-                (gap >= 1.8) or
-                (ends_sentence and (seg_duration >= 8.0 or gap >= 0.5)) or
-                (seg_duration >= 25.0)
+                (gap >= 1.2) or
+                (ends_sentence and (seg_duration >= 7.0 or gap >= 0.4)) or
+                (seg_duration >= 18.0)
             )
 
             if should_split:
@@ -411,7 +342,7 @@ class InferencePipeline:
                 "words": curr_words
             })
 
-        # PASS 6: Chronological Speaker Normalization (First speaker heard = SPEAKER_00)
+        # PASS 3: Chronological Speaker Normalization (First speaker heard = SPEAKER_00)
         first_heard = {}
         for seg in refined_segments:
             spk = seg["speaker"]
@@ -426,7 +357,7 @@ class InferencePipeline:
             for w in seg.get("words", []):
                 w["speaker"] = chrono_map.get(w.get("speaker"), w.get("speaker"))
 
-        # PASS 7: Legal Terminology, Suit Citation & Digit Normalization
+        # PASS 4: Legal Terminology, Suit Citation & Digit Normalization
         normalized_segments = [normalize_segment(seg) for seg in refined_segments]
 
         unique_speakers = len(set(s["speaker"] for s in normalized_segments))
