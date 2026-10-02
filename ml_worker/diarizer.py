@@ -178,12 +178,92 @@ class SpeakerDiarizer:
 
             unique_detected = len(set(t["speaker"] for t in turns))
             logger.info(f"Diarization inference successful: detected {len(turns)} turns across {unique_detected} distinct speakers.")
+
+            # Post-diarization consolidation: prevent a single speaker from being split
+            # into multiple clusters due to pitch/volume variation or micro-pauses.
+            turns = self._consolidate_fragmented_speakers(turns)
+
             return turns
 
         except Exception as e:
             logger.error(f"Critical error during speaker diarization inference: {e}", exc_info=True)
             return []
 
+    def _consolidate_fragmented_speakers(
+        self,
+        turns: List[Dict[str, Any]],
+        base_min_fraction: float = 0.04,
+        min_seconds: float = 2.0
+    ) -> List[Dict[str, Any]]:
+        """
+        Merges phantom speaker clusters (caused by Pyannote over-clustering)
+        back into the dominant speaker, WITHOUT absorbing real but brief speakers
+        such as a junior counsel or a witness who only spoke a short time.
+
+        Adaptive thresholds:
+        - The fraction threshold scales DOWN as speaker count rises:
+              2 speakers: merge below 4%
+              3 speakers: merge below 2.7%
+              4 speakers: merge below 2%
+              5+ speakers: merge below 1.6%
+          This lets a real junior counsel (5% of a 5-speaker court) survive
+          consolidation, while still merging phantom 1-2% acoustic fragments.
+        - BOTH conditions must hold: fraction < threshold AND dur < min_seconds.
+          This protects real brief speakers (objections, short remarks).
+        """
+        if not turns:
+            return turns
+
+        # Tally total speech time per speaker
+        speaker_durations: Dict[str, float] = {}
+        for t in turns:
+            spk = t["speaker"]
+            dur = max(0.0, t["end"] - t["start"])
+            speaker_durations[spk] = speaker_durations.get(spk, 0.0) + dur
+
+        total_speech = sum(speaker_durations.values())
+        n_speakers = len(speaker_durations)
+
+        if total_speech <= 0 or n_speakers <= 1:
+            return turns
+
+        # Adaptive fraction: threshold decreases as speaker count increases
+        adaptive_fraction = max(0.015, base_min_fraction / max(1.0, n_speakers / 2.0))
+
+        # Identify the dominant speaker (most total speech)
+        dominant = max(speaker_durations, key=lambda s: speaker_durations[s])
+
+        # Find phantom fragment speakers to absorb
+        # Requirement: BOTH negligible fraction AND negligible seconds
+        to_merge: Dict[str, str] = {}
+        for spk, dur in speaker_durations.items():
+            if spk == dominant:
+                continue
+            fraction = dur / total_speech
+            if fraction < adaptive_fraction and dur < min_seconds:
+                to_merge[spk] = dominant
+                logger.info(
+                    f"[CONSOLIDATION] Merging phantom speaker '{spk}' "
+                    f"({dur:.2f}s, {fraction*100:.1f}%) into '{dominant}'. "
+                    f"[threshold: {adaptive_fraction*100:.1f}%/{min_seconds}s, n={n_speakers}]"
+                )
+
+        if not to_merge:
+            return turns
+
+        # Apply the merge
+        merged_turns = []
+        for t in turns:
+            new_t = dict(t)
+            new_t["speaker"] = to_merge.get(t["speaker"], t["speaker"])
+            merged_turns.append(new_t)
+
+        consolidated_count = len(set(t["speaker"] for t in merged_turns))
+        logger.info(
+            f"[CONSOLIDATION] Reduced from {n_speakers} to "
+            f"{consolidated_count} speakers after phantom fragment merge."
+        )
+        return merged_turns
     def assign_speakers(
         self,
         segments: List[Dict[str, Any]],
