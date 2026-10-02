@@ -15,6 +15,10 @@ class WorkerConfig:
     WHISPER_DEVICE: str = os.getenv("WHISPER_DEVICE", "cuda" if os.getenv("CUDA_VISIBLE_DEVICES") or os.path.exists("/usr/local/cuda") else "auto")
     WHISPER_COMPUTE_TYPE: str = os.getenv("WHISPER_COMPUTE_TYPE", "float16")  # float16, int8_float16, int8
     WHISPER_CPU_THREADS: int = int(os.getenv("WHISPER_CPU_THREADS", "4"))
+    WHISPER_INITIAL_PROMPT: str = os.getenv(
+        "WHISPER_INITIAL_PROMPT",
+        "Suit No. 5, 5A, Suit No. FHC/ABJ/CS/55/2024, Court 1, Order 5 Rule 6(d), Exhibit 1A, Section 4, Count 1, page 10, paragraph 3, No. 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 2024, 2025, 2026. Court, Plaintiff, Defendant, Counsel, Your Lordship, Milord, My Lord."
+    )
     
     # Speaker Diarization
     @classmethod

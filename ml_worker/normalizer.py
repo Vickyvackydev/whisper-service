@@ -3,6 +3,60 @@ import re
 
 PUNCT_CHARS = '.,!?;:"\'()[]{}'
 
+NUMBER_WORDS = {
+    "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4,
+    "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9,
+    "ten": 10, "eleven": 11, "twelve": 12, "thirteen": 13,
+    "fourteen": 14, "fifteen": 15, "sixteen": 16, "seventeen": 17,
+    "eighteen": 18, "nineteen": 19, "twenty": 20, "thirty": 30,
+    "forty": 40, "fifty": 50, "sixty": 60, "seventy": 70,
+    "eighty": 80, "ninety": 90,
+}
+
+TENS = {
+    "twenty": 20, "thirty": 30, "forty": 40, "fifty": 50,
+    "sixty": 60, "seventy": 70, "eighty": 80, "ninety": 90
+}
+
+UNITS = {
+    "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4,
+    "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9,
+    "ten": 10, "eleven": 11, "twelve": 12, "thirteen": 13,
+    "fourteen": 14, "fifteen": 15, "sixteen": 16, "seventeen": 17,
+    "eighteen": 18, "nineteen": 19
+}
+
+NUM_PATTERN_STR = r'(?:zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|(?:twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety)(?:[\s-](?:one|two|three|four|five|six|seven|eight|nine))?|\d+)'
+
+RATE_OR_TIME_NOUNS = {
+    "day", "days", "week", "weeks", "month", "months", "year", "years",
+    "time", "times", "minute", "minutes", "second", "seconds",
+    "dollar", "dollars", "pound", "pounds", "penny", "pennies", "cent", "cents",
+    "naira", "share", "shares", "head", "heads", "piece", "pieces"
+}
+
+def parse_spoken_number(s: str) -> str:
+    s = s.strip().lower()
+    if s.isdigit():
+        return s
+    if s in NUMBER_WORDS:
+        return str(NUMBER_WORDS[s])
+    parts = re.split(r'[\s-]+', s)
+    if len(parts) == 2 and parts[0] in TENS and parts[1] in UNITS:
+        return str(TENS[parts[0]] + UNITS[parts[1]])
+    return s
+
+def is_number_or_word(s: str) -> bool:
+    clean = clean_token(s)
+    if clean.isdigit():
+        return True
+    if clean in NUMBER_WORDS:
+        return True
+    parts = clean.split('-')
+    if len(parts) == 2 and parts[0] in TENS and parts[1] in UNITS:
+        return True
+    return False
+
 def apply_proper_case(token: str, proper_word: str) -> str:
     if not token:
         return proper_word
@@ -61,6 +115,9 @@ COURT_REPLACEMENTS = [
     (r'(?i)\badjourned\s+for\s+mentioned\b', 'adjourned for mention'),
     (r'(?i)\bEU\s+health\b', 'ill-health'),
     (r'(?i)\bEU\s+Health\b', 'Ill-health'),
+    (r'(?i)\bOrder\s+(?:8|eight)\s+rule\s+(?:6|six)\s*d\b', 'Order 8 Rule 6(d)'),
+    (r'(?i)\brule\s+(?:6|six)\s*d\b', 'Rule 6(d)'),
+    (r'(?i)\b(?:6|six)\s*d\b', '6(d)'),
 ]
 
 PRONOUN_I_REPLACEMENTS = [
@@ -75,9 +132,51 @@ def normalize_case_numbers_and_slashes(text: str) -> str:
     if not text:
         return text
     
-    # 1. Repeatedly resolve slashes between alphanumeric terms (e.g. FHC / L / CS / 485 / 2026 -> FHC/L/CS/485/2026)
+    # 0. Normalize suit numbers and court identifiers
+    # e.g. "suit number", "suits number", "suit no", "suits no" -> "Suit No."
+    curr = re.sub(r'(?i)\b(?:suits?)\s+(?:numbers?|no\.?)\b', 'Suit No.', text)
+    curr = re.sub(r'(?i)\bcase\s+(?:numbers?|no\.?)\b', 'Case No.', curr)
+    curr = re.sub(r'(?i)\bcharge\s+(?:numbers?|no\.?)\b', 'Charge No.', curr)
+    curr = re.sub(r'(?i)\bappeal\s+(?:numbers?|no\.?)\b', 'Appeal No.', curr)
+    curr = re.sub(r'(?i)\bmatter\s+(?:numbers?|no\.?)\b', 'Matter No.', curr)
+
+    # 1. Year pronunciations: twenty nineteen -> 2019, twenty twenty-four -> 2024, etc.
+    year_map = [
+        (r'(?i)\btwenty\s+(?:nineteen|19)\b', '2019'),
+        (r'(?i)\btwenty\s+(?:twenty-one|twenty\s+one|21)\b', '2021'),
+        (r'(?i)\btwenty\s+(?:twenty-two|twenty\s+two|22)\b', '2022'),
+        (r'(?i)\btwenty\s+(?:twenty-three|twenty\s+three|23)\b', '2023'),
+        (r'(?i)\btwenty\s+(?:twenty-four|twenty\s+four|24)\b', '2024'),
+        (r'(?i)\btwenty\s+(?:twenty-five|twenty\s+five|25)\b', '2025'),
+        (r'(?i)\btwenty\s+(?:twenty-six|twenty\s+six|26)\b', '2026'),
+        (r'(?i)\btwenty\s+(?:twenty-seven|twenty\s+seven|27)\b', '2027'),
+        (r'(?i)\btwenty\s+(?:twenty-eight|twenty\s+eight|28)\b', '2028'),
+        (r'(?i)\btwenty\s+(?:twenty-nine|twenty\s+nine|29)\b', '2029'),
+        (r'(?i)\btwenty\s+(?:twenty|20)\b', '2020'),
+        (r'(?i)\btwenty\s+(?:thirty|30)\b', '2030'),
+    ]
+    for ym, yr in year_map:
+        curr = re.sub(ym, yr, curr)
+
+    # Series of 4 spoken single digits (e.g. "one nine zero four" -> 1904)
+    def repl_4digits(m):
+        d1 = str(NUMBER_WORDS.get(m.group(1).lower(), m.group(1)))
+        d2 = str(NUMBER_WORDS.get(m.group(2).lower(), m.group(2)))
+        d3 = str(NUMBER_WORDS.get(m.group(3).lower(), m.group(3)))
+        d4 = str(NUMBER_WORDS.get(m.group(4).lower(), m.group(4)))
+        return f"{d1}{d2}{d3}{d4}"
+
+    curr = re.sub(
+        r'(?i)\b(zero|one|two|three|four|five|six|seven|eight|nine|\d)\s+'
+        r'(zero|one|two|three|four|five|six|seven|eight|nine|\d)\s+'
+        r'(zero|one|two|three|four|five|six|seven|eight|nine|\d)\s+'
+        r'(zero|one|two|three|four|five|six|seven|eight|nine|\d)\b',
+        repl_4digits,
+        curr
+    )
+
+    # 2. Repeatedly resolve slashes between alphanumeric terms (e.g. FHC / L / CS / 485 / 2026 -> FHC/L/CS/485/2026)
     prev = None
-    curr = text
     while prev != curr:
         prev = curr
         curr = re.sub(
@@ -86,24 +185,93 @@ def normalize_case_numbers_and_slashes(text: str) -> str:
             curr
         )
     
-    # 2. Handle standalone "-slash-" or "-slash " or " slash-"
+    # 3. Handle standalone "-slash-" or "-slash " or " slash-"
     curr = re.sub(r'[\s-]*(?:slash|Slash)[\s-]+', '/', curr)
 
-    # 3. Collapse multiple spaces around remaining slashes if any
+    # 4. Collapse multiple spaces around remaining slashes if any
     curr = re.sub(r'\s*/\s*', '/', curr)
 
-    # 4. Uppercase slashed suit numbers (e.g. fhc/l/cs/485/2026 -> FHC/L/CS/485/2026)
-    curr = re.sub(
-        r'\b([A-Za-z0-9\.]+(?:/[A-Za-z0-9\.]+)+)\b',
-        lambda m: m.group(1).upper(),
-        curr
-    )
-    
     # 5. Clean up legal misrecognitions & court honorifics
     for pattern, replacement in COURT_REPLACEMENTS:
         curr = re.sub(pattern, replacement, curr)
 
-    # 6. Capitalize standalone pronoun "I" and its common contractions
+    # 6. Number + letter combinations: e.g. "five a" / "5 a" / "five A" / "5 A" / "five-a" -> "5A"
+    def repl_num_letter(m):
+        num_str = m.group(1)
+        letter = m.group(2).upper()
+        parsed_num = parse_spoken_number(num_str)
+        return f"{parsed_num}{letter}"
+
+    # Letter B-Z: any number followed by optional hyphen/space and letter
+    curr = re.sub(
+        rf'\b({NUM_PATTERN_STR})[\s-]*([b-zB-Z])\b',
+        repl_num_letter,
+        curr
+    )
+
+    # Letter A: ensure not followed by words like day, week, month, year, time, etc.
+    curr = re.sub(
+        rf'\b({NUM_PATTERN_STR})[\s-]*([aA])\b(?!\s+(?:day|days|week|weeks|month|months|year|years|time|times|minute|minutes|second|seconds|dollar|dollars|pound|pounds|penny|pennies|cent|cents|naira|share|shares|head|heads|piece|pieces))',
+        repl_num_letter,
+        curr
+    )
+
+    # 7. Spoken numbers after court / legal keywords
+    # "Suit No. five" -> "Suit No. 5"
+    # "Court five" -> "Court 5"
+    # "Order five" -> "Order 5"
+    # "Rule six" -> "Rule 6"
+    # "Exhibit five" -> "Exhibit 5"
+    # "number five" -> "No. 5"
+    # "No. five" -> "No. 5"
+    def repl_prefix_num(m):
+        prefix = m.group(1)
+        num_str = m.group(2)
+        parsed = parse_spoken_number(num_str)
+        if prefix.lower() in ("number", "no"):
+            prefix = "No."
+        elif prefix.lower() == "court":
+            prefix = "Court"
+        elif prefix.lower() == "order":
+            prefix = "Order"
+        elif prefix.lower() == "rule":
+            prefix = "Rule"
+        elif prefix.lower() == "exhibit":
+            prefix = "Exhibit"
+        elif prefix.lower() == "room":
+            prefix = "Room"
+        elif prefix.lower() == "suit":
+            prefix = "Suit"
+        return f"{prefix} {parsed}"
+
+    curr = re.sub(
+        rf'\b(Suit\s+No\.?|Case\s+No\.?|Charge\s+No\.?|Appeal\s+No\.?|Matter\s+No\.?|Court|Room|Order|Rule|Exhibit|No\.?|number|paragraph|section|clause|count|page|item)\s+({NUM_PATTERN_STR})\b',
+        repl_prefix_num,
+        curr,
+        flags=re.IGNORECASE
+    )
+
+    # 8. Uppercase slashed suit numbers (e.g. fhc/l/cs/485/2026 -> FHC/L/CS/485/2026)
+    # Also resolve any number words inside slashed tokens (e.g. /FIVE/ -> /5/)
+    def format_slashed_suit(m):
+        raw = m.group(1)
+        parts = raw.split('/')
+        new_parts = []
+        for p in parts:
+            p_clean = p.strip()
+            if p_clean.lower() in NUMBER_WORDS:
+                new_parts.append(str(NUMBER_WORDS[p_clean.lower()]))
+            else:
+                new_parts.append(p_clean.upper())
+        return "/".join(new_parts)
+
+    curr = re.sub(
+        r'\b([A-Za-z0-9\.]+(?:/[A-Za-z0-9\.]+)+)\b',
+        format_slashed_suit,
+        curr
+    )
+
+    # 9. Capitalize standalone pronoun "I" and its common contractions
     for pattern, replacement in PRONOUN_I_REPLACEMENTS:
         curr = re.sub(pattern, replacement, curr)
         
@@ -155,7 +323,83 @@ def clean_word_token(word: str) -> str:
     if lower in court_acronyms:
         return clean.upper()
 
+    # Clean number+letter combinations like "5a" -> "5A", "5-a" -> "5A"
+    clean_no_punct = clean.strip(PUNCT_CHARS)
+    m_nl = re.match(r'^(\d+)[-]?([a-zA-Z])$', clean_no_punct)
+    if m_nl:
+        return apply_proper_case(clean, f"{m_nl.group(1)}{m_nl.group(2).upper()}")
+    m_wnl = re.match(r'^([a-zA-Z]+)[-]([a-zA-Z])$', clean_no_punct)
+    if m_wnl and is_number_or_word(m_wnl.group(1)):
+        return apply_proper_case(clean, f"{parse_spoken_number(m_wnl.group(1))}{m_wnl.group(2).upper()}")
+
     return clean
+
+def merge_number_letter_words(words: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Merges sequences of word tokens representing numbers + letter suffix:
+    ['five', 'a'] -> ['5A']
+    ['5', 'a'] -> ['5A']
+    ['five', 'b'] -> ['5B']
+    ['1', 'a'] -> ['1A']
+    Preserves exact timing from the first token's start to the last token's end.
+    """
+    if not words:
+        return words
+
+    merged: List[Dict[str, Any]] = []
+    i = 0
+    n = len(words)
+
+    while i < n:
+        curr = words[i]
+        curr_text = str(curr.get("word", "")).strip()
+        curr_clean = clean_token(curr_text)
+
+        # Check if curr is a number (e.g. "5", "five") and next is a single letter (e.g. "a", "A", "b")
+        if i + 1 < n and is_number_or_word(curr_clean):
+            next_item = words[i+1]
+            next_text = str(next_item.get("word", "")).strip()
+            next_clean = clean_token(next_text)
+
+            is_valid_letter = False
+            if len(next_clean) == 1 and next_clean.isalpha():
+                if next_clean == "a":
+                    # Check next word after 'a'
+                    has_rate_word = False
+                    if i + 2 < n:
+                        after_clean = clean_token(str(words[i+2].get("word", "")))
+                        if after_clean in RATE_OR_TIME_NOUNS:
+                            has_rate_word = True
+                    if not has_rate_word:
+                        is_valid_letter = True
+                else:
+                    is_valid_letter = True
+
+            if is_valid_letter:
+                num_digits = parse_spoken_number(curr_clean)
+                combined = f"{num_digits}{next_clean.upper()}"
+                trail = ""
+                for char in reversed(next_text):
+                    if char in PUNCT_CHARS:
+                        trail = char + trail
+                    else:
+                        break
+                merged.append({
+                    "word": f"{combined}{trail}",
+                    "start": curr.get("start", 0.0),
+                    "end": next_item.get("end", curr.get("end", 0.0)),
+                    "speaker": curr.get("speaker", "SPEAKER_00"),
+                    "score": curr.get("score"),
+                    "source_word": curr.get("source_word"),
+                    "mapping_type": curr.get("mapping_type")
+                })
+                i += 2
+                continue
+
+        merged.append(curr)
+        i += 1
+
+    return merged
 
 def merge_slashed_words(words: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
@@ -234,12 +478,15 @@ def normalize_segment(segment: Dict[str, Any]) -> Dict[str, Any]:
             if "word" in w and w["word"]:
                 w["word"] = clean_word_token(w["word"])
         
-        # 2. Contextual honorific casing for two-word sequences (e.g. "my" + "lord" -> "My" + "Lord")
-        words = segment["words"]
+        # 2. Merge number + letter combinations (e.g. ['five', 'a'] -> ['5A'] or ['5', 'a'] -> ['5A'])
+        words = merge_number_letter_words(segment["words"])
+
+        # 3. Contextual honorific casing & court numbers for two-word/three-word sequences
         for idx in range(len(words) - 1):
             w1_clean = clean_token(words[idx].get("word", ""))
             w2_clean = clean_token(words[idx+1].get("word", ""))
 
+            # Judicial honorifics
             if (w1_clean in ("my", "me")) and (w2_clean in ("lord", "noble")):
                 words[idx]["word"] = apply_proper_case(words[idx]["word"], "My")
                 words[idx+1]["word"] = apply_proper_case(words[idx+1]["word"], "Lord" if w2_clean == "lord" else "Noble")
@@ -258,7 +505,27 @@ def normalize_segment(segment: Dict[str, Any]) -> Dict[str, Any]:
                 words[idx]["word"] = apply_proper_case(words[idx]["word"], title)
                 words[idx+1]["word"] = apply_proper_case(words[idx+1]["word"], w2_clean.capitalize())
 
-        # 2b. Legal terminology corrections across words
+            # Suit & Court number normalization across word tokens
+            if (w1_clean in ("suit", "suits")) and (w2_clean in ("number", "no")):
+                words[idx]["word"] = apply_proper_case(words[idx]["word"], "Suit")
+                words[idx+1]["word"] = apply_proper_case(words[idx+1]["word"], "No.")
+            elif w1_clean in ("case", "charge", "appeal", "matter") and w2_clean in ("number", "no"):
+                words[idx]["word"] = apply_proper_case(words[idx]["word"], w1_clean.capitalize())
+                words[idx+1]["word"] = apply_proper_case(words[idx+1]["word"], "No.")
+            elif w1_clean in ("court", "order", "rule", "exhibit", "room", "paragraph", "section", "clause", "count", "page", "item") and is_number_or_word(w2_clean):
+                words[idx]["word"] = apply_proper_case(words[idx]["word"], w1_clean.capitalize())
+                words[idx+1]["word"] = apply_proper_case(words[idx+1]["word"], parse_spoken_number(w2_clean))
+            elif w1_clean in ("no", "number") and is_number_or_word(w2_clean):
+                words[idx]["word"] = apply_proper_case(words[idx]["word"], "No.")
+                words[idx+1]["word"] = apply_proper_case(words[idx+1]["word"], parse_spoken_number(w2_clean))
+
+            # 3-word sequence: "Suit" "No." "five" -> "Suit" "No." "5"
+            if idx + 2 < len(words):
+                w3_clean = clean_token(words[idx+2].get("word", ""))
+                if (w1_clean in ("suit", "suits", "case", "charge", "appeal", "matter")) and (w2_clean in ("no", "number")) and is_number_or_word(w3_clean):
+                    words[idx+2]["word"] = apply_proper_case(words[idx+2]["word"], parse_spoken_number(w3_clean))
+
+        # 4. Legal terminology corrections across words
         for idx in range(len(words)):
             w_clean = clean_token(words[idx].get("word", ""))
             if w_clean == "kamolafe":
@@ -299,7 +566,8 @@ def normalize_segment(segment: Dict[str, Any]) -> Dict[str, Any]:
 
         words = [w for w in words if w.get("word")]
 
-        # 3. Merge slash tokens for suit numbers (e.g. FHC / L / CS / 485 / 2026 -> FHC/L/CS/485/2026)
+        # 5. Merge slash tokens for suit numbers (e.g. FHC / L / CS / 485 / 2026 -> FHC/L/CS/485/2026)
         segment["words"] = merge_slashed_words(words)
                 
     return segment
+

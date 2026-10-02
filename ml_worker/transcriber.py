@@ -100,7 +100,7 @@ class Transcriber:
             condition_on_previous_text=False, # Prevents hallucinations / skipping words
             no_speech_threshold=0.8,
             compression_ratio_threshold=2.4,
-            initial_prompt="Suit No., /, Court, Plaintiff, Defendant, Counsel, Your Lordship, Milord, My Lord."
+            initial_prompt=WorkerConfig.WHISPER_INITIAL_PROMPT
         )
 
         detected_language = info.language
