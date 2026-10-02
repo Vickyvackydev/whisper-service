@@ -38,12 +38,26 @@ class SpeakerDiarizer:
 
             # Calibrate hyperparameters for courtrooms
             try:
+                # 1. Direct attribute configuration for Pyannote 3.1
+                thresh = getattr(WorkerConfig, "DIARIZATION_THRESHOLD", None)
+                if thresh is not None and hasattr(self.pipeline, "clustering"):
+                    if hasattr(self.pipeline.clustering, "threshold"):
+                        self.pipeline.clustering.threshold = float(thresh)
+                        logger.info(f"Directly configured Pyannote clustering.threshold = {float(thresh)}")
+
+                min_off = getattr(WorkerConfig, "MIN_DURATION_OFF", 0.15)
+                min_on = getattr(WorkerConfig, "MIN_DURATION_ON", 0.05)
+                if hasattr(self.pipeline, "segmentation"):
+                    if hasattr(self.pipeline.segmentation, "min_duration_off") and min_off is not None:
+                        self.pipeline.segmentation.min_duration_off = float(min_off)
+                    if hasattr(self.pipeline.segmentation, "min_duration_on") and min_on is not None:
+                        self.pipeline.segmentation.min_duration_on = float(min_on)
+                    logger.info(f"Directly configured Pyannote segmentation: min_duration_off={min_off}, min_duration_on={min_on}")
+
+                # 2. Also attempt pipeline.instantiate if supported
                 instantiate_params = {}
-                threshold = getattr(WorkerConfig, "DIARIZATION_THRESHOLD", None)
-                if threshold is not None:
-                    instantiate_params["clustering"] = {"threshold": float(threshold)}
-                min_off = getattr(WorkerConfig, "MIN_DURATION_OFF", 0.2)
-                min_on = getattr(WorkerConfig, "MIN_DURATION_ON", 0.1)
+                if thresh is not None:
+                    instantiate_params["clustering"] = {"threshold": float(thresh)}
                 seg_dict = {}
                 if min_off is not None:
                     seg_dict["min_duration_off"] = float(min_off)
@@ -53,9 +67,7 @@ class SpeakerDiarizer:
                     instantiate_params["segmentation"] = seg_dict
                 if instantiate_params:
                     self.pipeline.instantiate(instantiate_params)
-                    logger.info(f"Pyannote calibrated with court hyperparameters: {instantiate_params}")
-                else:
-                    logger.info("Using Pyannote default calibrated clustering threshold.")
+                    logger.info(f"Pyannote instantiated with court hyperparameters: {instantiate_params}")
             except Exception as thresh_err:
                 logger.debug(f"Note on clustering/segmentation settings: {thresh_err}")
             
