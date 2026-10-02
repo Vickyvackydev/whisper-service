@@ -219,39 +219,26 @@ class InferencePipeline:
         Takes WhisperX stitched word-level speaker assignments and builds
         clean, conversational speaker turns.
 
-        The pipeline runs 5 correction passes before finalizing:
+        Acoustic Ground Truth:
+        - Word timestamps from Wav2Vec2 CTC phoneme alignment.
+        - Word speaker assignments from Pyannote 3.1.1 via WhisperX.
+        - Heuristic smoothing passes (Pass 0 majority vote, Pass 1 jitter smoothing,
+          and Pass 2b orphan absorption) are disabled per consultant analysis so that
+          real human dialogue, conversational interjections ("I agree", "Wait, what?",
+          "That's not true", "Objection"), and rapid speaker handoffs are preserved.
 
-        PASS 0 - Whisper-Segment Majority-Vote Unification
-            Whisper transcribes one utterance as one segment. WhisperX then
-            assigns per-word speaker labels from Pyannote, but Pyannote
-            boundary lag means the first or last 1-3 words of a segment get
-            the WRONG speaker. We unify each short segment (<12s, >=3 words)
-            to its majority speaker — the one who "owns" >60% of the words.
-            This is the primary fix for "sentence split across two speakers".
-
-        PASS 1 - Multi-word Boundary Jitter Smoothing (windows of 1, 2, 3 words)
-            Even after Pass 0, words at the seam between two Whisper segments
-            may still be mis-tagged. If a tight run of 1-3 words is flanked on
-            BOTH sides by the same speaker with no large gap or sentence
-            ending, snap the run to that speaker.
-
-        PASS 2 - Conversational Turn Re-segmentation
-            Group smoothed words into natural speaker turns using:
-            - Speaker transition (always split)
+        Stages:
+        STAGE 1 - Conversational Turn Re-segmentation
+            Group acoustically labeled words into natural speaker turns using:
+            - Speaker transition (always split when spk != curr_speaker)
             - Silence gap >= 1.2s
             - Sentence-end + gap >= 0.4s or block >= 7s
             - Max block guard >= 18s
 
-        PASS 2b - Short Orphan Segment Absorption
-            A segment of <= 3 words or < 1.5s sandwiched between two segments
-            of the SAME speaker is almost certainly a ghost boundary artifact.
-            Absorb it into the preceding segment rather than creating a
-            spurious speaker turn.
-
-        PASS 3 - Chronological Speaker Normalization
+        STAGE 2 - Chronological Speaker Normalization
             Renumber speakers so the first voice heard = SPEAKER_00.
 
-        PASS 4 - Legal Text Normalization
+        STAGE 3 - Legal Text Normalization
             Numbers as digits, honorific casing, suit citations, etc.
         """
         all_words: List[Dict[str, Any]] = []
@@ -294,83 +281,12 @@ class InferencePipeline:
         if not all_words:
             return stitched_result.get("segments", []), 1
 
-        # -------------------------------------------------------------------
-        # PASS 0: Whisper-Segment Majority-Vote Speaker Unification
-        # -------------------------------------------------------------------
-        # Group word indices by their source Whisper segment
-        seg_word_groups: Dict[int, List[int]] = {}
-        for i, w in enumerate(all_words):
-            sid = w.get("_seg_id", 0)
-            seg_word_groups.setdefault(sid, []).append(i)
-
-        for sid, indices in seg_word_groups.items():
-            if len(indices) < 2:
-                continue
-            seg_dur = all_words[indices[-1]]["end"] - all_words[indices[0]]["start"]
-            # Only unify segments that don't contain a clear internal speaker switch pause (>=0.75s)
-            # and are within reasonable conversational utterance length (<= 25s)
-            if seg_dur > 25.0:
-                continue
-            has_long_pause = any(
-                (all_words[indices[k+1]]["start"] - all_words[indices[k]]["end"]) >= 0.75
-                for k in range(len(indices) - 1)
-            )
-            if has_long_pause:
-                continue
-
-            speaker_counts = Counter(all_words[i]["speaker"] for i in indices)
-            majority_speaker, majority_count = speaker_counts.most_common(1)[0]
-            # Apply if majority is >= 60% — eliminates boundary word jitter on continuous utterances
-            if (majority_count / len(indices)) >= 0.60:
-                for i in indices:
-                    all_words[i]["speaker"] = majority_speaker
+        # NOTE: Pass 0 (Utterance Majority Vote) and Pass 1 (Jitter Smoothing)
+        # were removed per consultant recommendations to avoid destroying
+        # legitimate speaker turns, interjections, and speaker transitions.
 
         # -------------------------------------------------------------------
-        # PASS 1: Multi-word Boundary Jitter Smoothing
-        # -------------------------------------------------------------------
-        n = len(all_words)
-
-        def _snap_run(start_idx: int, end_idx: int, target_spk: str) -> None:
-            for k in range(start_idx, end_idx + 1):
-                all_words[k]["speaker"] = target_spk
-
-        for window in (1, 2, 3):
-            i = window
-            while i < n - window:
-                run_indices = list(range(i, i + window))
-                left_spk  = all_words[i - 1]["speaker"]
-                right_idx = i + window
-                right_spk = all_words[right_idx]["speaker"] if right_idx < n else None
-
-                # Flanking speakers must agree and differ from the run
-                if left_spk != right_spk or right_spk is None:
-                    i += 1
-                    continue
-
-                run_spks = [all_words[j]["speaker"] for j in run_indices]
-                if any(s == left_spk for s in run_spks):
-                    i += 1
-                    continue
-
-                gap_before = all_words[i]["start"]           - all_words[i - 1]["end"]
-                gap_after  = (all_words[right_idx]["start"]  - all_words[i + window - 1]["end"]) if right_idx < n else 0.0
-                run_dur    = all_words[i + window - 1]["end"] - all_words[i]["start"]
-                prev_text  = str(all_words[i - 1]["word"]).strip()
-                ends_sent  = any(prev_text.endswith(p) for p in (".", "?", "!"))
-
-                if (
-                    not ends_sent
-                    and gap_before < 0.30
-                    and gap_after  < 0.30
-                    and run_dur    < (0.40 * window)
-                ):
-                    _snap_run(run_indices[0], run_indices[-1], left_spk)
-                    i += window + 1
-                else:
-                    i += 1
-
-        # -------------------------------------------------------------------
-        # PASS 2: Conversational Turn Re-segmentation
+        # STAGE 1: Conversational Turn Re-segmentation
         # -------------------------------------------------------------------
         refined_segments: List[Dict[str, Any]] = []
         curr_speaker: Optional[str] = None
@@ -422,42 +338,11 @@ class InferencePipeline:
                 "words": curr_words,
             })
 
-        # -------------------------------------------------------------------
-        # PASS 2b: Short Orphan Segment Absorption
-        # -------------------------------------------------------------------
-        # Example of what this fixes:
-        #   [SPEAKER_00: "My Lord"] [SPEAKER_01: "I"] [SPEAKER_00: "submit that the..."]
-        #   becomes:
-        #   [SPEAKER_00: "My Lord I submit that the..."]
-        #
-        # A segment is an "orphan" if:
-        #   - It has <= 3 words OR lasts < 1.5s
-        #   - Its immediate neighbours both belong to the SAME speaker
-        #   - That speaker is different from the orphan's speaker
-        i = 1
-        while i < len(refined_segments) - 1:
-            prev_seg = refined_segments[i - 1]
-            curr_seg = refined_segments[i]
-            next_seg = refined_segments[i + 1]
-            seg_dur  = curr_seg["end"] - curr_seg["start"]
-            n_words  = len(curr_seg.get("words", []))
-
-            if (
-                prev_seg["speaker"] == next_seg["speaker"]
-                and curr_seg["speaker"] != prev_seg["speaker"]
-                and (n_words <= 4 or seg_dur < 2.0)
-            ):
-                # Fix: absorb orphan into prev_seg
-                prev_seg["words"].extend(curr_seg.get("words", []))
-                prev_seg["end"] = curr_seg["end"]
-                prev_seg["text"] = " ".join(w["word"] for w in prev_seg["words"]).strip()
-                refined_segments.pop(i)
-                # Do not increment — re-check at same index after pop
-            else:
-                i += 1
+        # NOTE: Pass 2b (Short Orphan Segment Absorption) was removed per
+        # consultant recommendations to prevent absorbing valid short interjections.
 
         # -------------------------------------------------------------------
-        # PASS 3: Chronological Speaker Normalization
+        # STAGE 2: Chronological Speaker Normalization
         # First speaker heard in the audio = SPEAKER_00
         # -------------------------------------------------------------------
         first_heard: Dict[str, float] = {}
@@ -474,7 +359,7 @@ class InferencePipeline:
             for w in seg.get("words", []):
                 w["speaker"] = chrono_map.get(w.get("speaker"), w.get("speaker"))
 
-        # PASS 4: Legal Terminology, Suit Citation & Digit Normalization
+        # STAGE 3: Legal Terminology, Suit Citation & Digit Normalization
         normalized_segments = [normalize_segment(seg) for seg in refined_segments]
 
         unique_speakers = len(set(s["speaker"] for s in normalized_segments))

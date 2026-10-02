@@ -205,5 +205,84 @@ class TestSpeakerDiarizer(unittest.TestCase):
         self.assertEqual(len(unique_spks), 1)
         self.assertIn("SPEAKER_00", unique_spks)
 
+class TestReconstructSpeakerTurns(unittest.TestCase):
+    def setUp(self):
+        from ml_worker.pipeline import InferencePipeline
+        self.pipeline = InferencePipeline(None, None)
+
+    def test_interjections_preserved_without_smoothing_erasure(self):
+        """
+        Verify that 2-word interjections ('No objection.') are preserved as distinct speaker
+        turns rather than being absorbed by Pass 1 or Pass 2b.
+        """
+        stitched = {
+            "segments": [
+                {
+                    "start": 0.0,
+                    "end": 4.5,
+                    "text": "We seek an adjournment. No objection. Thank you my Lord.",
+                    "words": [
+                        {"word": "We", "start": 0.1, "end": 0.4, "speaker": "SPEAKER_00"},
+                        {"word": "seek", "start": 0.5, "end": 0.8, "speaker": "SPEAKER_00"},
+                        {"word": "an", "start": 0.9, "end": 1.1, "speaker": "SPEAKER_00"},
+                        {"word": "adjournment.", "start": 1.2, "end": 1.8, "speaker": "SPEAKER_00"},
+                        {"word": "No", "start": 2.0, "end": 2.3, "speaker": "SPEAKER_01"},
+                        {"word": "objection.", "start": 2.4, "end": 2.8, "speaker": "SPEAKER_01"},
+                        {"word": "Thank", "start": 3.0, "end": 3.3, "speaker": "SPEAKER_00"},
+                        {"word": "you", "start": 3.4, "end": 3.6, "speaker": "SPEAKER_00"},
+                        {"word": "my", "start": 3.7, "end": 3.9, "speaker": "SPEAKER_00"},
+                        {"word": "Lord.", "start": 4.0, "end": 4.4, "speaker": "SPEAKER_00"},
+                    ]
+                }
+            ]
+        }
+        turns, num_spks = self.pipeline.reconstruct_speaker_turns(stitched)
+        self.assertEqual(num_spks, 2)
+        self.assertEqual(len(turns), 3)
+        self.assertEqual(turns[0]["speaker"], "SPEAKER_00")
+        self.assertEqual(turns[0]["text"], "We seek an adjournment.")
+        self.assertEqual(turns[1]["speaker"], "SPEAKER_01")
+        self.assertEqual(turns[1]["text"], "No objection.")
+        self.assertEqual(turns[2]["speaker"], "SPEAKER_00")
+        self.assertEqual(turns[2]["text"], "Thank you My Lord.")
+
+    def test_no_majority_vote_erasure_in_whisper_segment(self):
+        """
+        Verify that Pass 0 majority vote (which used to erase speakers with < 40% of words)
+        is disabled, so a speaker with 35% of words is preserved.
+        """
+        stitched = {
+            "segments": [
+                {
+                    "start": 0.0,
+                    "end": 15.0,
+                    "text": "Speaker A speaks the majority of the time here. Now Speaker B answers back clearly.",
+                    "words": [
+                        {"word": "Speaker", "start": 0.5, "end": 0.9, "speaker": "SPEAKER_00"},
+                        {"word": "A", "start": 1.0, "end": 1.2, "speaker": "SPEAKER_00"},
+                        {"word": "speaks", "start": 1.3, "end": 1.6, "speaker": "SPEAKER_00"},
+                        {"word": "the", "start": 1.7, "end": 1.8, "speaker": "SPEAKER_00"},
+                        {"word": "majority", "start": 1.9, "end": 2.4, "speaker": "SPEAKER_00"},
+                        {"word": "of", "start": 2.5, "end": 2.6, "speaker": "SPEAKER_00"},
+                        {"word": "the", "start": 2.7, "end": 2.8, "speaker": "SPEAKER_00"},
+                        {"word": "time", "start": 2.9, "end": 3.2, "speaker": "SPEAKER_00"},
+                        {"word": "here.", "start": 3.3, "end": 3.7, "speaker": "SPEAKER_00"},
+                        # Speaker B speaks 5 words (35.7% of 14 words)
+                        {"word": "Now", "start": 4.5, "end": 4.8, "speaker": "SPEAKER_01"},
+                        {"word": "Speaker", "start": 4.9, "end": 5.2, "speaker": "SPEAKER_01"},
+                        {"word": "B", "start": 5.3, "end": 5.5, "speaker": "SPEAKER_01"},
+                        {"word": "answers", "start": 5.6, "end": 6.0, "speaker": "SPEAKER_01"},
+                        {"word": "back.", "start": 6.1, "end": 6.5, "speaker": "SPEAKER_01"},
+                    ]
+                }
+            ]
+        }
+        turns, num_spks = self.pipeline.reconstruct_speaker_turns(stitched)
+        self.assertEqual(num_spks, 2)
+        self.assertEqual(len(turns), 2)
+        self.assertEqual(turns[0]["speaker"], "SPEAKER_00")
+        self.assertEqual(turns[1]["speaker"], "SPEAKER_01")
+        self.assertEqual(turns[1]["text"], "Now Speaker B answers back.")
+
 if __name__ == "__main__":
     unittest.main()
