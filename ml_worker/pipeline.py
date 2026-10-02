@@ -304,17 +304,24 @@ class InferencePipeline:
             seg_word_groups.setdefault(sid, []).append(i)
 
         for sid, indices in seg_word_groups.items():
-            if len(indices) < 3:
+            if len(indices) < 2:
                 continue
             seg_dur = all_words[indices[-1]]["end"] - all_words[indices[0]]["start"]
-            # Only unify segments short enough to realistically be one speaker.
-            # Long segments (>12s) can legitimately span a speaker handoff.
-            if seg_dur > 12.0:
+            # Only unify segments that don't contain a clear internal speaker switch pause (>=0.75s)
+            # and are within reasonable conversational utterance length (<= 25s)
+            if seg_dur > 25.0:
                 continue
+            has_long_pause = any(
+                (all_words[indices[k+1]]["start"] - all_words[indices[k]]["end"]) >= 0.75
+                for k in range(len(indices) - 1)
+            )
+            if has_long_pause:
+                continue
+
             speaker_counts = Counter(all_words[i]["speaker"] for i in indices)
             majority_speaker, majority_count = speaker_counts.most_common(1)[0]
-            # Apply only if majority is clear (>60%) — avoids forcing ambiguous segments
-            if majority_count / len(indices) > 0.60:
+            # Apply if majority is >= 60% — eliminates boundary word jitter on continuous utterances
+            if (majority_count / len(indices)) >= 0.60:
                 for i in indices:
                     all_words[i]["speaker"] = majority_speaker
 
@@ -438,7 +445,7 @@ class InferencePipeline:
             if (
                 prev_seg["speaker"] == next_seg["speaker"]
                 and curr_seg["speaker"] != prev_seg["speaker"]
-                and (n_words <= 3 or seg_dur < 1.5)
+                and (n_words <= 4 or seg_dur < 2.0)
             ):
                 # Fix: absorb orphan into prev_seg
                 prev_seg["words"].extend(curr_seg.get("words", []))

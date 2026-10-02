@@ -159,5 +159,51 @@ class TestSpeakerDiarizer(unittest.TestCase):
         self.assertEqual(res[1]["speaker"], "SPEAKER_01")
         self.assertEqual(res[1]["text"], "Now second speaker talks.")
 
+    def test_single_speaker_3_blocks_consolidates_to_single_bank(self):
+        """
+        Simulates the user screenshot: A 33-second recording of ONE person
+        erroneously split into 3 equal blocks (SPEAKER_00, SPEAKER_01, SPEAKER_02).
+        Must be consolidated down to 1 single speaker (SPEAKER_00).
+        """
+        turns = [
+            {"start": 0.0, "end": 11.2, "speaker": "SPEAKER_00"},
+            {"start": 11.5, "end": 22.1, "speaker": "SPEAKER_01"},
+            {"start": 22.5, "end": 33.0, "speaker": "SPEAKER_02"},
+        ]
+        consolidated = self.diarizer._consolidate_fragmented_speakers(turns)
+        unique_spks = set(t["speaker"] for t in consolidated)
+        self.assertEqual(len(unique_spks), 1, f"Expected 1 speaker after consolidation, got: {unique_spks}")
+        self.assertIn("SPEAKER_00", unique_spks)
+
+    def test_multi_speaker_dialogue_preserved(self):
+        """
+        In a real courtroom dialogue, speakers alternate (Judge -> Counsel -> Judge -> Counsel).
+        This must NEVER be merged into a single speaker.
+        """
+        turns = [
+            {"start": 0.0, "end": 5.0, "speaker": "SPEAKER_00"},  # Judge
+            {"start": 5.5, "end": 15.0, "speaker": "SPEAKER_01"}, # Counsel
+            {"start": 15.5, "end": 20.0, "speaker": "SPEAKER_00"},# Judge returns
+            {"start": 20.5, "end": 35.0, "speaker": "SPEAKER_01"},# Counsel returns
+        ]
+        consolidated = self.diarizer._consolidate_fragmented_speakers(turns)
+        unique_spks = set(t["speaker"] for t in consolidated)
+        self.assertEqual(len(unique_spks), 2, f"Expected 2 speakers preserved, got: {unique_spks}")
+
+    def test_dominant_speaker_absorbs_micro_noise_blip(self):
+        """
+        One speaker speaks for 45s (95% of speech). A 0.8s micro-fragment is detected.
+        It should be absorbed into the dominant speaker.
+        """
+        turns = [
+            {"start": 0.0, "end": 20.0, "speaker": "SPEAKER_00"},
+            {"start": 20.5, "end": 21.3, "speaker": "SPEAKER_01"}, # 0.8s artifact
+            {"start": 22.0, "end": 45.0, "speaker": "SPEAKER_00"},
+        ]
+        consolidated = self.diarizer._consolidate_fragmented_speakers(turns)
+        unique_spks = set(t["speaker"] for t in consolidated)
+        self.assertEqual(len(unique_spks), 1)
+        self.assertIn("SPEAKER_00", unique_spks)
+
 if __name__ == "__main__":
     unittest.main()

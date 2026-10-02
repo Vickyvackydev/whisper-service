@@ -34,11 +34,11 @@ class WorkerConfig:
 
     HF_TOKEN: str = get_hf_token.__func__(None)
     DIARIZATION_MODEL: str = os.getenv("DIARIZATION_MODEL", "pyannote/speaker-diarization-3.1")
-    DIARIZATION_THRESHOLD: Optional[float] = float(os.getenv("DIARIZATION_THRESHOLD", "0.55"))
+    DIARIZATION_THRESHOLD: Optional[float] = float(os.getenv("DIARIZATION_THRESHOLD", "0.70"))
     MIN_SPEAKERS: Optional[int] = int(os.getenv("MIN_SPEAKERS")) if os.getenv("MIN_SPEAKERS") else None
     MAX_SPEAKERS: Optional[int] = int(os.getenv("MAX_SPEAKERS")) if os.getenv("MAX_SPEAKERS") else None
-    MIN_DURATION_ON: float = float(os.getenv("MIN_DURATION_ON", "0.05"))
-    MIN_DURATION_OFF: float = float(os.getenv("MIN_DURATION_OFF", "0.08"))
+    MIN_DURATION_ON: float = float(os.getenv("MIN_DURATION_ON", "0.20"))
+    MIN_DURATION_OFF: float = float(os.getenv("MIN_DURATION_OFF", "0.35"))
     ENABLE_DIARIZATION_DEFAULT: bool = os.getenv("ENABLE_DIARIZATION_DEFAULT", "true").lower() in ("true", "1", "yes")
     
     # Worker Identifiers & Concurrency

@@ -36,25 +36,15 @@ class SpeakerDiarizer:
             else:
                 logger.info("Pyannote Diarization pipeline loaded on CPU.")
 
-            # Calibrate hyperparameters for courtrooms
+            # Calibrate Pyannote hyperparameters
+            # IMPORTANT ORDER: call instantiate() FIRST (applies via Pyannote schema),
+            # then override attributes DIRECTLY AFTER so our values are never overwritten.
             try:
-                # 1. Direct attribute configuration for Pyannote 3.1
-                thresh = getattr(WorkerConfig, "DIARIZATION_THRESHOLD", None)
-                if thresh is not None and hasattr(self.pipeline, "clustering"):
-                    if hasattr(self.pipeline.clustering, "threshold"):
-                        self.pipeline.clustering.threshold = float(thresh)
-                        logger.info(f"Directly configured Pyannote clustering.threshold = {float(thresh)}")
+                thresh  = getattr(WorkerConfig, "DIARIZATION_THRESHOLD", 0.70)
+                min_off = getattr(WorkerConfig, "MIN_DURATION_OFF", 0.35)
+                min_on  = getattr(WorkerConfig, "MIN_DURATION_ON", 0.20)
 
-                min_off = getattr(WorkerConfig, "MIN_DURATION_OFF", 0.15)
-                min_on = getattr(WorkerConfig, "MIN_DURATION_ON", 0.05)
-                if hasattr(self.pipeline, "segmentation"):
-                    if hasattr(self.pipeline.segmentation, "min_duration_off") and min_off is not None:
-                        self.pipeline.segmentation.min_duration_off = float(min_off)
-                    if hasattr(self.pipeline.segmentation, "min_duration_on") and min_on is not None:
-                        self.pipeline.segmentation.min_duration_on = float(min_on)
-                    logger.info(f"Directly configured Pyannote segmentation: min_duration_off={min_off}, min_duration_on={min_on}")
-
-                # 2. Also attempt pipeline.instantiate if supported
+                # Step 1: pipeline.instantiate() — respects Pyannote's internal schema
                 instantiate_params = {}
                 if thresh is not None:
                     instantiate_params["clustering"] = {"threshold": float(thresh)}
@@ -66,10 +56,34 @@ class SpeakerDiarizer:
                 if seg_dict:
                     instantiate_params["segmentation"] = seg_dict
                 if instantiate_params:
-                    self.pipeline.instantiate(instantiate_params)
-                    logger.info(f"Pyannote instantiated with court hyperparameters: {instantiate_params}")
+                    try:
+                        self.pipeline.instantiate(instantiate_params)
+                        logger.info(f"Pyannote pipeline.instantiate() applied: {instantiate_params}")
+                    except Exception as inst_err:
+                        logger.debug(f"pipeline.instantiate() not available or failed ({inst_err}), using direct attrs only")
+
+                # Step 2: Direct attribute override (always runs AFTER instantiate so it wins)
+                if thresh is not None:
+                    if hasattr(self.pipeline, "clustering") and hasattr(self.pipeline.clustering, "threshold"):
+                        self.pipeline.clustering.threshold = float(thresh)
+                        logger.info(f"[THRESHOLD] Pyannote clustering.threshold set to {float(thresh)}")
+                    # Pyannote 3.x alternative path
+                    for attr in ("_clustering", "klustering"):
+                        sub = getattr(self.pipeline, attr, None)
+                        if sub is not None and hasattr(sub, "threshold"):
+                            sub.threshold = float(thresh)
+                            logger.info(f"[THRESHOLD] Pyannote {attr}.threshold set to {float(thresh)}")
+
+                if hasattr(self.pipeline, "segmentation"):
+                    seg = self.pipeline.segmentation
+                    if min_off is not None and hasattr(seg, "min_duration_off"):
+                        seg.min_duration_off = float(min_off)
+                    if min_on is not None and hasattr(seg, "min_duration_on"):
+                        seg.min_duration_on = float(min_on)
+                    logger.info(f"[SEGMENTATION] min_duration_off={min_off}, min_duration_on={min_on}")
+
             except Exception as thresh_err:
-                logger.debug(f"Note on clustering/segmentation settings: {thresh_err}")
+                logger.debug(f"Hyperparameter configuration note: {thresh_err}")
             
             self.is_loaded = True
         except Exception as e:
@@ -180,8 +194,8 @@ class SpeakerDiarizer:
             logger.info(f"Diarization inference successful: detected {len(turns)} turns across {unique_detected} distinct speakers.")
 
             # Post-diarization consolidation: prevent a single speaker from being split
-            # into multiple clusters due to pitch/volume variation or micro-pauses.
-            turns = self._consolidate_fragmented_speakers(turns)
+            # into multiple clusters due to pitch/volume variation, sliding-window boundaries, or micro-pauses.
+            turns = self._consolidate_fragmented_speakers(turns, audio_data=data, sample_rate=sample_rate)
 
             return turns
 
@@ -189,32 +203,87 @@ class SpeakerDiarizer:
             logger.error(f"Critical error during speaker diarization inference: {e}", exc_info=True)
             return []
 
+    def _extract_audio_feature(self, waveform_1d: np.ndarray, sample_rate: int = 16000) -> Optional[np.ndarray]:
+        """
+        Computes normalized log-filterbank acoustic feature vector for a segment.
+        Provides robust voice comparison across different speech chunks.
+        """
+        if len(waveform_1d) < int(sample_rate * 0.3):
+            return None
+        win_len = int(sample_rate * 0.025)
+        hop_len = int(sample_rate * 0.010)
+        if len(waveform_1d) <= win_len:
+            return None
+
+        # Try Pyannote embedding if pipeline loaded and has _embedding
+        if self.pipeline is not None and hasattr(self.pipeline, "_embedding"):
+            try:
+                emb_model = getattr(self.pipeline, "_embedding")
+                if callable(emb_model):
+                    t_in = torch.from_numpy(waveform_1d).unsqueeze(0).unsqueeze(0).to(self.device_obj)
+                    with torch.no_grad():
+                        out = emb_model(t_in)
+                    out_np = out.squeeze().detach().cpu().numpy().astype(np.float32)
+                    norm = np.linalg.norm(out_np)
+                    if norm > 1e-6:
+                        return out_np / norm
+            except Exception as emb_e:
+                logger.debug(f"Direct Pyannote embedding extraction note ({emb_e}), using acoustic filterbanks")
+
+        # Fallback / Universal: 24-band geometric filterbank across 100Hz - 6500Hz
+        try:
+            n_fft = 512
+            window = np.hanning(win_len)
+            num_frames = (len(waveform_1d) - win_len) // hop_len
+            if num_frames <= 0:
+                return None
+
+            indices = np.linspace(0, num_frames - 1, min(num_frames, 150), dtype=int)
+            frames = np.stack([waveform_1d[idx * hop_len : idx * hop_len + win_len] * window for idx in indices])
+            mags = np.abs(np.fft.rfft(frames, n=n_fft))
+
+            n_bands = 24
+            bin_freqs = np.linspace(0, sample_rate / 2, mags.shape[1])
+            band_edges = np.geomspace(100, min(sample_rate / 2, 6500), n_bands + 2)
+            filterbank = np.zeros((n_bands, mags.shape[1]), dtype=np.float32)
+            for b in range(n_bands):
+                left, center, right = band_edges[b], band_edges[b+1], band_edges[b+2]
+                filterbank[b] = np.maximum(0, np.minimum(
+                    (bin_freqs - left) / max(1e-6, center - left),
+                    (right - bin_freqs) / max(1e-6, right - center)
+                ))
+
+            band_energies = np.dot(mags, filterbank.T)
+            log_energies = np.log(np.maximum(1e-6, band_energies))
+            avg_feat = log_energies.mean(axis=0)
+            norm = np.linalg.norm(avg_feat)
+            if norm > 1e-6:
+                return (avg_feat / norm).astype(np.float32)
+        except Exception as feat_err:
+            logger.debug(f"Acoustic feature calculation note: {feat_err}")
+
+        return None
+
     def _consolidate_fragmented_speakers(
         self,
         turns: List[Dict[str, Any]],
+        audio_data: Optional[np.ndarray] = None,
+        sample_rate: int = 16000,
         base_min_fraction: float = 0.04,
         min_seconds: float = 2.0
     ) -> List[Dict[str, Any]]:
         """
-        Merges phantom speaker clusters (caused by Pyannote over-clustering)
-        back into the dominant speaker, WITHOUT absorbing real but brief speakers
-        such as a junior counsel or a witness who only spoke a short time.
-
-        Adaptive thresholds:
-        - The fraction threshold scales DOWN as speaker count rises:
-              2 speakers: merge below 4%
-              3 speakers: merge below 2.7%
-              4 speakers: merge below 2%
-              5+ speakers: merge below 1.6%
-          This lets a real junior counsel (5% of a 5-speaker court) survive
-          consolidation, while still merging phantom 1-2% acoustic fragments.
-        - BOTH conditions must hold: fraction < threshold AND dur < min_seconds.
-          This protects real brief speakers (objections, short remarks).
+        Consolidates fragmented speaker clusters using:
+        1. Acoustic Embedding Centroid Matching (pairwise cosine similarity >= 0.72)
+        2. Conversational Dynamics & Monologue Analysis (detects non-alternating sequential blocks)
+        3. Dominant Speaker Dominance Check (>= 85% speech time)
+        4. Tiny Fragment Pruning (micro-noise / clicks)
+        5. Micro-pause turn stitching (<= 0.40s)
+        6. Consistent Chronological Speaker Normalization (SPEAKER_00, SPEAKER_01...)
         """
         if not turns:
             return turns
 
-        # Tally total speech time per speaker
         speaker_durations: Dict[str, float] = {}
         for t in turns:
             spk = t["speaker"]
@@ -227,43 +296,142 @@ class SpeakerDiarizer:
         if total_speech <= 0 or n_speakers <= 1:
             return turns
 
-        # Adaptive fraction: threshold decreases as speaker count increases
-        adaptive_fraction = max(0.015, base_min_fraction / max(1.0, n_speakers / 2.0))
-
-        # Identify the dominant speaker (most total speech)
         dominant = max(speaker_durations, key=lambda s: speaker_durations[s])
+        sorted_turns = sorted(turns, key=lambda t: t["start"])
 
-        # Find phantom fragment speakers to absorb
-        # Requirement: BOTH negligible fraction AND negligible seconds
+        # ── Conversational Dynamics: Count runs and conversational returns ───
+        speaker_runs: Dict[str, int] = {}
+        prev_spk = None
+        seen_speakers = set()
+        return_speaker_count = 0
+
+        for t in sorted_turns:
+            spk = t["speaker"]
+            if spk != prev_spk:
+                speaker_runs[spk] = speaker_runs.get(spk, 0) + 1
+                if spk in seen_speakers:
+                    return_speaker_count += 1
+                seen_speakers.add(spk)
+                prev_spk = spk
+
+        total_audio_dur = (sorted_turns[-1]["end"] - sorted_turns[0]["start"]) if sorted_turns else 0.0
+
+        # ── Acoustic Speaker Centroid Extraction ─────────────────────────────
+        speaker_centroids: Dict[str, np.ndarray] = {}
+        if audio_data is not None and len(audio_data) > 0:
+            for spk in speaker_durations:
+                spk_turns = [t for t in sorted_turns if t["speaker"] == spk and (t["end"] - t["start"]) >= 0.5]
+                if not spk_turns:
+                    spk_turns = [t for t in sorted_turns if t["speaker"] == spk]
+
+                feats = []
+                for st in spk_turns[:5]:
+                    start_s = max(0, int(st["start"] * sample_rate))
+                    end_s = min(len(audio_data), int(st["end"] * sample_rate))
+                    if end_s - start_s >= int(0.3 * sample_rate):
+                        feat = self._extract_audio_feature(audio_data[start_s:end_s], sample_rate)
+                        if feat is not None:
+                            feats.append(feat)
+                if feats:
+                    avg_feat = np.mean(feats, axis=0)
+                    norm = np.linalg.norm(avg_feat)
+                    if norm > 1e-6:
+                        speaker_centroids[spk] = avg_feat / norm
+
+        # ── Build Merge Mapping ──────────────────────────────────────────────
         to_merge: Dict[str, str] = {}
+        ranked_speakers = sorted(speaker_durations.keys(), key=lambda s: speaker_durations[s], reverse=True)
+
+        def get_root_target(s: str) -> str:
+            curr = s
+            visited = set()
+            while curr in to_merge and curr not in visited:
+                visited.add(curr)
+                curr = to_merge[curr]
+            return curr
+
+        # 1. Acoustic Similarity Merging (sim >= 0.72)
+        for i in range(len(ranked_speakers)):
+            spk_main = ranked_speakers[i]
+            target = get_root_target(spk_main)
+            for j in range(i + 1, len(ranked_speakers)):
+                spk_other = ranked_speakers[j]
+                if spk_other in to_merge:
+                    continue
+                if spk_main in speaker_centroids and spk_other in speaker_centroids:
+                    sim = float(np.dot(speaker_centroids[spk_main], speaker_centroids[spk_other]))
+                    if sim >= 0.72:
+                        to_merge[spk_other] = target
+                        logger.info(f"[CONSOLIDATION] Merging '{spk_other}' into '{target}' — acoustic similarity {sim:.3f}")
+
+        # 2. Pure Sequential Monologue Detection (Zero Conversational Returns)
+        # In a real conversation, speakers alternate (return_speaker_count >= 1).
+        # If returns == 0 and audio duration <= 120s, non-dominant sequential blocks are acoustic splits of one speaker!
+        if return_speaker_count == 0 and total_audio_dur <= 120.0 and n_speakers >= 2:
+            target = get_root_target(dominant)
+            for spk in ranked_speakers:
+                if spk != target and spk not in to_merge:
+                    to_merge[spk] = target
+                    logger.info(f"[CONSOLIDATION] Merging '{spk}' into dominant '{target}' — pure sequential short audio (returns=0, dur={total_audio_dur:.1f}s)")
+
+        # 3. Dominant Speaker Dominance Check (>= 85% speech time)
+        dom_fraction = speaker_durations[dominant] / total_speech
+        if dom_fraction >= 0.85:
+            target = get_root_target(dominant)
+            for spk, dur in speaker_durations.items():
+                if spk != target and spk not in to_merge:
+                    if speaker_runs.get(spk, 0) <= 1 or dur < 3.0:
+                        to_merge[spk] = target
+                        logger.info(f"[CONSOLIDATION] Merging '{spk}' into dominant '{target}' — dominant speaker holds {dom_fraction*100:.1f}%")
+
+        # 4. Tiny Fragment Pruning
+        adaptive_fraction = max(0.015, base_min_fraction / max(1.0, n_speakers / 2.0))
+        target = get_root_target(dominant)
         for spk, dur in speaker_durations.items():
-            if spk == dominant:
-                continue
-            fraction = dur / total_speech
-            if fraction < adaptive_fraction and dur < min_seconds:
-                to_merge[spk] = dominant
-                logger.info(
-                    f"[CONSOLIDATION] Merging phantom speaker '{spk}' "
-                    f"({dur:.2f}s, {fraction*100:.1f}%) into '{dominant}'. "
-                    f"[threshold: {adaptive_fraction*100:.1f}%/{min_seconds}s, n={n_speakers}]"
-                )
+            if spk != target and spk not in to_merge:
+                fraction = dur / total_speech
+                if fraction < adaptive_fraction and dur < min_seconds:
+                    to_merge[spk] = target
+                    logger.info(f"[CONSOLIDATION] Merging tiny fragment '{spk}' ({dur:.1f}s, {fraction*100:.1f}%) into '{target}'")
 
-        if not to_merge:
-            return turns
-
-        # Apply the merge
+        # 5. Apply Merges
         merged_turns = []
-        for t in turns:
-            new_t = dict(t)
-            new_t["speaker"] = to_merge.get(t["speaker"], t["speaker"])
-            merged_turns.append(new_t)
+        for t in sorted_turns:
+            spk = t["speaker"]
+            final_spk = get_root_target(spk)
+            merged_turns.append({
+                "start": t["start"],
+                "end": t["end"],
+                "speaker": final_spk
+            })
 
-        consolidated_count = len(set(t["speaker"] for t in merged_turns))
-        logger.info(
-            f"[CONSOLIDATION] Reduced from {n_speakers} to "
-            f"{consolidated_count} speakers after phantom fragment merge."
-        )
-        return merged_turns
+        # 6. Micro-Pause Turn Stitching (same speaker with pause <= 0.40s)
+        stitched_turns = []
+        for t in merged_turns:
+            if not stitched_turns:
+                stitched_turns.append(dict(t))
+            else:
+                last = stitched_turns[-1]
+                gap = t["start"] - last["end"]
+                if last["speaker"] == t["speaker"] and gap <= 0.40:
+                    last["end"] = max(last["end"], t["end"])
+                else:
+                    stitched_turns.append(dict(t))
+
+        # 7. Consistent Chronological Re-numbering (SPEAKER_00, SPEAKER_01...)
+        first_heard = {}
+        for t in stitched_turns:
+            s = t["speaker"]
+            if s not in first_heard:
+                first_heard[s] = t["start"]
+        ordered = sorted(first_heard.keys(), key=lambda s: first_heard[s])
+        remap = {orig: f"SPEAKER_{idx:02d}" for idx, orig in enumerate(ordered)}
+
+        for t in stitched_turns:
+            t["speaker"] = remap.get(t["speaker"], t["speaker"])
+
+        logger.info(f"[CONSOLIDATION] {n_speakers} raw speakers → {len(ordered)} consolidated speakers.")
+        return stitched_turns
     def assign_speakers(
         self,
         segments: List[Dict[str, Any]],
