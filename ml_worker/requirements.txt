@@ -8,3 +8,4 @@ pydantic>=2.0.0
 numpy>=1.24.0
 soundfile>=0.12.1
 python-dotenv>=1.0.1
+whisperx @ git+https://github.com/m-bain/whisperX.git

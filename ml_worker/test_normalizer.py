@@ -108,5 +108,38 @@ class TestNormalizer(unittest.TestCase):
         self.assertEqual(words[4]["word"], "Court")
         self.assertEqual(words[5]["word"], "5")
 
+    def test_my_casing_normalization(self):
+        cases = [
+            ("This is My client and My submission and My Lord.", "This is my client and my submission and My Lord."),
+            ("My client is ready. My Lord, I agree.", "My client is ready. My Lord, I agree."),
+            ("Yes, My Lord. That is My argument.", "Yes, My Lord. That is my argument."),
+            ("in My humble view, My Lord.", "in my humble view, My Lord."),
+            ("It was My fault, My Noble Lord.", "It was my fault, My Noble Lord."),
+            ("My Lords, please note My presence.", "My Lords, please note my presence."),
+            ("No, My friend.", "No, my friend."),
+            ("Where is My car? My car is there.", "Where is my car? My car is there."),
+        ]
+        for inp, expected in cases:
+            with self.subTest(inp=inp):
+                self.assertEqual(normalize_case_numbers_and_slashes(inp), expected)
+
+        # Word level test
+        seg = {
+            "text": "This is My client. Yes, my lord.",
+            "words": [
+                {"word": "This"},
+                {"word": "is"},
+                {"word": "My"},
+                {"word": "client."},
+                {"word": "Yes,"},
+                {"word": "my"},
+                {"word": "lord."},
+            ]
+        }
+        res = normalize_segment(seg)
+        self.assertEqual(res["text"], "This is my client. Yes, My Lord.")
+        words_out = [w["word"] for w in res["words"]]
+        self.assertEqual(words_out, ["This", "is", "my", "client.", "Yes,", "My", "Lord."])
+
 if __name__ == '__main__':
     unittest.main()

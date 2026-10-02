@@ -36,22 +36,46 @@ class SpeakerDiarizer:
             else:
                 logger.info("Pyannote Diarization pipeline loaded on CPU.")
 
-            # Calibrate clustering threshold if custom override is set
+            # Calibrate hyperparameters for courtrooms
             try:
+                instantiate_params = {}
                 threshold = getattr(WorkerConfig, "DIARIZATION_THRESHOLD", None)
                 if threshold is not None:
-                    self.pipeline.instantiate({"clustering": {"threshold": float(threshold)}})
-                    logger.info(f"Pyannote clustering threshold calibrated to {threshold}.")
+                    instantiate_params["clustering"] = {"threshold": float(threshold)}
+                min_off = getattr(WorkerConfig, "MIN_DURATION_OFF", 0.2)
+                min_on = getattr(WorkerConfig, "MIN_DURATION_ON", 0.1)
+                seg_dict = {}
+                if min_off is not None:
+                    seg_dict["min_duration_off"] = float(min_off)
+                if min_on is not None:
+                    seg_dict["min_duration_on"] = float(min_on)
+                if seg_dict:
+                    instantiate_params["segmentation"] = seg_dict
+                if instantiate_params:
+                    self.pipeline.instantiate(instantiate_params)
+                    logger.info(f"Pyannote calibrated with court hyperparameters: {instantiate_params}")
                 else:
                     logger.info("Using Pyannote default calibrated clustering threshold.")
             except Exception as thresh_err:
-                logger.debug(f"Note on clustering threshold setting: {thresh_err}")
+                logger.debug(f"Note on clustering/segmentation settings: {thresh_err}")
             
             self.is_loaded = True
         except Exception as e:
             logger.error(f"Failed to load Pyannote diarization pipeline: {e}")
             self.pipeline = None
             self.is_loaded = False
+
+    def diarize_dataframe(
+        self,
+        audio_path: Path,
+        min_speakers: Optional[int] = None,
+        max_speakers: Optional[int] = None
+    ):
+        import pandas as pd
+        turns = self.diarize(audio_path, min_speakers=min_speakers, max_speakers=max_speakers)
+        if not turns:
+            return pd.DataFrame(columns=["start", "end", "speaker"])
+        return pd.DataFrame(turns)
 
     def diarize(
         self,

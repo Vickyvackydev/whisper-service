@@ -35,6 +35,8 @@ class WorkerConfig:
     DIARIZATION_THRESHOLD: Optional[float] = float(os.getenv("DIARIZATION_THRESHOLD", "0.38")) if os.getenv("DIARIZATION_THRESHOLD") != "0" else None
     MIN_SPEAKERS: Optional[int] = int(os.getenv("MIN_SPEAKERS", "2")) if os.getenv("MIN_SPEAKERS") != "0" else None
     MAX_SPEAKERS: Optional[int] = int(os.getenv("MAX_SPEAKERS")) if os.getenv("MAX_SPEAKERS") else None
+    MIN_DURATION_ON: float = float(os.getenv("MIN_DURATION_ON", "0.1"))
+    MIN_DURATION_OFF: float = float(os.getenv("MIN_DURATION_OFF", "0.2"))
     ENABLE_DIARIZATION_DEFAULT: bool = os.getenv("ENABLE_DIARIZATION_DEFAULT", "true").lower() in ("true", "1", "yes")
     
     # Worker Identifiers & Concurrency

@@ -275,7 +275,62 @@ def normalize_case_numbers_and_slashes(text: str) -> str:
     for pattern, replacement in PRONOUN_I_REPLACEMENTS:
         curr = re.sub(pattern, replacement, curr)
         
+    # 10. Normalize 'My' casing: only capitalize in court honorifics ("My Lord", "My Ladyship", etc.) or at sentence start
+    curr = normalize_my_casing(curr)
+
     return curr
+
+COURT_MY_TRAILS = {'lord', 'lords', 'lordship', 'lordships', 'ladyship', 'ladyships', 'noble'}
+
+def normalize_my_casing(text: str) -> str:
+    """
+    Normalizes 'my' / 'My' casing across text:
+    - Court honorifics ('My Lord', 'My Lords', 'My Noble Lord', 'My Ladyship', 'My Lordship') are always capitalized.
+    - 'My' at the beginning of a sentence is kept capitalized.
+    - Any individual 'My' appearing in the middle of a sentence (e.g. 'this is my client', 'in my view', 'that is my submission')
+      is lowercased to 'my'.
+    """
+    if not text:
+        return text
+
+    # 1. First ensure court honorifics with 'my' or 'me' are properly capitalized
+    text = re.sub(r'(?i)\b(?:my|me)\s+noble\s+lords?\b', lambda m: 'My Noble Lords' if m.group(0).lower().endswith('s') else 'My Noble Lord', text)
+    text = re.sub(r'(?i)\b(?:my|me)\s+lords?\b', lambda m: 'My Lords' if m.group(0).lower().endswith('s') else 'My Lord', text)
+    text = re.sub(r'(?i)\b(?:my|me)\s+lordships?\b', lambda m: 'My Lordships' if m.group(0).lower().endswith('s') else 'My Lordship', text)
+    text = re.sub(r'(?i)\b(?:my|me)\s+ladyships?\b', lambda m: 'My Ladyships' if m.group(0).lower().endswith('s') else 'My Ladyship', text)
+
+    # 2. Tokenize by words and spaces, keeping punctuation
+    tokens = re.split(r'(\s+)', text)
+    new_tokens = []
+    
+    sentence_start = True
+
+    for i, tok in enumerate(tokens):
+        if tok.isspace() or not tok:
+            new_tokens.append(tok)
+            continue
+
+        clean = tok.strip(PUNCT_CHARS)
+
+        if clean == 'My':
+            # Check next non-space token
+            next_word_clean = ''
+            for j in range(i + 1, len(tokens)):
+                if not tokens[j].isspace() and tokens[j]:
+                    next_word_clean = tokens[j].strip(PUNCT_CHARS).lower()
+                    break
+
+            is_court_honorific = next_word_clean in COURT_MY_TRAILS
+            if not is_court_honorific and not sentence_start:
+                # Replace 'My' with 'my', preserving any punctuation around it
+                start_pos = tok.find('My')
+                if start_pos != -1:
+                    tok = tok[:start_pos] + 'my' + tok[start_pos + 2:]
+
+        new_tokens.append(tok)
+        sentence_start = any(tok.rstrip(PUNCT_CHARS).endswith(p) or tok.endswith(p) for p in ('.', '?', '!'))
+
+    return ''.join(new_tokens)
 
 def clean_word_token(word: str) -> str:
     if not word:
@@ -487,9 +542,14 @@ def normalize_segment(segment: Dict[str, Any]) -> Dict[str, Any]:
             w2_clean = clean_token(words[idx+1].get("word", ""))
 
             # Judicial honorifics
-            if (w1_clean in ("my", "me")) and (w2_clean in ("lord", "noble")):
+            if (w1_clean in ("my", "me")) and (w2_clean in ("lord", "lords", "noble", "lordship", "lordships", "ladyship", "ladyships")):
                 words[idx]["word"] = apply_proper_case(words[idx]["word"], "My")
-                words[idx+1]["word"] = apply_proper_case(words[idx+1]["word"], "Lord" if w2_clean == "lord" else "Noble")
+                if w2_clean == "noble":
+                    words[idx+1]["word"] = apply_proper_case(words[idx+1]["word"], "Noble")
+                elif w2_clean in ("lord", "lords"):
+                    words[idx+1]["word"] = apply_proper_case(words[idx+1]["word"], "Lord" if w2_clean == "lord" else "Lords")
+                else:
+                    words[idx+1]["word"] = apply_proper_case(words[idx+1]["word"], w2_clean.capitalize())
             elif w1_clean == "your":
                 if w2_clean in ("honour", "honor"):
                     words[idx]["word"] = apply_proper_case(words[idx]["word"], "Your")
@@ -566,7 +626,23 @@ def normalize_segment(segment: Dict[str, Any]) -> Dict[str, Any]:
 
         words = [w for w in words if w.get("word")]
 
-        # 5. Merge slash tokens for suit numbers (e.g. FHC / L / CS / 485 / 2026 -> FHC/L/CS/485/2026)
+        # 5. Lowercase individual 'My' that is NOT at start of sentence and NOT part of an honorific
+        sentence_start = True
+        for idx in range(len(words)):
+            raw_w = words[idx].get("word", "")
+            clean_w = raw_w.strip(PUNCT_CHARS)
+            if clean_w == "My":
+                is_honorific = False
+                if idx + 1 < len(words):
+                    next_clean = clean_token(words[idx+1].get("word", ""))
+                    if next_clean in COURT_MY_TRAILS:
+                        is_honorific = True
+                if not is_honorific and not sentence_start:
+                    words[idx]["word"] = apply_proper_case(raw_w, "my")
+
+            sentence_start = any(raw_w.rstrip(PUNCT_CHARS).endswith(p) or raw_w.endswith(p) for p in ('.', '?', '!'))
+
+        # 6. Merge slash tokens for suit numbers (e.g. FHC / L / CS / 485 / 2026 -> FHC/L/CS/485/2026)
         segment["words"] = merge_slashed_words(words)
                 
     return segment
