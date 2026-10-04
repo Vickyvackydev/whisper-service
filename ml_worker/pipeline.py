@@ -147,7 +147,7 @@ class InferencePipeline:
                             logger.info(f"[{job_id}] [DIAGNOSTIC 1: Raw Pyannote intervals (first 35s)]:\n{pyannote_intervals}")
 
                         import whisperx
-                        stitched = whisperx.assign_word_speakers(diarize_df, aligned_result, fill_nearest=False)
+                        stitched = whisperx.assign_word_speakers(diarize_df, aligned_result, fill_nearest=True)
 
                         # 2. Dump raw word speakers directly after whisperx.assign_word_speakers
                         raw_early_words = []
@@ -157,7 +157,7 @@ class InferencePipeline:
                                     raw_early_words.append(f"{w.get('word', '')}[{w.get('speaker', 'NONE')}]")
                         logger.info(f"[{job_id}] [DIAGNOSTIC 2: Raw Word Speakers from WhisperX (first 35s)]:\n" + " ".join(raw_early_words[:80]))
 
-                        segments, num_speakers = self.reconstruct_speaker_turns(stitched, diarize_df)
+                        segments, num_speakers = self.reconstruct_speaker_turns(stitched)
 
                         # 3. Dump final reconstructed turns for first 35 seconds
                         final_early_turns = []
@@ -214,60 +214,7 @@ class InferencePipeline:
             cleanup_file(raw_download_path)
             cleanup_file(wav_path)
 
-    @staticmethod
-    def _match_word_speaker(
-        w_start: float,
-        w_end: float,
-        diar_intervals: List[Tuple[float, float, str]],
-        whisperx_spk: Any = None,
-        seg_spk: Any = None,
-        min_coverage: float = 0.25,
-    ) -> str:
-        """
-        Resolve a word's speaker purely from Pyannote intervals (sorted by start).
-        Whisper segment boundaries / segment speakers are NOT trusted.
-
-        1. True temporal intersection: the interval with the largest overlap wins,
-           provided it covers >= 25% of the word's duration.
-        2. Otherwise the nearest diarization interval by time distance
-           (words in short Pyannote gaps belong to the adjacent voice, not SPEAKER_00).
-        3. Otherwise (no diarization intervals at all) SPEAKER_00.
-
-        `whisperx_spk` / `seg_spk` are kept for signature compatibility and are only
-        used when there are no diarization intervals.
-        """
-        w_dur = max(0.01, w_end - w_start)
-        best_spk: Optional[str] = None
-        best_overlap = 0.0
-        nearest_spk: Optional[str] = None
-        nearest_dist = float("inf")
-
-        for d_start, d_end, d_spk in diar_intervals:
-            if d_start > w_end + nearest_dist:
-                break  # sorted by start: nothing later can overlap or be nearer
-            inter = max(0.0, min(w_end, d_end) - max(w_start, d_start))
-            if inter > best_overlap:
-                best_overlap = inter
-                best_spk = d_spk
-            if inter > 0.0:
-                dist = 0.0
-            elif d_end < w_start:
-                dist = w_start - d_end
-            else:
-                dist = d_start - w_end
-            if dist < nearest_dist:
-                nearest_dist = dist
-                nearest_spk = d_spk
-
-        if best_spk and (best_overlap / w_dur) >= min_coverage:
-            return best_spk
-        if nearest_spk:
-            return nearest_spk
-        if whisperx_spk and str(whisperx_spk).strip() not in ("None", ""):
-            return str(whisperx_spk)
-        return "SPEAKER_00"
-
-    def reconstruct_speaker_turns(self, stitched_result: Dict[str, Any], diarize_df: Any = None) -> Tuple[List[Dict[str, Any]], int]:
+    def reconstruct_speaker_turns(self, stitched_result: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], int]:
         """
         Takes WhisperX stitched word-level speaker assignments and builds
         clean, conversational speaker turns.
@@ -281,11 +228,12 @@ class InferencePipeline:
           "That's not true", "Objection"), and rapid speaker handoffs are preserved.
 
         Stages:
-        STAGE 1 - Speaker-Homogeneous Turn Slicing
-            Whisper segment boundaries are discarded. All words are flattened and
-            new segments are sliced only where:
-            - the word speaker changes, OR
-            - the silence gap between consecutive words is >= 0.8s
+        STAGE 1 - Conversational Turn Re-segmentation
+            Group acoustically labeled words into natural speaker turns using:
+            - Speaker transition (always split when spk != curr_speaker)
+            - Silence gap >= 1.2s
+            - Sentence-end + gap >= 0.4s or block >= 7s
+            - Max block guard >= 18s
 
         STAGE 2 - Chronological Speaker Normalization
             Renumber speakers so the first voice heard = SPEAKER_00.
@@ -293,13 +241,6 @@ class InferencePipeline:
         STAGE 3 - Legal Text Normalization
             Numbers as digits, honorific casing, suit citations, etc.
         """
-        # Pre-extract Pyannote intervals once, sorted by start, for word-overlap matching
-        diar_intervals: List[Tuple[float, float, str]] = []
-        if diarize_df is not None and hasattr(diarize_df, "iterrows"):
-            for _, r in diarize_df.iterrows():
-                diar_intervals.append((float(r["start"]), float(r["end"]), str(r["speaker"])))
-            diar_intervals.sort(key=lambda x: x[0])
-
         all_words: List[Dict[str, Any]] = []
         for seg in stitched_result.get("segments", []):
             words = seg.get("words", [])
@@ -328,19 +269,11 @@ class InferencePipeline:
                         w_end = float(w.get("end", w_start + 0.05))
                         if w_end < w_start:
                             w_end = w_start + 0.05
-                        # Do NOT fall back to seg["speaker"] first: it is the majority speaker
-                        # of the whole Whisper window and wipes out quick speaker handoffs.
-                        word_spk = self._match_word_speaker(
-                            w_start, w_end, diar_intervals,
-                            whisperx_spk=w.get("speaker"),
-                            seg_spk=seg.get("speaker"),
-                        )
-
                         all_words.append({
                             "word": w_txt,
                             "start": round(w_start, 3),
                             "end": round(w_end, 3),
-                            "speaker": str(word_spk),
+                            "speaker": str(w.get("speaker") or seg.get("speaker") or "SPEAKER_00"),
                             "score": round(float(w.get("score")), 3) if w.get("score") is not None else None,
                             "_seg_id": seg_id,
                         })
@@ -368,8 +301,16 @@ class InferencePipeline:
 
             last_w = curr_words[-1]
             gap = w["start"] - last_w["end"]
+            seg_duration = w["end"] - curr_words[0]["start"]
+            last_text = last_w["word"]
+            ends_sentence = any(last_text.endswith(p) for p in (".", "?", "!"))
 
-            should_split = (spk != curr_speaker) or (gap >= 0.8)
+            should_split = (
+                (spk != curr_speaker) or
+                (gap >= 1.2) or
+                (ends_sentence and (seg_duration >= 7.0 or gap >= 0.4)) or
+                (seg_duration >= 18.0)
+            )
 
             if should_split:
                 seg_text = " ".join(cw["word"] for cw in curr_words).strip()

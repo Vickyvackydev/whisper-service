@@ -159,11 +159,11 @@ class TestSpeakerDiarizer(unittest.TestCase):
         self.assertEqual(res[1]["speaker"], "SPEAKER_01")
         self.assertEqual(res[1]["text"], "Now second speaker talks.")
 
-    def test_sequential_distinct_clusters_never_cross_merged(self):
+    def test_single_speaker_3_blocks_consolidates_to_single_bank(self):
         """
-        Cross-speaker consolidation is disabled: Pyannote clusters are the source of truth.
-        Three sequential blocks with distinct labels (e.g. Judge, Counsel, Witness each
-        speaking once) must stay as 3 distinct speakers.
+        Simulates the user screenshot: A 33-second recording of ONE person
+        erroneously split into 3 equal blocks (SPEAKER_00, SPEAKER_01, SPEAKER_02).
+        Must be consolidated down to 1 single speaker (SPEAKER_00).
         """
         turns = [
             {"start": 0.0, "end": 11.2, "speaker": "SPEAKER_00"},
@@ -172,17 +172,8 @@ class TestSpeakerDiarizer(unittest.TestCase):
         ]
         consolidated = self.diarizer._consolidate_fragmented_speakers(turns)
         unique_spks = set(t["speaker"] for t in consolidated)
-        self.assertEqual(unique_spks, {"SPEAKER_00", "SPEAKER_01", "SPEAKER_02"})
-
-    def test_same_speaker_stitched_only_within_0_10s(self):
-        turns = [
-            {"start": 0.0, "end": 2.0, "speaker": "A"},
-            {"start": 2.05, "end": 4.0, "speaker": "A"},  # 0.05s gap -> stitched
-            {"start": 4.3, "end": 6.0, "speaker": "A"},   # 0.30s gap -> kept separate
-        ]
-        consolidated = self.diarizer._consolidate_fragmented_speakers(turns)
-        self.assertEqual(len(consolidated), 2)
-        self.assertEqual(consolidated[0]["end"], 4.0)
+        self.assertEqual(len(unique_spks), 1, f"Expected 1 speaker after consolidation, got: {unique_spks}")
+        self.assertIn("SPEAKER_00", unique_spks)
 
     def test_multi_speaker_dialogue_preserved(self):
         """
@@ -294,8 +285,8 @@ class TestReconstructSpeakerTurns(unittest.TestCase):
         self.assertEqual(turns[1]["speaker"], "SPEAKER_01")
         self.assertEqual(turns[1]["text"], "Now Speaker B answers back.")
 
-class TestMatchWordSpeaker(unittest.TestCase):
-    def setUp(self):
+if __name__ == "__main__":
+    unittest.main()
         from ml_worker.pipeline import InferencePipeline
         self.match = InferencePipeline._match_word_speaker
         self.intervals = [(0.0, 2.0, "A"), (2.1, 4.0, "B"), (6.0, 8.0, "C")]

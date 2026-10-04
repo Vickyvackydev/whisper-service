@@ -34,14 +34,9 @@ class WorkerConfig:
 
     HF_TOKEN: str = get_hf_token.__func__(None)
     DIARIZATION_MODEL: str = os.getenv("DIARIZATION_MODEL", "pyannote/speaker-diarization-3.1")
-    # 0.38 separates voices with different timbres (narration, father, mother, judge)
-    # in reverberant courtroom audio. Lower = more speakers.
-    DIARIZATION_THRESHOLD: Optional[float] = float(os.getenv("DIARIZATION_THRESHOLD", "0.38"))
-    # Force Pyannote to instantiate >= 3 clusters (Judge, Mother, Father, Narration...).
-    # Set MIN_SPEAKERS=0 to disable.
-    MIN_SPEAKERS: Optional[int] = int(os.getenv("MIN_SPEAKERS", "3"))
-    # Allow up to 6 speakers. Set MAX_SPEAKERS=0 to remove the upper bound.
-    MAX_SPEAKERS: Optional[int] = int(os.getenv("MAX_SPEAKERS", "6"))
+    DIARIZATION_THRESHOLD: Optional[float] = float(os.getenv("DIARIZATION_THRESHOLD", "0.63"))
+    MIN_SPEAKERS: Optional[int] = int(os.getenv("MIN_SPEAKERS")) if os.getenv("MIN_SPEAKERS") else None
+    MAX_SPEAKERS: Optional[int] = int(os.getenv("MAX_SPEAKERS")) if os.getenv("MAX_SPEAKERS") else None
     MIN_DURATION_ON: float = float(os.getenv("MIN_DURATION_ON", "0.08"))
     MIN_DURATION_OFF: float = float(os.getenv("MIN_DURATION_OFF", "0.20"))
     ENABLE_DIARIZATION_DEFAULT: bool = os.getenv("ENABLE_DIARIZATION_DEFAULT", "true").lower() in ("true", "1", "yes")
