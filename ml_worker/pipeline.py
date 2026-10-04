@@ -224,13 +224,17 @@ class InferencePipeline:
         min_coverage: float = 0.25,
     ) -> str:
         """
-        Resolve a word's speaker from Pyannote intervals (sorted by start).
+        Resolve a word's speaker purely from Pyannote intervals (sorted by start).
+        Whisper segment boundaries / segment speakers are NOT trusted.
 
         1. True temporal intersection: the interval with the largest overlap wins,
            provided it covers >= 25% of the word's duration.
-        2. Otherwise WhisperX's own label for the word (if any).
-        3. Otherwise the nearest diarization interval by time distance.
-        4. Otherwise the segment speaker, then SPEAKER_00.
+        2. Otherwise the nearest diarization interval by time distance
+           (words in short Pyannote gaps belong to the adjacent voice, not SPEAKER_00).
+        3. Otherwise (no diarization intervals at all) SPEAKER_00.
+
+        `whisperx_spk` / `seg_spk` are kept for signature compatibility and are only
+        used when there are no diarization intervals.
         """
         w_dur = max(0.01, w_end - w_start)
         best_spk: Optional[str] = None
@@ -257,11 +261,11 @@ class InferencePipeline:
 
         if best_spk and (best_overlap / w_dur) >= min_coverage:
             return best_spk
-        if whisperx_spk and str(whisperx_spk).strip() not in ("None", ""):
-            return str(whisperx_spk)
         if nearest_spk:
             return nearest_spk
-        return str(seg_spk or "SPEAKER_00")
+        if whisperx_spk and str(whisperx_spk).strip() not in ("None", ""):
+            return str(whisperx_spk)
+        return "SPEAKER_00"
 
     def reconstruct_speaker_turns(self, stitched_result: Dict[str, Any], diarize_df: Any = None) -> Tuple[List[Dict[str, Any]], int]:
         """
@@ -277,12 +281,11 @@ class InferencePipeline:
           "That's not true", "Objection"), and rapid speaker handoffs are preserved.
 
         Stages:
-        STAGE 1 - Conversational Turn Re-segmentation
-            Group acoustically labeled words into natural speaker turns using:
-            - Speaker transition (always split when spk != curr_speaker)
-            - Silence gap >= 1.2s
-            - Sentence-end + gap >= 0.4s or block >= 7s
-            - Max block guard >= 18s
+        STAGE 1 - Speaker-Homogeneous Turn Slicing
+            Whisper segment boundaries are discarded. All words are flattened and
+            new segments are sliced only where:
+            - the word speaker changes, OR
+            - the silence gap between consecutive words is >= 0.8s
 
         STAGE 2 - Chronological Speaker Normalization
             Renumber speakers so the first voice heard = SPEAKER_00.
@@ -365,16 +368,8 @@ class InferencePipeline:
 
             last_w = curr_words[-1]
             gap = w["start"] - last_w["end"]
-            seg_duration = w["end"] - curr_words[0]["start"]
-            last_text = last_w["word"]
-            ends_sentence = any(last_text.endswith(p) for p in (".", "?", "!"))
 
-            should_split = (
-                (spk != curr_speaker) or
-                (gap >= 1.2) or
-                (ends_sentence and (seg_duration >= 7.0 or gap >= 0.4)) or
-                (seg_duration >= 18.0)
-            )
+            should_split = (spk != curr_speaker) or (gap >= 0.8)
 
             if should_split:
                 seg_text = " ".join(cw["word"] for cw in curr_words).strip()

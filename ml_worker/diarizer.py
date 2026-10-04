@@ -40,7 +40,7 @@ class SpeakerDiarizer:
             # IMPORTANT ORDER: call instantiate() FIRST (applies via Pyannote schema),
             # then override attributes DIRECTLY AFTER so our values are never overwritten.
             try:
-                thresh  = getattr(WorkerConfig, "DIARIZATION_THRESHOLD", 0.42)
+                thresh  = getattr(WorkerConfig, "DIARIZATION_THRESHOLD", 0.38)
                 min_off = getattr(WorkerConfig, "MIN_DURATION_OFF", 0.20)
                 min_on  = getattr(WorkerConfig, "MIN_DURATION_ON", 0.08)
 
@@ -135,19 +135,31 @@ class SpeakerDiarizer:
             # Ensure 1D float32 array
             data = np.ascontiguousarray(data, dtype=np.float32)
             
-            # Prepare kwargs for min/max speakers (optional overrides)
+            # Prepare kwargs for min/max speakers.
+            # Default: min_speakers=3, max_speakers=6 so Pyannote cannot collapse a
+            # multi-party recording (Judge, Mother, Father, Narration) into 2 clusters.
+            # MIN_SPEAKERS=0 / MAX_SPEAKERS=0 disable the respective bound.
             params = {}
             target_min = min_speakers if min_speakers is not None else getattr(WorkerConfig, "MIN_SPEAKERS", None)
-            # Court sessions always have >= 2 speakers (Judge + Counsel). Default to 2 so Pyannote
-            # can never collapse the whole session into one speaker. MIN_SPEAKERS=0 disables this.
             if target_min is None:
-                target_min = 2
+                target_min = 3
             if target_min > 0:
                 params["min_speakers"] = int(target_min)
             target_max = max_speakers if max_speakers is not None else getattr(WorkerConfig, "MAX_SPEAKERS", None)
-            if target_max is not None and target_max > 0:
+            if target_max is None:
+                target_max = 6
+            if target_max > 0:
                 params["max_speakers"] = max(int(target_max), params.get("min_speakers", 1))
             logger.info(f"Diarization speaker constraints: {params or 'none'}")
+
+            # Override clustering threshold strictly before calling the pipeline
+            thresh = getattr(WorkerConfig, "DIARIZATION_THRESHOLD", 0.38)
+            if thresh is not None and hasattr(self.pipeline, "clustering"):
+                try:
+                    self.pipeline.clustering.threshold = float(thresh)
+                    logger.info(f"[THRESHOLD] clustering.threshold = {self.pipeline.clustering.threshold} (pre-inference)")
+                except Exception:
+                    pass
 
             diarization_output = None
 

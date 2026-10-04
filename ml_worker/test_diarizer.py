@@ -304,16 +304,43 @@ class TestMatchWordSpeaker(unittest.TestCase):
         # word 1.9-2.4: 0.1s in A, 0.3s in B -> B (even though WhisperX said A)
         self.assertEqual(self.match(1.9, 2.4, self.intervals, whisperx_spk="A"), "B")
 
-    def test_low_coverage_falls_back_to_whisperx(self):
-        # word 3.95-4.6: 0.05s of 0.65s in B (<25%) -> WhisperX label kept
-        self.assertEqual(self.match(3.95, 4.6, self.intervals, whisperx_spk="A"), "A")
+    def test_low_coverage_falls_back_to_nearest_interval(self):
+        # word 3.95-4.6: 0.05s of 0.65s in B (<25%) -> nearest interval B, WhisperX ignored
+        self.assertEqual(self.match(3.95, 4.6, self.intervals, whisperx_spk="A"), "B")
 
     def test_no_overlap_uses_nearest_interval_not_speaker_00(self):
         # word in gap 5.5-5.8, no WhisperX label -> nearest interval C (0.2s away)
         self.assertEqual(self.match(5.5, 5.8, self.intervals, seg_spk="A"), "C")
 
-    def test_no_intervals_uses_segment_speaker(self):
-        self.assertEqual(self.match(1.0, 1.2, [], seg_spk="SPEAKER_03"), "SPEAKER_03")
+    def test_no_intervals_ignores_segment_speaker(self):
+        # Whisper segment speaker is not trusted -> SPEAKER_00
+        self.assertEqual(self.match(1.0, 1.2, [], seg_spk="SPEAKER_03"), "SPEAKER_00")
+
+
+class TestTurnSlicing(unittest.TestCase):
+    def test_slices_on_speaker_change_and_08s_gap(self):
+        import pandas as pd
+        from ml_worker.pipeline import InferencePipeline
+        pipe = InferencePipeline.__new__(InferencePipeline)
+        df = pd.DataFrame([
+            {"start": 0.0, "end": 3.0, "speaker": "S1"},
+            {"start": 3.0, "end": 6.0, "speaker": "S2"},
+        ])
+        # One 6s Whisper segment containing a question (S1) and an answer (S2),
+        # plus a 0.9s pause inside S1's speech.
+        stitched = {"segments": [{"start": 0.0, "end": 6.0, "text": "", "words": [
+            {"word": "Who", "start": 0.0, "end": 0.3},
+            {"word": "paid?", "start": 0.4, "end": 0.8},
+            {"word": "Tell", "start": 1.7, "end": 2.0},
+            {"word": "me.", "start": 2.1, "end": 2.5},
+            {"word": "He", "start": 3.2, "end": 3.4},
+            {"word": "did.", "start": 3.5, "end": 3.9},
+        ]}]}
+        segs, n = pipe.reconstruct_speaker_turns(stitched, df)
+        self.assertEqual(n, 2)
+        self.assertEqual([s["speaker"] for s in segs], ["SPEAKER_00", "SPEAKER_00", "SPEAKER_01"])
+        self.assertEqual(len(segs[0]["words"]), 2)
+        self.assertEqual(segs[2]["start"], 3.2)
 
 
 if __name__ == "__main__":
