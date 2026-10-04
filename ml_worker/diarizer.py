@@ -40,7 +40,7 @@ class SpeakerDiarizer:
             # IMPORTANT ORDER: call instantiate() FIRST (applies via Pyannote schema),
             # then override attributes DIRECTLY AFTER so our values are never overwritten.
             try:
-                thresh  = getattr(WorkerConfig, "DIARIZATION_THRESHOLD", 0.48)
+                thresh  = getattr(WorkerConfig, "DIARIZATION_THRESHOLD", 0.42)
                 min_off = getattr(WorkerConfig, "MIN_DURATION_OFF", 0.20)
                 min_on  = getattr(WorkerConfig, "MIN_DURATION_ON", 0.08)
 

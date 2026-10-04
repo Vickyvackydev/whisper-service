@@ -214,6 +214,55 @@ class InferencePipeline:
             cleanup_file(raw_download_path)
             cleanup_file(wav_path)
 
+    @staticmethod
+    def _match_word_speaker(
+        w_start: float,
+        w_end: float,
+        diar_intervals: List[Tuple[float, float, str]],
+        whisperx_spk: Any = None,
+        seg_spk: Any = None,
+        min_coverage: float = 0.25,
+    ) -> str:
+        """
+        Resolve a word's speaker from Pyannote intervals (sorted by start).
+
+        1. True temporal intersection: the interval with the largest overlap wins,
+           provided it covers >= 25% of the word's duration.
+        2. Otherwise WhisperX's own label for the word (if any).
+        3. Otherwise the nearest diarization interval by time distance.
+        4. Otherwise the segment speaker, then SPEAKER_00.
+        """
+        w_dur = max(0.01, w_end - w_start)
+        best_spk: Optional[str] = None
+        best_overlap = 0.0
+        nearest_spk: Optional[str] = None
+        nearest_dist = float("inf")
+
+        for d_start, d_end, d_spk in diar_intervals:
+            if d_start > w_end + nearest_dist:
+                break  # sorted by start: nothing later can overlap or be nearer
+            inter = max(0.0, min(w_end, d_end) - max(w_start, d_start))
+            if inter > best_overlap:
+                best_overlap = inter
+                best_spk = d_spk
+            if inter > 0.0:
+                dist = 0.0
+            elif d_end < w_start:
+                dist = w_start - d_end
+            else:
+                dist = d_start - w_end
+            if dist < nearest_dist:
+                nearest_dist = dist
+                nearest_spk = d_spk
+
+        if best_spk and (best_overlap / w_dur) >= min_coverage:
+            return best_spk
+        if whisperx_spk and str(whisperx_spk).strip() not in ("None", ""):
+            return str(whisperx_spk)
+        if nearest_spk:
+            return nearest_spk
+        return str(seg_spk or "SPEAKER_00")
+
     def reconstruct_speaker_turns(self, stitched_result: Dict[str, Any], diarize_df: Any = None) -> Tuple[List[Dict[str, Any]], int]:
         """
         Takes WhisperX stitched word-level speaker assignments and builds
@@ -241,11 +290,12 @@ class InferencePipeline:
         STAGE 3 - Legal Text Normalization
             Numbers as digits, honorific casing, suit citations, etc.
         """
-        # Pre-extract Pyannote intervals once (used to resolve words WhisperX left unassigned)
+        # Pre-extract Pyannote intervals once, sorted by start, for word-overlap matching
         diar_intervals: List[Tuple[float, float, str]] = []
         if diarize_df is not None and hasattr(diarize_df, "iterrows"):
             for _, r in diarize_df.iterrows():
                 diar_intervals.append((float(r["start"]), float(r["end"]), str(r["speaker"])))
+            diar_intervals.sort(key=lambda x: x[0])
 
         all_words: List[Dict[str, Any]] = []
         for seg in stitched_result.get("segments", []):
@@ -277,15 +327,11 @@ class InferencePipeline:
                             w_end = w_start + 0.05
                         # Do NOT fall back to seg["speaker"] first: it is the majority speaker
                         # of the whole Whisper window and wipes out quick speaker handoffs.
-                        word_spk = w.get("speaker")
-                        if not word_spk or str(word_spk).strip() in ("None", ""):
-                            matched_spk = None
-                            w_mid = (w_start + w_end) / 2.0
-                            for d_start, d_end, d_spk in diar_intervals:
-                                if d_start <= w_mid <= d_end:
-                                    matched_spk = d_spk
-                                    break
-                            word_spk = matched_spk if matched_spk else (seg.get("speaker") or "SPEAKER_00")
+                        word_spk = self._match_word_speaker(
+                            w_start, w_end, diar_intervals,
+                            whisperx_spk=w.get("speaker"),
+                            seg_spk=seg.get("speaker"),
+                        )
 
                         all_words.append({
                             "word": w_txt,

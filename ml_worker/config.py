@@ -34,9 +34,9 @@ class WorkerConfig:
 
     HF_TOKEN: str = get_hf_token.__func__(None)
     DIARIZATION_MODEL: str = os.getenv("DIARIZATION_MODEL", "pyannote/speaker-diarization-3.1")
-    # 0.48 forces Pyannote's agglomerative clustering to separate similar male voices
-    # (e.g. Judge vs Counsel) in reverberant courtroom audio. Lower = more speakers.
-    DIARIZATION_THRESHOLD: Optional[float] = float(os.getenv("DIARIZATION_THRESHOLD", "0.48"))
+    # 0.42 separates voices with different timbres (narration, father, mother, judge)
+    # in reverberant courtroom audio. Lower = more speakers.
+    DIARIZATION_THRESHOLD: Optional[float] = float(os.getenv("DIARIZATION_THRESHOLD", "0.42"))
     # Court proceedings always have >= 2 active speakers. Set MIN_SPEAKERS=0 to disable.
     MIN_SPEAKERS: Optional[int] = int(os.getenv("MIN_SPEAKERS", "2"))
     MAX_SPEAKERS: Optional[int] = int(os.getenv("MAX_SPEAKERS")) if os.getenv("MAX_SPEAKERS") else None

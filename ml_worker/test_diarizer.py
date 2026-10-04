@@ -294,5 +294,27 @@ class TestReconstructSpeakerTurns(unittest.TestCase):
         self.assertEqual(turns[1]["speaker"], "SPEAKER_01")
         self.assertEqual(turns[1]["text"], "Now Speaker B answers back.")
 
+class TestMatchWordSpeaker(unittest.TestCase):
+    def setUp(self):
+        from ml_worker.pipeline import InferencePipeline
+        self.match = InferencePipeline._match_word_speaker
+        self.intervals = [(0.0, 2.0, "A"), (2.1, 4.0, "B"), (6.0, 8.0, "C")]
+
+    def test_largest_overlap_wins_over_whisperx_label(self):
+        # word 1.9-2.4: 0.1s in A, 0.3s in B -> B (even though WhisperX said A)
+        self.assertEqual(self.match(1.9, 2.4, self.intervals, whisperx_spk="A"), "B")
+
+    def test_low_coverage_falls_back_to_whisperx(self):
+        # word 3.95-4.6: 0.05s of 0.65s in B (<25%) -> WhisperX label kept
+        self.assertEqual(self.match(3.95, 4.6, self.intervals, whisperx_spk="A"), "A")
+
+    def test_no_overlap_uses_nearest_interval_not_speaker_00(self):
+        # word in gap 5.5-5.8, no WhisperX label -> nearest interval C (0.2s away)
+        self.assertEqual(self.match(5.5, 5.8, self.intervals, seg_spk="A"), "C")
+
+    def test_no_intervals_uses_segment_speaker(self):
+        self.assertEqual(self.match(1.0, 1.2, [], seg_spk="SPEAKER_03"), "SPEAKER_03")
+
+
 if __name__ == "__main__":
     unittest.main()
