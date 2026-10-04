@@ -159,11 +159,11 @@ class TestSpeakerDiarizer(unittest.TestCase):
         self.assertEqual(res[1]["speaker"], "SPEAKER_01")
         self.assertEqual(res[1]["text"], "Now second speaker talks.")
 
-    def test_single_speaker_3_blocks_consolidates_to_single_bank(self):
+    def test_sequential_distinct_clusters_never_cross_merged(self):
         """
-        Simulates the user screenshot: A 33-second recording of ONE person
-        erroneously split into 3 equal blocks (SPEAKER_00, SPEAKER_01, SPEAKER_02).
-        Must be consolidated down to 1 single speaker (SPEAKER_00).
+        Cross-speaker consolidation is disabled: Pyannote clusters are the source of truth.
+        Three sequential blocks with distinct labels (e.g. Judge, Counsel, Witness each
+        speaking once) must stay as 3 distinct speakers.
         """
         turns = [
             {"start": 0.0, "end": 11.2, "speaker": "SPEAKER_00"},
@@ -172,8 +172,17 @@ class TestSpeakerDiarizer(unittest.TestCase):
         ]
         consolidated = self.diarizer._consolidate_fragmented_speakers(turns)
         unique_spks = set(t["speaker"] for t in consolidated)
-        self.assertEqual(len(unique_spks), 1, f"Expected 1 speaker after consolidation, got: {unique_spks}")
-        self.assertIn("SPEAKER_00", unique_spks)
+        self.assertEqual(unique_spks, {"SPEAKER_00", "SPEAKER_01", "SPEAKER_02"})
+
+    def test_same_speaker_stitched_only_within_0_10s(self):
+        turns = [
+            {"start": 0.0, "end": 2.0, "speaker": "A"},
+            {"start": 2.05, "end": 4.0, "speaker": "A"},  # 0.05s gap -> stitched
+            {"start": 4.3, "end": 6.0, "speaker": "A"},   # 0.30s gap -> kept separate
+        ]
+        consolidated = self.diarizer._consolidate_fragmented_speakers(turns)
+        self.assertEqual(len(consolidated), 2)
+        self.assertEqual(consolidated[0]["end"], 4.0)
 
     def test_multi_speaker_dialogue_preserved(self):
         """

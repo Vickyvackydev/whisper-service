@@ -40,7 +40,7 @@ class SpeakerDiarizer:
             # IMPORTANT ORDER: call instantiate() FIRST (applies via Pyannote schema),
             # then override attributes DIRECTLY AFTER so our values are never overwritten.
             try:
-                thresh  = getattr(WorkerConfig, "DIARIZATION_THRESHOLD", 0.63)
+                thresh  = getattr(WorkerConfig, "DIARIZATION_THRESHOLD", 0.48)
                 min_off = getattr(WorkerConfig, "MIN_DURATION_OFF", 0.20)
                 min_on  = getattr(WorkerConfig, "MIN_DURATION_ON", 0.08)
 
@@ -81,6 +81,14 @@ class SpeakerDiarizer:
                     if min_on is not None and hasattr(seg, "min_duration_on"):
                         seg.min_duration_on = float(min_on)
                     logger.info(f"[SEGMENTATION] min_duration_off={min_off}, min_duration_on={min_on}")
+
+                # Step 3: Verify the threshold actually landed on the pipeline
+                applied = getattr(getattr(self.pipeline, "clustering", None), "threshold", None)
+                if thresh is not None and applied is not None and abs(float(applied) - float(thresh)) > 1e-6:
+                    logger.warning(f"[THRESHOLD] Mismatch: expected {float(thresh)}, pipeline has {applied}. Forcing.")
+                    self.pipeline.clustering.threshold = float(thresh)
+                    applied = self.pipeline.clustering.threshold
+                logger.info(f"[THRESHOLD] Verified pipeline.clustering.threshold = {applied}")
 
             except Exception as thresh_err:
                 logger.debug(f"Hyperparameter configuration note: {thresh_err}")
@@ -130,11 +138,16 @@ class SpeakerDiarizer:
             # Prepare kwargs for min/max speakers (optional overrides)
             params = {}
             target_min = min_speakers if min_speakers is not None else getattr(WorkerConfig, "MIN_SPEAKERS", None)
-            if target_min is not None and target_min > 0:
-                params["min_speakers"] = target_min
+            # Court sessions always have >= 2 speakers (Judge + Counsel). Default to 2 so Pyannote
+            # can never collapse the whole session into one speaker. MIN_SPEAKERS=0 disables this.
+            if target_min is None:
+                target_min = 2
+            if target_min > 0:
+                params["min_speakers"] = int(target_min)
             target_max = max_speakers if max_speakers is not None else getattr(WorkerConfig, "MAX_SPEAKERS", None)
             if target_max is not None and target_max > 0:
-                params["max_speakers"] = target_max
+                params["max_speakers"] = max(int(target_max), params.get("min_speakers", 1))
+            logger.info(f"Diarization speaker constraints: {params or 'none'}")
 
             diarization_output = None
 
@@ -273,105 +286,29 @@ class SpeakerDiarizer:
         min_seconds: float = 2.0
     ) -> List[Dict[str, Any]]:
         """
-        Consolidates fragmented speaker clusters using:
-        1. Acoustic Embedding Centroid Matching (pairwise cosine similarity >= 0.72)
-        2. Conversational Dynamics & Monologue Analysis (detects non-alternating sequential blocks)
-        3. Dominant Speaker Dominance Check (>= 85% speech time)
-        4. Tiny Fragment Pruning (micro-noise / clicks)
-        5. Micro-pause turn stitching (<= 0.10s)
-        6. Consistent Chronological Speaker Normalization (SPEAKER_00, SPEAKER_01...)
+        Post-processes raw Pyannote turns WITHOUT any cross-speaker merging.
+
+        Cross-speaker consolidation (acoustic filterbank centroid matching, monologue
+        detection, dominance and fragment merges) is fully DISABLED: it was collapsing
+        distinct male courtroom voices (Judge vs Counsel) into one speaker. Pyannote's
+        clustering (threshold + min_speakers) is the single source of truth for identity.
+
+        Only two operations remain:
+        1. Micro-pause stitching: merge turns of the EXACT same speaker separated by <= 0.10s.
+        2. Chronological re-numbering (first voice heard = SPEAKER_00).
+
+        `audio_data`, `sample_rate`, `base_min_fraction`, `min_seconds` are kept for
+        signature compatibility but are no longer used.
         """
         if not turns:
             return turns
 
-        speaker_durations: Dict[str, float] = {}
-        for t in turns:
-            spk = t["speaker"]
-            dur = max(0.0, t["end"] - t["start"])
-            speaker_durations[spk] = speaker_durations.get(spk, 0.0) + dur
-
-        total_speech = sum(speaker_durations.values())
-        n_speakers = len(speaker_durations)
-
-        if total_speech <= 0 or n_speakers <= 1:
-            return turns
-
-        dominant = max(speaker_durations, key=lambda s: speaker_durations[s])
+        n_speakers = len(set(t["speaker"] for t in turns))
         sorted_turns = sorted(turns, key=lambda t: t["start"])
-
-        # ── Conversational Dynamics: Count runs and conversational returns ───
-        speaker_runs: Dict[str, int] = {}
-        prev_spk = None
-        seen_speakers = set()
-        return_speaker_count = 0
-
-        for t in sorted_turns:
-            spk = t["speaker"]
-            if spk != prev_spk:
-                speaker_runs[spk] = speaker_runs.get(spk, 0) + 1
-                if spk in seen_speakers:
-                    return_speaker_count += 1
-                seen_speakers.add(spk)
-                prev_spk = spk
-
-        total_audio_dur = (sorted_turns[-1]["end"] - sorted_turns[0]["start"]) if sorted_turns else 0.0
-
-        # ── Acoustic Speaker Centroid Extraction ─────────────────────────────
-        speaker_centroids: Dict[str, np.ndarray] = {}
-        if audio_data is not None and len(audio_data) > 0:
-            for spk in speaker_durations:
-                spk_turns = [t for t in sorted_turns if t["speaker"] == spk and (t["end"] - t["start"]) >= 0.5]
-                if not spk_turns:
-                    spk_turns = [t for t in sorted_turns if t["speaker"] == spk]
-
-                feats = []
-                for st in spk_turns[:5]:
-                    start_s = max(0, int(st["start"] * sample_rate))
-                    end_s = min(len(audio_data), int(st["end"] * sample_rate))
-                    if end_s - start_s >= int(0.3 * sample_rate):
-                        feat = self._extract_audio_feature(audio_data[start_s:end_s], sample_rate)
-                        if feat is not None:
-                            feats.append(feat)
-                if feats:
-                    avg_feat = np.mean(feats, axis=0)
-                    norm = np.linalg.norm(avg_feat)
-                    if norm > 1e-6:
-                        speaker_centroids[spk] = avg_feat / norm
-
-        # ── Build Merge Mapping ──────────────────────────────────────────────
-        to_merge: Dict[str, str] = {}
-        ranked_speakers = sorted(speaker_durations.keys(), key=lambda s: speaker_durations[s], reverse=True)
-
-        def get_root_target(s: str) -> str:
-            curr = s
-            visited = set()
-            while curr in to_merge and curr not in visited:
-                visited.add(curr)
-                curr = to_merge[curr]
-            return curr
-
-        # Pure Sequential Monologue Detection (Zero Conversational Returns)
-        # In a real conversation, speakers alternate (return_speaker_count >= 1).
-        # If returns == 0 and audio duration <= 60s, non-dominant sequential blocks are acoustic splits of one speaker reading/speaking continuously.
-        # NOTE: Dominance (>85%), fragment (<2s), and similarity (>=0.72) heuristics were removed per consultant recommendations
-        # to ensure that short interjections (e.g. mother's 1-2s remarks) and distinct room voices (father vs judge) are never merged.
-        if return_speaker_count == 0 and total_audio_dur <= 60.0 and n_speakers >= 2:
-            target = get_root_target(dominant)
-            for spk in ranked_speakers:
-                if spk != target and spk not in to_merge:
-                    to_merge[spk] = target
-                    logger.info(f"[CONSOLIDATION] Merging '{spk}' into dominant '{target}' — pure sequential short monologue (returns=0, dur={total_audio_dur:.1f}s)")
-
-        # 5. Apply Merges
-        merged_turns = []
-        for t in sorted_turns:
-            spk = t["speaker"]
-            final_spk = get_root_target(spk)
-            merged_turns.append({
-                "start": t["start"],
-                "end": t["end"],
-                "speaker": final_spk
-            })
+        merged_turns = [
+            {"start": t["start"], "end": t["end"], "speaker": t["speaker"]}
+            for t in sorted_turns
+        ]
 
         # 6. Micro-Pause Turn Stitching (same speaker with pause <= 0.10s)
         # A larger gap (e.g. 0.40s) absorbs 200-300ms interjections by another speaker.
