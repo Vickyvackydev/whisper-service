@@ -147,7 +147,7 @@ class InferencePipeline:
                             logger.info(f"[{job_id}] [DIAGNOSTIC 1: Raw Pyannote intervals (first 35s)]:\n{pyannote_intervals}")
 
                         import whisperx
-                        stitched = whisperx.assign_word_speakers(diarize_df, aligned_result, fill_nearest=True)
+                        stitched = whisperx.assign_word_speakers(diarize_df, aligned_result, fill_nearest=False)
 
                         # 2. Dump raw word speakers directly after whisperx.assign_word_speakers
                         raw_early_words = []
@@ -157,7 +157,7 @@ class InferencePipeline:
                                     raw_early_words.append(f"{w.get('word', '')}[{w.get('speaker', 'NONE')}]")
                         logger.info(f"[{job_id}] [DIAGNOSTIC 2: Raw Word Speakers from WhisperX (first 35s)]:\n" + " ".join(raw_early_words[:80]))
 
-                        segments, num_speakers = self.reconstruct_speaker_turns(stitched)
+                        segments, num_speakers = self.reconstruct_speaker_turns(stitched, diarize_df)
 
                         # 3. Dump final reconstructed turns for first 35 seconds
                         final_early_turns = []
@@ -214,7 +214,7 @@ class InferencePipeline:
             cleanup_file(raw_download_path)
             cleanup_file(wav_path)
 
-    def reconstruct_speaker_turns(self, stitched_result: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], int]:
+    def reconstruct_speaker_turns(self, stitched_result: Dict[str, Any], diarize_df: Any = None) -> Tuple[List[Dict[str, Any]], int]:
         """
         Takes WhisperX stitched word-level speaker assignments and builds
         clean, conversational speaker turns.
@@ -241,6 +241,12 @@ class InferencePipeline:
         STAGE 3 - Legal Text Normalization
             Numbers as digits, honorific casing, suit citations, etc.
         """
+        # Pre-extract Pyannote intervals once (used to resolve words WhisperX left unassigned)
+        diar_intervals: List[Tuple[float, float, str]] = []
+        if diarize_df is not None and hasattr(diarize_df, "iterrows"):
+            for _, r in diarize_df.iterrows():
+                diar_intervals.append((float(r["start"]), float(r["end"]), str(r["speaker"])))
+
         all_words: List[Dict[str, Any]] = []
         for seg in stitched_result.get("segments", []):
             words = seg.get("words", [])
@@ -269,11 +275,23 @@ class InferencePipeline:
                         w_end = float(w.get("end", w_start + 0.05))
                         if w_end < w_start:
                             w_end = w_start + 0.05
+                        # Do NOT fall back to seg["speaker"] first: it is the majority speaker
+                        # of the whole Whisper window and wipes out quick speaker handoffs.
+                        word_spk = w.get("speaker")
+                        if not word_spk or str(word_spk).strip() in ("None", ""):
+                            matched_spk = None
+                            w_mid = (w_start + w_end) / 2.0
+                            for d_start, d_end, d_spk in diar_intervals:
+                                if d_start <= w_mid <= d_end:
+                                    matched_spk = d_spk
+                                    break
+                            word_spk = matched_spk if matched_spk else (seg.get("speaker") or "SPEAKER_00")
+
                         all_words.append({
                             "word": w_txt,
                             "start": round(w_start, 3),
                             "end": round(w_end, 3),
-                            "speaker": str(w.get("speaker") or seg.get("speaker") or "SPEAKER_00"),
+                            "speaker": str(word_spk),
                             "score": round(float(w.get("score")), 3) if w.get("score") is not None else None,
                             "_seg_id": seg_id,
                         })

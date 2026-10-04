@@ -278,7 +278,7 @@ class SpeakerDiarizer:
         2. Conversational Dynamics & Monologue Analysis (detects non-alternating sequential blocks)
         3. Dominant Speaker Dominance Check (>= 85% speech time)
         4. Tiny Fragment Pruning (micro-noise / clicks)
-        5. Micro-pause turn stitching (<= 0.40s)
+        5. Micro-pause turn stitching (<= 0.10s)
         6. Consistent Chronological Speaker Normalization (SPEAKER_00, SPEAKER_01...)
         """
         if not turns:
@@ -373,7 +373,8 @@ class SpeakerDiarizer:
                 "speaker": final_spk
             })
 
-        # 6. Micro-Pause Turn Stitching (same speaker with pause <= 0.40s)
+        # 6. Micro-Pause Turn Stitching (same speaker with pause <= 0.10s)
+        # A larger gap (e.g. 0.40s) absorbs 200-300ms interjections by another speaker.
         stitched_turns = []
         for t in merged_turns:
             if not stitched_turns:
@@ -381,7 +382,7 @@ class SpeakerDiarizer:
             else:
                 last = stitched_turns[-1]
                 gap = t["start"] - last["end"]
-                if last["speaker"] == t["speaker"] and gap <= 0.40:
+                if last["speaker"] == t["speaker"] and 0.0 <= gap <= 0.10:
                     last["end"] = max(last["end"], t["end"])
                 else:
                     stitched_turns.append(dict(t))
@@ -547,13 +548,27 @@ class SpeakerDiarizer:
                 w["speaker"] = None
                 w["from_diarization"] = False
 
-        # 6. Fill unassigned words from closest neighbors
-        last_known_mapped = speaker_map.get(ordered_speakers[0], "SPEAKER_00") if ordered_speakers else "SPEAKER_00"
+        # 6. Fill unassigned words from the temporally closest neighbor (bidirectional)
         for i in range(len(flat_words)):
-            if flat_words[i].get("speaker") is not None:
-                last_known_mapped = flat_words[i]["speaker"]
-            else:
-                flat_words[i]["speaker"] = last_known_mapped
+            if flat_words[i].get("speaker") is None:
+                prev_dist, next_dist = float("inf"), float("inf")
+                prev_spk, next_spk = "SPEAKER_00", "SPEAKER_00"
+                cur_start = float(flat_words[i].get("start", 0.0))
+                cur_end = float(flat_words[i].get("end", cur_start))
+
+                for p in range(i - 1, -1, -1):
+                    if flat_words[p].get("speaker"):
+                        prev_dist = cur_start - float(flat_words[p].get("end", 0.0))
+                        prev_spk = flat_words[p]["speaker"]
+                        break
+
+                for n in range(i + 1, len(flat_words)):
+                    if flat_words[n].get("speaker"):
+                        next_dist = float(flat_words[n].get("start", 0.0)) - cur_end
+                        next_spk = flat_words[n]["speaker"]
+                        break
+
+                flat_words[i]["speaker"] = prev_spk if prev_dist <= next_dist else next_spk
 
         # 7. Preserve Legal Honorific & Affirmation Honorific Pairs ("My Lord", "Your Honor", "Yes Sir")
         # Prevents splitting honorific titles across two speaker turns
