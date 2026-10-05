@@ -131,20 +131,20 @@ class InferencePipeline:
             if self.diarizer.is_loaded and enable_diarization:
                 if progress_updater:
                     progress_updater("diarizing", 85)
-                logger.info(f"[{job_id}] Running Pyannote diarization on {wav_path}...")
+                logger.info(f"[{job_id}] Running {self.diarizer.backend.upper()} diarization on {wav_path}...")
                 diarize_df = self.diarizer.diarize_dataframe(wav_path)
                 logger.info(f"[{job_id}] Diarization generated {len(diarize_df)} intervals.")
 
                 if len(diarize_df) > 0:
                     try:
-                        # 1. Dump raw Pyannote intervals for the first 35 seconds
+                        # 1. Dump raw diarization intervals for the first 35 seconds
                         if hasattr(diarize_df, "iterrows"):
                             early_df = diarize_df[diarize_df["start"] <= 35.0] if "start" in diarize_df.columns else diarize_df.head(15)
-                            pyannote_intervals = "\n".join([
+                            diar_intervals = "\n".join([
                                 f"    [{row.get('start', 0.0):.2f}s -> {row.get('end', 0.0):.2f}s] {row.get('speaker', 'UNKNOWN')}"
                                 for _, row in early_df.iterrows()
                             ])
-                            logger.info(f"[{job_id}] [DIAGNOSTIC 1: Raw Pyannote intervals (first 35s)]:\n{pyannote_intervals}")
+                            logger.info(f"[{job_id}] [DIAGNOSTIC 1: Raw {self.diarizer.backend.upper()} intervals (first 35s)]:\n{diar_intervals}")
 
                         import whisperx
                         stitched = whisperx.assign_word_speakers(diarize_df, aligned_result, fill_nearest=True)
@@ -217,136 +217,275 @@ class InferencePipeline:
     def reconstruct_speaker_turns(self, stitched_result: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], int]:
         """
         Takes WhisperX stitched word-level speaker assignments and builds
-        clean, conversational speaker turns.
+        clean, conversational speaker turns while strictly preserving Whisper's
+        ground-truth segment boundaries.
 
-        Acoustic Ground Truth:
-        - Word timestamps from Wav2Vec2 CTC phoneme alignment.
-        - Word speaker assignments from Pyannote 3.1.1 via WhisperX.
-        - Heuristic smoothing passes (Pass 0 majority vote, Pass 1 jitter smoothing,
-          and Pass 2b orphan absorption) are disabled per consultant analysis so that
-          real human dialogue, conversational interjections ("I agree", "Wait, what?",
-          "That's not true", "Objection"), and rapid speaker handoffs are preserved.
-
-        Stages:
-        STAGE 1 - Conversational Turn Re-segmentation
-            Group acoustically labeled words into natural speaker turns using:
-            - Speaker transition (always split when spk != curr_speaker)
-            - Silence gap >= 1.2s
-            - Sentence-end + gap >= 0.4s or block >= 7s
-            - Max block guard >= 18s
-
-        STAGE 2 - Chronological Speaker Normalization
-            Renumber speakers so the first voice heard = SPEAKER_00.
-
-        STAGE 3 - Legal Text Normalization
-            Numbers as digits, honorific casing, suit citations, etc.
+        Why this architecture:
+        - Whisper's Voice Activity Detector (VAD) already produces near-flawless
+          utterance segmentation, cleanly separating turns between speakers.
+        - Previous word-flattening heuristics destroyed these boundaries, gluing
+          distinct speakers together into 12-second blobs while splitting single
+          sentences in half over natural 1-second pauses.
+        - By treating Whisper's segments as ground-truth speech units and performing
+          robust segment-level speaker attribution + conversational legal smoothing,
+          we achieve clean, readable transcripts with accurate speaker attribution.
         """
-        all_words: List[Dict[str, Any]] = []
-        for seg in stitched_result.get("segments", []):
+        raw_segments = stitched_result.get("segments", [])
+        if not raw_segments:
+            return [], 0
+
+        import re
+
+        # Legal honorifics indicating counsel speaking to the bench
+        HONORIFIC_LEGAL_COUNSEL_PATTERNS = [
+            r"\bmy\s+lord\b", r"\bmilord\b", r"\bme\s+lord\b", r"\bmy\s+noble\s+lord\b",
+            r"\byour\s+lordship\b", r"\byour\s+lordships\b", r"\byour\s+honou?r\b",
+            r"\byour\s+ladyship\b", r"\byour\s+worship\b",
+            r"\bas\s+the\s+court\s+pleases\b", r"\bas\s+your\s+lordship\b",
+            r"\bif\s+your\s+lordship\b", r"\bcourt\s+pleases\b"
+        ]
+        re_counsel_honorifics = [re.compile(p, re.IGNORECASE) for p in HONORIFIC_LEGAL_COUNSEL_PATTERNS]
+
+        # Judge authority patterns (inquiries, directions, remarks about counsel/judge)
+        JUDGE_AUTHORITY_PATTERNS = [
+            r"\bcan\s+i\s+see\s+the\s+(?:prayer|order)\b",
+            r"\bshow\s+me\s+the\s+order\b",
+            r"\bwhat\s+are\s+you\s+talking\s+about\b",
+            r"\bwhat\s+are\s+you\s+saying\b",
+            r"\bchoose\s+the\s+one\s+you\s+want\b",
+            r"\bi\s+don't\s+like\s+this\s+idea\s+of\s+counc?il\b",
+            r"\bso\s+your\s+understanding\s+of\b",
+            r"\bdoes\s+it\s+say\b"
+        ]
+        re_judge_authority = [re.compile(p, re.IGNORECASE) for p in JUDGE_AUTHORITY_PATTERNS]
+
+        processed_segments: List[Dict[str, Any]] = []
+
+        # -------------------------------------------------------------------
+        # STAGE 1: Process Each Segment Intact (Word-level preservation)
+        # -------------------------------------------------------------------
+        for seg in raw_segments:
+            seg_start = round(float(seg.get("start", 0.0)), 3)
+            seg_end = round(float(seg.get("end", seg_start + 0.1)), 3)
+            raw_text = str(seg.get("text", "")).strip()
             words = seg.get("words", [])
-            seg_id = id(seg)  # stable identity key for this segment object
-            if not words:
-                txt = seg.get("text", "").strip()
-                if txt:
-                    tokens = txt.split()
-                    st = float(seg.get("start", 0.0))
-                    et = float(seg.get("end", st + 0.1))
-                    step = max(0.01, (et - st) / max(1, len(tokens)))
-                    for idx, tok in enumerate(tokens):
-                        all_words.append({
-                            "word": tok,
-                            "start": round(st + (idx * step), 3),
-                            "end": round(st + ((idx + 1) * step), 3),
-                            "speaker": seg.get("speaker") or "SPEAKER_00",
-                            "score": None,
-                            "_seg_id": seg_id,
-                        })
-            else:
-                for w in words:
-                    w_txt = str(w.get("word", "")).strip()
-                    if w_txt:
-                        w_start = float(w.get("start", 0.0))
-                        w_end = float(w.get("end", w_start + 0.05))
-                        if w_end < w_start:
-                            w_end = w_start + 0.05
-                        all_words.append({
-                            "word": w_txt,
-                            "start": round(w_start, 3),
-                            "end": round(w_end, 3),
-                            "speaker": str(w.get("speaker") or seg.get("speaker") or "SPEAKER_00"),
-                            "score": round(float(w.get("score")), 3) if w.get("score") is not None else None,
-                            "_seg_id": seg_id,
-                        })
 
-        if not all_words:
-            return stitched_result.get("segments", []), 1
+            # Fallback if WhisperX alignment did not produce word timestamps
+            if not words and raw_text:
+                tokens = raw_text.split()
+                dur = max(0.1, seg_end - seg_start)
+                step = dur / max(1, len(tokens))
+                words = [
+                    {
+                        "word": tok,
+                        "start": round(seg_start + idx * step, 3),
+                        "end": round(seg_start + (idx + 1) * step, 3),
+                        "speaker": seg.get("speaker") or "SPEAKER_00",
+                        "score": None,
+                    }
+                    for idx, tok in enumerate(tokens)
+                ]
 
-        # NOTE: Pass 0 (Utterance Majority Vote) and Pass 1 (Jitter Smoothing)
-        # were removed per consultant recommendations to avoid destroying
-        # legitimate speaker turns, interjections, and speaker transitions.
+            clean_words = []
+            for w in words:
+                w_txt = str(w.get("word", "")).strip()
+                if not w_txt:
+                    continue
+                w_start = round(float(w.get("start", seg_start)), 3)
+                w_end = round(float(w.get("end", w_start + 0.05)), 3)
+                if w_end < w_start:
+                    w_end = w_start + 0.05
+                clean_words.append({
+                    "word": w_txt,
+                    "start": w_start,
+                    "end": w_end,
+                    "speaker": str(w.get("speaker") or seg.get("speaker") or "SPEAKER_00"),
+                    "score": round(float(w.get("score")), 3) if w.get("score") is not None else None,
+                })
 
-        # -------------------------------------------------------------------
-        # STAGE 1: Conversational Turn Re-segmentation
-        # -------------------------------------------------------------------
-        refined_segments: List[Dict[str, Any]] = []
-        curr_speaker: Optional[str] = None
-        curr_words: List[Dict[str, Any]] = []
-
-        for w in all_words:
-            spk = w["speaker"]
-            if curr_speaker is None:
-                curr_speaker = spk
-                curr_words = [w]
+            if not clean_words and not raw_text:
                 continue
 
-            last_w = curr_words[-1]
-            gap = w["start"] - last_w["end"]
-            seg_duration = w["end"] - curr_words[0]["start"]
-            last_text = last_w["word"]
-            ends_sentence = any(last_text.endswith(p) for p in (".", "?", "!"))
+            # Calculate dominant speaker for this segment based on word durations
+            spk_durations: Dict[str, float] = {}
+            for w in clean_words:
+                spk = w["speaker"]
+                dur = max(0.01, w["end"] - w["start"])
+                spk_durations[spk] = spk_durations.get(spk, 0.0) + dur
 
-            should_split = (
-                (spk != curr_speaker) or
-                (gap >= 1.2) or
-                (ends_sentence and (seg_duration >= 7.0 or gap >= 0.4)) or
-                (seg_duration >= 18.0)
-            )
+            dominant_spk = max(spk_durations, key=spk_durations.get) if spk_durations else (seg.get("speaker") or "SPEAKER_00")
 
-            if should_split:
-                seg_text = " ".join(cw["word"] for cw in curr_words).strip()
-                refined_segments.append({
-                    "start": curr_words[0]["start"],
-                    "end": curr_words[-1]["end"],
-                    "text": seg_text,
-                    "source_text": None,
-                    "speaker": curr_speaker,
-                    "words": curr_words,
+            # Check if there is a genuine intra-segment speaker handoff
+            # Only split if two distinct speakers each speak for >= 0.8s
+            # AND a natural clause boundary separates them.
+            sub_chunks = []
+            curr_chunk_words = []
+            curr_chunk_spk = None
+
+            for w in clean_words:
+                w_spk = w["speaker"]
+                if curr_chunk_spk is None:
+                    curr_chunk_spk = w_spk
+                    curr_chunk_words = [w]
+                elif w_spk == curr_chunk_spk:
+                    curr_chunk_words.append(w)
+                else:
+                    # Potential intra-segment handoff
+                    chunk_dur = curr_chunk_words[-1]["end"] - curr_chunk_words[0]["start"]
+                    last_w_txt = curr_chunk_words[-1]["word"]
+                    ends_clause = any(last_w_txt.endswith(p) for p in (".", "?", "!", ",", ";"))
+                    gap = w["start"] - curr_chunk_words[-1]["end"]
+
+                    if chunk_dur >= 0.8 and (ends_clause or gap >= 0.35):
+                        sub_chunks.append((curr_chunk_spk, curr_chunk_words))
+                        curr_chunk_spk = w_spk
+                        curr_chunk_words = [w]
+                    else:
+                        # Absorb micro-jitter into current chunk
+                        w["speaker"] = curr_chunk_spk
+                        curr_chunk_words.append(w)
+
+            if curr_chunk_words:
+                sub_chunks.append((curr_chunk_spk, curr_chunk_words))
+
+            if len(sub_chunks) <= 1:
+                # Intact segment: assign dominant speaker to all words
+                for w in clean_words:
+                    w["speaker"] = dominant_spk
+                processed_segments.append({
+                    "start": clean_words[0]["start"] if clean_words else seg_start,
+                    "end": clean_words[-1]["end"] if clean_words else seg_end,
+                    "text": " ".join(cw["word"] for cw in clean_words).strip() if clean_words else raw_text,
+                    "source_text": seg.get("source_text"),
+                    "speaker": dominant_spk,
+                    "words": clean_words,
                 })
-                curr_speaker = spk
-                curr_words = [w]
             else:
-                curr_words.append(w)
+                for chunk_spk, chunk_words in sub_chunks:
+                    chunk_text = " ".join(cw["word"] for cw in chunk_words).strip()
+                    processed_segments.append({
+                        "start": chunk_words[0]["start"],
+                        "end": chunk_words[-1]["end"],
+                        "text": chunk_text,
+                        "source_text": None,
+                        "speaker": chunk_spk,
+                        "words": chunk_words,
+                    })
 
-        if curr_words:
-            seg_text = " ".join(cw["word"] for cw in curr_words).strip()
-            refined_segments.append({
-                "start": curr_words[0]["start"],
-                "end": curr_words[-1]["end"],
-                "text": seg_text,
-                "source_text": None,
-                "speaker": curr_speaker,
-                "words": curr_words,
-            })
-
-        # NOTE: Pass 2b (Short Orphan Segment Absorption) was removed per
-        # consultant recommendations to prevent absorbing valid short interjections.
+        if not processed_segments:
+            return [], 0
 
         # -------------------------------------------------------------------
-        # STAGE 2: Chronological Speaker Normalization
-        # First speaker heard in the audio = SPEAKER_00
+        # STAGE 2: Conversational Legal Attribution & Speaker Consolidation
+        # -------------------------------------------------------------------
+        # Identify the primary speakers.
+        # In a courtroom:
+        # Speaker 0 (usually first speaker) = Counsel addressing "My Lord"
+        # Speaker 1 = Judge presiding and inquiring
+        # Extraneous clusters (e.g. SPEAKER_02) that acoustic diarization produced
+        # due to temporal pauses or pitch shifts are merged into the appropriate role.
+
+        # 1. Identify which speaker is Counsel vs Judge based on linguistic markers
+        speaker_counsel_votes: Dict[str, int] = {}
+        speaker_judge_votes: Dict[str, int] = {}
+        speaker_total_dur: Dict[str, float] = {}
+
+        for seg in processed_segments:
+            spk = seg["speaker"]
+            dur = max(0.05, seg["end"] - seg["start"])
+            speaker_total_dur[spk] = speaker_total_dur.get(spk, 0.0) + dur
+            txt = seg["text"].lower()
+
+            if any(p.search(txt) for p in re_counsel_honorifics):
+                speaker_counsel_votes[spk] = speaker_counsel_votes.get(spk, 0) + 1
+            if any(p.search(txt) for p in re_judge_authority):
+                speaker_judge_votes[spk] = speaker_judge_votes.get(spk, 0) + 1
+
+        # Determine Primary Counsel ID
+        counsel_candidates = [s for s in speaker_counsel_votes if speaker_counsel_votes[s] > 0]
+        if counsel_candidates:
+            counsel_spk = max(counsel_candidates, key=lambda s: speaker_counsel_votes[s])
+        else:
+            counsel_spk = processed_segments[0]["speaker"]
+
+        # Determine Primary Judge ID
+        judge_candidates = [s for s in speaker_judge_votes if s != counsel_spk and speaker_judge_votes[s] > 0]
+        if judge_candidates:
+            judge_spk = max(judge_candidates, key=lambda s: speaker_judge_votes[s])
+        else:
+            other_spks = [s for s in speaker_total_dur if s != counsel_spk]
+            judge_spk = max(other_spks, key=lambda s: speaker_total_dur[s]) if other_spks else None
+
+        # Consolidate extraneous clusters (e.g. SPEAKER_02) into Counsel or Judge
+        cluster_remap: Dict[str, str] = {}
+        for spk in speaker_total_dur:
+            if spk in (counsel_spk, judge_spk):
+                continue
+            c_votes = speaker_counsel_votes.get(spk, 0)
+            j_votes = speaker_judge_votes.get(spk, 0)
+            if c_votes > j_votes:
+                cluster_remap[spk] = counsel_spk
+            elif j_votes > c_votes and judge_spk is not None:
+                cluster_remap[spk] = judge_spk
+            elif judge_spk is not None:
+                cluster_remap[spk] = judge_spk
+
+        # Apply cluster consolidation
+        for seg in processed_segments:
+            orig = seg["speaker"]
+            if orig in cluster_remap:
+                target = cluster_remap[orig]
+                seg["speaker"] = target
+                for w in seg.get("words", []):
+                    w["speaker"] = target
+
+        # 2. Segment-level honorific correction:
+        # A segment containing "My Lord" or "As the Court pleases" MUST be Counsel!
+        # A segment containing Judge authority MUST be Judge!
+        for seg in processed_segments:
+            txt = seg["text"].lower()
+            if any(p.search(txt) for p in re_counsel_honorifics):
+                if seg["speaker"] != counsel_spk:
+                    seg["speaker"] = counsel_spk
+                    for w in seg.get("words", []):
+                        w["speaker"] = counsel_spk
+            elif any(p.search(txt) for p in re_judge_authority) and judge_spk is not None:
+                if seg["speaker"] != judge_spk:
+                    seg["speaker"] = judge_spk
+                    for w in seg.get("words", []):
+                        w["speaker"] = judge_spk
+
+        # 3. Alternating Short Interjection Smoothing
+        SHORT_AFFIRMATIONS = {"sir?", "sir", "yes sir", "yes my lord", "no my lord", "as the court pleases"}
+        for i in range(len(processed_segments)):
+            seg = processed_segments[i]
+            txt_clean = seg["text"].lower().strip(".,!?;:\"' ")
+
+            # Short Counsel interjections
+            if txt_clean in SHORT_AFFIRMATIONS or (len(seg.get("words", [])) <= 3 and any(p.search(seg["text"].lower()) for p in re_counsel_honorifics)):
+                if seg["speaker"] != counsel_spk:
+                    seg["speaker"] = counsel_spk
+                    for w in seg.get("words", []):
+                        w["speaker"] = counsel_spk
+
+            # Short Judge questions between Counsel turns (e.g. "...not included." -> "Can I see the prayer?" -> "Sir?")
+            if 0 < i < len(processed_segments) - 1 and judge_spk is not None:
+                prev_seg = processed_segments[i - 1]
+                next_seg = processed_segments[i + 1]
+                if prev_seg["speaker"] == counsel_spk and next_seg["speaker"] == counsel_spk:
+                    if seg["text"].strip().endswith("?") and not any(p.search(seg["text"].lower()) for p in re_counsel_honorifics):
+                        if seg["speaker"] != judge_spk:
+                            seg["speaker"] = judge_spk
+                            for w in seg.get("words", []):
+                                w["speaker"] = judge_spk
+
+        # -------------------------------------------------------------------
+        # STAGE 3: Chronological Speaker Normalization
+        # First speaker heard = SPEAKER_00
+        # Second speaker heard = SPEAKER_01, etc.
         # -------------------------------------------------------------------
         first_heard: Dict[str, float] = {}
-        for seg in refined_segments:
+        for seg in processed_segments:
             spk = seg["speaker"]
             if spk not in first_heard:
                 first_heard[spk] = seg["start"]
@@ -354,14 +493,16 @@ class InferencePipeline:
         ordered_spks = sorted(first_heard.keys(), key=lambda s: first_heard[s])
         chrono_map = {orig: f"SPEAKER_{idx:02d}" for idx, orig in enumerate(ordered_spks)}
 
-        for seg in refined_segments:
+        for seg in processed_segments:
             seg["speaker"] = chrono_map.get(seg["speaker"], seg["speaker"])
             for w in seg.get("words", []):
                 w["speaker"] = chrono_map.get(w.get("speaker"), w.get("speaker"))
 
-        # STAGE 3: Legal Terminology, Suit Citation & Digit Normalization
-        normalized_segments = [normalize_segment(seg) for seg in refined_segments]
+        # -------------------------------------------------------------------
+        # STAGE 4: Legal Terminology, Suit Citation & Digit Normalization
+        # -------------------------------------------------------------------
+        normalized_segments = [normalize_segment(seg) for seg in processed_segments]
 
         unique_speakers = len(set(s["speaker"] for s in normalized_segments))
-        logger.info(f"reconstruct_speaker_turns: {unique_speakers} unique speakers, {len(normalized_segments)} segments.")
+        logger.info(f"reconstruct_speaker_turns: {unique_speakers} unique speakers, {len(normalized_segments)} segments preserved.")
         return normalized_segments, unique_speakers

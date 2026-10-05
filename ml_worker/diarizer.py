@@ -189,6 +189,17 @@ class SpeakerDiarizer:
                     "speaker": formatted_spk
                 })
 
+            # Post-diarization consolidation to prevent pitch/pause fractures
+            try:
+                import soundfile as sf
+                data, sample_rate = sf.read(str(audio_path), dtype="float32")
+                if len(data.shape) > 1:
+                    data = data.mean(axis=1)
+                data = np.ascontiguousarray(data, dtype=np.float32)
+                turns = self._consolidate_fragmented_speakers(turns, audio_data=data, sample_rate=sample_rate)
+            except Exception as consol_e:
+                logger.debug(f"NeMo post-consolidation note ({consol_e}), using raw turns")
+
             unique_detected = len(set(t["speaker"] for t in turns))
             logger.info(f"NVIDIA NeMo diarization successful: detected {len(turns)} turns across {unique_detected} distinct speakers.")
             return turns
