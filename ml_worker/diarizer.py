@@ -146,8 +146,14 @@ class SpeakerDiarizer:
         try:
             logger.info(f"Running NVIDIA NeMo speaker diarization on {audio_path.name}...")
             import torch
-            with torch.no_grad():
+            with torch.inference_mode():
                 preds = self.nemo_model.diarize(audio=str(audio_path), batch_size=1)
+
+            # Purge intermediate NeMo tensors immediately after forward pass
+            import gc
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
             if isinstance(preds, tuple):
                 preds = preds[0]
@@ -253,14 +259,25 @@ class SpeakerDiarizer:
                     data = data.mean(axis=1)
                 data = np.ascontiguousarray(data, dtype=np.float32)
                 turns = self._consolidate_fragmented_speakers(turns, audio_data=data, sample_rate=sample_rate)
+                del data
+                gc.collect()
             except Exception as consol_e:
                 logger.debug(f"NeMo post-consolidation note ({consol_e}), using raw turns")
 
             unique_detected = len(set(t["speaker"] for t in turns))
             logger.info(f"NVIDIA NeMo diarization successful: detected {len(turns)} turns across {unique_detected} distinct speakers.")
             return turns
-        except Exception as e:
-            logger.error(f"NVIDIA NeMo diarization failed ({e}). Falling back to Pyannote...", exc_info=True)
+        except (torch.cuda.OutOfMemoryError, RuntimeError, Exception) as e:
+            err_msg = str(e)
+            is_oom = "out of memory" in err_msg.lower() or ("cuda" in err_msg.lower() and "memory" in err_msg.lower())
+            if is_oom:
+                logger.error(f"NVIDIA NeMo Sortformer OOM on {audio_path.name}: {e}. Clearing GPU cache and falling back to Pyannote...")
+                import gc
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            else:
+                logger.error(f"NVIDIA NeMo diarization failed ({e}). Falling back to Pyannote...", exc_info=True)
             if self.pipeline is not None:
                 return self._diarize_pyannote(audio_path, min_speakers, max_speakers)
             return []
@@ -360,6 +377,19 @@ class SpeakerDiarizer:
         except Exception as e:
             logger.error(f"Critical error during speaker diarization inference: {e}", exc_info=True)
             return []
+        finally:
+            try:
+                del data
+                if "waveform_cuda" in locals():
+                    del waveform_cuda
+                if "waveform_cpu" in locals():
+                    del waveform_cpu
+            except Exception:
+                pass
+            import gc
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     def _extract_audio_feature(self, waveform_1d: np.ndarray, sample_rate: int = 16000) -> Optional[np.ndarray]:
         """

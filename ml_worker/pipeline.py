@@ -83,6 +83,11 @@ class InferencePipeline:
                 progress_callback=transcribe_progress_cb
             )
 
+            # Purge CUDA cache immediately after Whisper inference to free memory for alignment & diarization
+            gc.collect()
+            if torch and torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
             segments = whisper_result["segments"]
             num_speakers = 1
 
@@ -111,8 +116,9 @@ class InferencePipeline:
                         return_char_alignments=False
                     )
 
-                    # Release alignment model from memory
+                    # Release alignment model and audio buffer from memory immediately
                     del align_model
+                    del audio_arr
                     gc.collect()
                     if torch and align_device == "cuda":
                         torch.cuda.empty_cache()
@@ -121,6 +127,9 @@ class InferencePipeline:
                 except Exception as align_err:
                     logger.warning(f"[{job_id}] WhisperX phoneme alignment skipped or failed ({align_err}). Retaining Whisper timestamps.")
                     aligned_result = {"segments": segments}
+                    gc.collect()
+                    if torch and torch.cuda.is_available():
+                        torch.cuda.empty_cache()
 
             # Diarization & Word Midpoint Stitching
             total_align_segs = len(aligned_result.get("segments", []))
@@ -134,6 +143,11 @@ class InferencePipeline:
                 logger.info(f"[{job_id}] Running {self.diarizer.backend.upper()} diarization on {wav_path}...")
                 diarize_df = self.diarizer.diarize_dataframe(wav_path)
                 logger.info(f"[{job_id}] Diarization generated {len(diarize_df)} intervals.")
+
+                # Release diarization memory immediately
+                gc.collect()
+                if torch and torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
                 if len(diarize_df) > 0:
                     try:
@@ -210,9 +224,12 @@ class InferencePipeline:
             return formatted_result
 
         finally:
-            # Guarantee scratch file cleanup
+            # Guarantee scratch file cleanup and release pipeline GPU tensors
             cleanup_file(raw_download_path)
             cleanup_file(wav_path)
+            gc.collect()
+            if torch and torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     @staticmethod
     def _split_segment_runs(clean_words: List[Dict[str, Any]]) -> List[Tuple[str, List[Dict[str, Any]]]]:

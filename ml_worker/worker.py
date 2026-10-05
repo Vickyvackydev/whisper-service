@@ -1,5 +1,10 @@
 import os
 import sys
+
+# Prevent PyTorch CUDA memory allocator fragmentation
+if "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
 import time
 import signal
 import threading
@@ -159,7 +164,10 @@ class MLWorker:
 
                 except torch.cuda.OutOfMemoryError as oom:
                     logger.error(f"GPU OOM while processing Job {job_id}: {oom}")
-                    torch.cuda.empty_cache()
+                    import gc
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
                     self.db.fail_job(
                         job_id=job_id,
                         error_message="Inference failed due to GPU Out of Memory (OOM)",
@@ -168,10 +176,17 @@ class MLWorker:
                     )
                 except Exception as proc_err:
                     logger.error(f"Error processing Job {job_id}: {proc_err}", exc_info=True)
+                    err_str = str(proc_err)
+                    is_oom = "out of memory" in err_str.lower() or ("cuda" in err_str.lower() and "memory" in err_str.lower())
+                    if is_oom:
+                        import gc
+                        gc.collect()
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
                     self.db.fail_job(
                         job_id=job_id,
                         error_message=str(proc_err),
-                        error_details={"error_type": type(proc_err).__name__, "details": str(proc_err)},
+                        error_details={"error_type": "GPU_OOM" if is_oom else type(proc_err).__name__, "details": str(proc_err)},
                         callback_url=callback_url
                     )
 
@@ -181,6 +196,14 @@ class MLWorker:
             finally:
                 self.current_job_id = None
                 self.worker_status = "idle"
+                # Always release cached GPU tensors and run garbage collection between jobs
+                try:
+                    import gc
+                    gc.collect()
+                    if torch and torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                except Exception as cleanup_err:
+                    logger.debug(f"Post-job GPU cleanup note: {cleanup_err}")
 
     def trigger_runpod_auto_stop(self):
         pod_id = self.config.RUNPOD_POD_ID or "yf989jc63uke3g"
