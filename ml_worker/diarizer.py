@@ -149,18 +149,74 @@ class SpeakerDiarizer:
             with torch.no_grad():
                 preds = self.nemo_model.diarize(audio=str(audio_path), batch_size=1)
 
-            if isinstance(preds, list) and len(preds) > 0 and isinstance(preds[0], list):
-                raw_segments = preds[0]
+            if isinstance(preds, tuple):
+                preds = preds[0]
+
+            if isinstance(preds, str):
+                raw_segments = preds.strip().splitlines()
+            elif isinstance(preds, list):
+                if len(preds) > 0 and isinstance(preds[0], list) and not isinstance(preds[0], str):
+                    raw_segments = preds[0]
+                else:
+                    raw_segments = preds
             else:
-                raw_segments = preds or []
+                raw_segments = []
 
             turns = []
-            for seg in raw_segments:
-                if len(seg) >= 3:
-                    st, et, spk_label = seg[0], seg[1], seg[2]
-                elif len(seg) == 2:
-                    st, et, spk_label = seg[0], seg[1], "speaker_0"
-                else:
+            for item in raw_segments:
+                if not item:
+                    continue
+
+                st, et, spk_label = None, None, None
+
+                # Format A: String line (e.g. "0.905 3.720 speaker_0" or RTTM "SPEAKER file 1 0.905 2.815 <NA> <NA> speaker_0 <NA> <NA>")
+                if isinstance(item, str):
+                    parts = item.strip().split()
+                    if not parts:
+                        continue
+                    if parts[0] == "SPEAKER" and len(parts) >= 8:
+                        # RTTM format: SPEAKER <file> <chnl> <tbeg> <tdur> <ortho> <stype> <name> <conf>
+                        try:
+                            st = float(parts[3])
+                            dur = float(parts[4])
+                            et = st + dur
+                            spk_label = parts[7]
+                        except (ValueError, IndexError):
+                            continue
+                    elif len(parts) >= 3:
+                        # Standard NeMo string: "start end speaker"
+                        try:
+                            st = float(parts[0])
+                            et = float(parts[1])
+                            spk_label = parts[2]
+                        except ValueError:
+                            continue
+                    elif len(parts) == 2:
+                        try:
+                            st = float(parts[0])
+                            et = float(parts[1])
+                            spk_label = "speaker_0"
+                        except ValueError:
+                            continue
+
+                # Format B: List or tuple: [start, end, speaker]
+                elif isinstance(item, (list, tuple)):
+                    if len(item) >= 3:
+                        try:
+                            st = float(item[0])
+                            et = float(item[1])
+                            spk_label = str(item[2])
+                        except (ValueError, TypeError):
+                            continue
+                    elif len(item) == 2:
+                        try:
+                            st = float(item[0])
+                            et = float(item[1])
+                            spk_label = "speaker_0"
+                        except (ValueError, TypeError):
+                            continue
+
+                if st is None or et is None or spk_label is None:
                     continue
 
                 st = round(float(st), 3)
