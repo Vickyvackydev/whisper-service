@@ -214,6 +214,96 @@ class InferencePipeline:
             cleanup_file(raw_download_path)
             cleanup_file(wav_path)
 
+    @staticmethod
+    def _split_segment_runs(clean_words: List[Dict[str, Any]]) -> List[Tuple[str, List[Dict[str, Any]]]]:
+        """
+        Splits contiguous words inside a single Whisper segment into distinct speaker sub-chunks
+        when a genuine interjection/handoff occurs (e.g. cross-talk without pause).
+        Filters out single-word acoustic jitter (< 0.35s) so natural sentences aren't fractured.
+        """
+        if not clean_words:
+            return []
+
+        # 1. Group contiguous words into initial speaker runs
+        runs: List[Dict[str, Any]] = []
+        for w in clean_words:
+            w_spk = w.get("speaker", "SPEAKER_00")
+            if not runs or runs[-1]["speaker"] != w_spk:
+                runs.append({"speaker": w_spk, "words": [w]})
+            else:
+                runs[-1]["words"].append(w)
+
+        STANDALONE_AFFIRMATIONS = {"yes", "no", "yeah", "nope", "sure", "correct", "sir", "true"}
+
+        # 2. Smooth single-word acoustic jitter (< 0.35s)
+        changed = True
+        while changed and len(runs) > 1:
+            changed = False
+            new_runs = []
+            i = 0
+            while i < len(runs):
+                r = runs[i]
+                r_dur = r["words"][-1]["end"] - r["words"][0]["start"]
+                r_len = len(r["words"])
+                first_w_txt = r["words"][0]["word"].lower().strip(".,!?;:\"' ")
+
+                # Intentional short response / affirmation
+                is_valid_standalone = False
+                if r_len == 1 and first_w_txt in STANDALONE_AFFIRMATIONS:
+                    is_valid_standalone = True
+
+                # Preceded by a natural pause or closing punctuation
+                if i > 0:
+                    prev_last_w = runs[i-1]["words"][-1]
+                    gap = r["words"][0]["start"] - prev_last_w["end"]
+                    ends_clause = any(prev_last_w["word"].endswith(p) for p in (".", "?", "!"))
+                    if ends_clause or gap >= 0.30:
+                        is_valid_standalone = True
+
+                # If 1-word island and NOT an intentional standalone, absorb as jitter
+                if r_len == 1 and r_dur < 0.35 and not is_valid_standalone:
+                    if i > 0 and i < len(runs) - 1 and runs[i-1]["speaker"] == runs[i+1]["speaker"]:
+                        # Middle jitter: absorb into surrounding speaker
+                        prev_spk = runs[i-1]["speaker"]
+                        for w in r["words"]:
+                            w["speaker"] = prev_spk
+                        new_runs[-1]["words"].extend(r["words"])
+                        changed = True
+                        i += 1
+                        continue
+                    elif i == 0 and len(runs) > 1:
+                        # Leading jitter
+                        next_spk = runs[1]["speaker"]
+                        for w in r["words"]:
+                            w["speaker"] = next_spk
+                        runs[1]["words"] = r["words"] + runs[1]["words"]
+                        changed = True
+                        i += 1
+                        continue
+                    elif i == len(runs) - 1 and len(new_runs) > 0:
+                        # Trailing jitter
+                        prev_spk = new_runs[-1]["speaker"]
+                        for w in r["words"]:
+                            w["speaker"] = prev_spk
+                        new_runs[-1]["words"].extend(r["words"])
+                        changed = True
+                        i += 1
+                        continue
+
+                new_runs.append(r)
+                i += 1
+
+            # Merge consecutive identical speakers in new_runs
+            merged = []
+            for r in new_runs:
+                if not merged or merged[-1]["speaker"] != r["speaker"]:
+                    merged.append(r)
+                else:
+                    merged[-1]["words"].extend(r["words"])
+            runs = merged
+
+        return [(r["speaker"], r["words"]) for r in runs]
+
     def reconstruct_speaker_turns(self, stitched_result: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], int]:
         """
         Takes WhisperX stitched word-level speaker assignments and builds
@@ -266,11 +356,38 @@ class InferencePipeline:
         ]
         re_judge_authority = [re.compile(p, re.IGNORECASE) for p in JUDGE_AUTHORITY_PATTERNS]
 
+        # Universal Judicial Directives & Courtroom Management (exclusively spoken by the Presiding Judge)
+        RE_JUDGE_DIRECTIVES = re.compile(
+            r"\b(?:"
+            r"(?:he|she|it|they)\s+will\s+not\s+pay\s+(?:for\s+your\s+rent|school\s+fees|medical|maintenance|upkeep|you)|"
+            r"not\s+to\s+touch\s+(?:school\s+fees|medical|maintenance|upkeep)|"
+            r"(?:have|did)\s+i\s+given?\s+my\s+(?:judgement|ruling|decision|order)|"
+            r"give\s+me\s+judgement|"
+            r"for\s+upkeep\s+you\s+don't\s+need|"
+            r"why\s+are\s+you\s+here\??|"
+            r"(?:just\s+)?keep\s+quiet|"
+            r"i\s+said\s+keep\s+quiet|"
+            r"watch\s+what\s+you\s+are\s+saying|"
+            r"let's\s+resolve\s+this|"
+            r"let's\s+get\s+to\s+the\s+root\s+of\s+this|"
+            r"stop\s+interjecting(?:\s+(?:him|her|them))?|"
+            r"let\s+(?:him|her|them)\s+(?:finish|speak|tell\s+me)|"
+            r"let\s+me\s+listen\s+to\s+(?:him|her|them)|"
+            r"send\s+you\s+out\s+of\s+the\s+courtroom|"
+            r"who\s+was\s+paying\s+(?:the\s+)?(?:school\s+fees|rent|medical|upkeep)|"
+            r"that\s+is\s+not\s+your\s+problem|"
+            r"let\s+(?:her|him|them)\s+round\s+up\s+this\s+session|"
+            r"start\s+the\s+next\s+session\s+from\s+that\s+school|"
+            r"judge\s+in\s+your\s+own\s+(?:cause|course)"
+            r")\b",
+            re.IGNORECASE
+        )
+
         RE_SUBMISSION = re.compile(r"\b(?:as\s+(?:the|your\s+lordship's?)\s+court\s+pleases|as\s+the\s+court\s+pleases|court\s+pleases)\b", re.IGNORECASE)
         RE_CLARIFICATION = re.compile(r"^(?:sir\??|my\s+lord\??|pardon\??|sorry\??)$", re.IGNORECASE)
         RE_BENCH_INQUIRY = re.compile(r"\b(?:can\s+i\s+see\s+the|let\s+me\s+see\s+the|show\s+me\s+the|where\s+is\s+the\s+(?:order|prayer|writ|suit|process))\b", re.IGNORECASE)
         RE_COUNSEL_ARGUMENT = re.compile(r"\b(?:what\s+i'm\s+saying|what\s+i\s+am\s+saying|what\s+we\s+are\s+saying|our\s+submission|our\s+prayer|our\s+application|we\s+are\s+asking|we\s+asked\s+for|we\s+prayed|we\s+filed|we\s+served|we\s+said)\b", re.IGNORECASE)
-        DANGLING_CONJUNCTIONS = {"that", "and", "or", "because", "which", "to", "of", "in", "with", "the", "a", "an", "is", "was", "are", "were"}
+        DANGLING_CONJUNCTIONS = {"and", "or", "because", "which", "that", "but", "whether"}
 
         processed_segments: List[Dict[str, Any]] = []
 
@@ -328,49 +445,20 @@ class InferencePipeline:
 
             dominant_spk = max(spk_durations, key=spk_durations.get) if spk_durations else (seg.get("speaker") or "SPEAKER_00")
 
-            # Check if there is a genuine intra-segment speaker handoff
-            # Only split if two distinct speakers each speak for >= 0.8s
-            # AND a natural clause boundary separates them.
-            sub_chunks = []
-            curr_chunk_words = []
-            curr_chunk_spk = None
-
-            for w in clean_words:
-                w_spk = w["speaker"]
-                if curr_chunk_spk is None:
-                    curr_chunk_spk = w_spk
-                    curr_chunk_words = [w]
-                elif w_spk == curr_chunk_spk:
-                    curr_chunk_words.append(w)
-                else:
-                    # Potential intra-segment handoff
-                    chunk_dur = curr_chunk_words[-1]["end"] - curr_chunk_words[0]["start"]
-                    last_w_txt = curr_chunk_words[-1]["word"]
-                    ends_clause = any(last_w_txt.endswith(p) for p in (".", "?", "!", ",", ";"))
-                    gap = w["start"] - curr_chunk_words[-1]["end"]
-
-                    if chunk_dur >= 0.8 and (ends_clause or gap >= 0.35):
-                        sub_chunks.append((curr_chunk_spk, curr_chunk_words))
-                        curr_chunk_spk = w_spk
-                        curr_chunk_words = [w]
-                    else:
-                        # Absorb micro-jitter into current chunk
-                        w["speaker"] = curr_chunk_spk
-                        curr_chunk_words.append(w)
-
-            if curr_chunk_words:
-                sub_chunks.append((curr_chunk_spk, curr_chunk_words))
+            # Intra-segment speaker handoffs (split only when genuine multi-word turns occur)
+            sub_chunks = self._split_segment_runs(clean_words)
 
             if len(sub_chunks) <= 1:
                 # Intact segment: assign dominant speaker to all words
+                seg_spk = sub_chunks[0][0] if sub_chunks else dominant_spk
                 for w in clean_words:
-                    w["speaker"] = dominant_spk
+                    w["speaker"] = seg_spk
                 processed_segments.append({
                     "start": clean_words[0]["start"] if clean_words else seg_start,
                     "end": clean_words[-1]["end"] if clean_words else seg_end,
                     "text": " ".join(cw["word"] for cw in clean_words).strip() if clean_words else raw_text,
                     "source_text": seg.get("source_text"),
-                    "speaker": dominant_spk,
+                    "speaker": seg_spk,
                     "words": clean_words,
                 })
             else:
@@ -398,18 +486,22 @@ class InferencePipeline:
         speaker_counsel_votes: Dict[str, int] = {}
         speaker_judge_votes: Dict[str, int] = {}
         speaker_total_dur: Dict[str, float] = {}
+        speaker_word_counts: Dict[str, int] = {}
+        speaker_seg_counts: Dict[str, int] = {}
 
         total_audio_speech = 0.0
         for seg in processed_segments:
             spk = seg["speaker"]
             dur = max(0.05, seg["end"] - seg["start"])
             speaker_total_dur[spk] = speaker_total_dur.get(spk, 0.0) + dur
+            speaker_seg_counts[spk] = speaker_seg_counts.get(spk, 0) + 1
+            speaker_word_counts[spk] = speaker_word_counts.get(spk, 0) + len(seg.get("words", []))
             total_audio_speech += dur
             txt = seg["text"].lower()
 
             if any(p.search(txt) for p in re_counsel_honorifics):
                 speaker_counsel_votes[spk] = speaker_counsel_votes.get(spk, 0) + 1
-            if any(p.search(txt) for p in re_judge_authority):
+            if any(p.search(txt) for p in re_judge_authority) or RE_JUDGE_DIRECTIVES.search(txt):
                 speaker_judge_votes[spk] = speaker_judge_votes.get(spk, 0) + 1
 
         # Identify Primary Counsel (most honorifics addressed to bench)
@@ -437,15 +529,19 @@ class InferencePipeline:
 
         logger.info(f"Courtroom Role Discovery: Counsel={counsel_spk} (votes={speaker_counsel_votes}), Judge={judge_spk} (votes={speaker_judge_votes})")
 
-        # Only merge micro-clusters (ghost clusters that spoke < 3% of total audio and < 6 seconds total)
-        # This preserves legitimate 2nd / 3rd counsels, registrars, and witnesses!
+        # Micro-cluster pruning: only prune true acoustic glitches/clicks (< 0.8s, <= 1 word, isolated turn)
+        # Legitimate 2nd / 3rd participants (e.g. Father, Registrar, 2nd Counsel, Witness) are strictly preserved!
         cluster_remap: Dict[str, str] = {}
         target_max_speakers = getattr(WorkerConfig, "MAX_SPEAKERS", None)
 
         for spk, dur in speaker_total_dur.items():
             if spk in (counsel_spk, judge_spk):
                 continue
-            is_micro_phantom = (dur < 6.0 and (dur / max(1.0, total_audio_speech)) < 0.04)
+            word_cnt = speaker_word_counts.get(spk, 0)
+            seg_cnt = speaker_seg_counts.get(spk, 0)
+
+            # True acoustic phantom: sub-second duration (< 0.8s), only 1 word or noise, and single isolated turn
+            is_micro_phantom = (dur < 0.8 and word_cnt <= 1 and seg_cnt <= 1)
             is_enforced_2spk = (target_max_speakers == 2 and len(speaker_total_dur) > 2)
 
             if is_micro_phantom or is_enforced_2spk:
@@ -478,6 +574,16 @@ class InferencePipeline:
                         seg["speaker"] = counsel_spk
                         for w in seg.get("words", []):
                             w["speaker"] = counsel_spk
+
+        # Pass 1B: Universal Courtroom Rule: Only the Bench issues judicial orders, maintenance directives, and contempt warnings
+        if judge_spk is not None:
+            for seg in processed_segments:
+                if seg["speaker"] != judge_spk:
+                    txt = seg["text"].lower()
+                    if RE_JUDGE_DIRECTIVES.search(txt):
+                        seg["speaker"] = judge_spk
+                        for w in seg.get("words", []):
+                            w["speaker"] = judge_spk
 
         # Pass 2: Conversational Alternation & Response Sandwiches
         SHORT_AFFIRMATIONS = {"sir?", "sir", "yes sir", "yes my lord", "no my lord", "as the court pleases"}
@@ -517,8 +623,12 @@ class InferencePipeline:
                     prev_tokens = prev_seg["text"].lower().strip(".,!?;:\"' ").split()
                     prev_last_word = prev_tokens[-1] if prev_tokens else ""
                     if gap <= 0.8 and prev_last_word in DANGLING_CONJUNCTIONS:
-                        if seg["speaker"] == counsel_spk and prev_seg["speaker"] == judge_spk:
-                            prev_seg["speaker"] = counsel_spk
+                        first_word = seg["text"].lower().strip(".,!?;:\"' ").split()[0] if seg["text"].strip() else ""
+                        if first_word not in {"i", "my", "we", "no", "yes"}:
+                            if prev_seg["speaker"] == judge_spk and RE_JUDGE_DIRECTIVES.search(prev_seg["text"]):
+                                seg["speaker"] = judge_spk
+                            elif seg["speaker"] == counsel_spk and prev_seg["speaker"] == judge_spk:
+                                prev_seg["speaker"] = counsel_spk
 
                 # Case F: Short Affirmations ("Sir?", "Yes sir", "As the Court pleases")
                 if txt_clean in SHORT_AFFIRMATIONS and seg["speaker"] == judge_spk:
@@ -529,6 +639,7 @@ class InferencePipeline:
             final_spk = seg["speaker"]
             for w in seg.get("words", []):
                 w["speaker"] = final_spk
+
 
         # -------------------------------------------------------------------
         # STAGE 3: Chronological Speaker Normalization

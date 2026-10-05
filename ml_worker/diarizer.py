@@ -515,8 +515,12 @@ class SpeakerDiarizer:
         # to ensure that short interjections (e.g. mother's 1-2s remarks) and distinct room voices (father vs judge) are never merged.
         if return_speaker_count == 0 and total_audio_dur <= 60.0 and n_speakers >= 2:
             target = get_root_target(dominant)
+            target_centroid = speaker_centroids.get(target)
             for spk in ranked_speakers:
                 if spk != target and spk not in to_merge:
+                    spk_centroid = speaker_centroids.get(spk)
+                    if target_centroid is not None and spk_centroid is not None and float(np.dot(target_centroid, spk_centroid)) < 0.75:
+                        continue
                     to_merge[spk] = target
                     logger.info(f"[CONSOLIDATION] Merging '{spk}' into dominant '{target}' — pure sequential short monologue (returns=0, dur={total_audio_dur:.1f}s)")
 
