@@ -33,6 +33,8 @@ class WorkerConfig:
         return token
 
     HF_TOKEN: str = get_hf_token.__func__(None)
+    DIARIZATION_BACKEND: str = os.getenv("DIARIZATION_BACKEND", "nemo").lower()  # "nemo" or "pyannote"
+    NEMO_DIARIZATION_MODEL: str = os.getenv("NEMO_DIARIZATION_MODEL", "nvidia/diar_sortformer_4spk-v1")
     DIARIZATION_MODEL: str = os.getenv("DIARIZATION_MODEL", "pyannote/speaker-diarization-3.1")
     DIARIZATION_THRESHOLD: Optional[float] = float(os.getenv("DIARIZATION_THRESHOLD", "0.63"))
     MIN_SPEAKERS: Optional[int] = int(os.getenv("MIN_SPEAKERS")) if os.getenv("MIN_SPEAKERS") else None

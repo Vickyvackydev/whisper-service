@@ -9,24 +9,48 @@ logger = logging.getLogger("ml_worker.diarizer")
 
 class SpeakerDiarizer:
     def __init__(self):
+        self.backend = getattr(WorkerConfig, "DIARIZATION_BACKEND", "nemo").lower()
+        self.nemo_model = None
         self.pipeline = None
         self.is_loaded = False
-        self.model_name = WorkerConfig.DIARIZATION_MODEL
+        self.nemo_model_name = getattr(WorkerConfig, "NEMO_DIARIZATION_MODEL", "nvidia/diar_sortformer_4spk-v1")
+        self.pyannote_model_name = getattr(WorkerConfig, "DIARIZATION_MODEL", "pyannote/speaker-diarization-3.1")
         self.hf_token = WorkerConfig.HF_TOKEN
         self.device = "cuda" if (torch.cuda.is_available() and WorkerConfig.WHISPER_DEVICE != "cpu") else "cpu"
         self.device_obj = torch.device(self.device)
 
     def load_model(self):
+        if self.backend == "nemo":
+            try:
+                logger.info(f"Loading NVIDIA NeMo Diarization model: {self.nemo_model_name} on {self.device}...")
+                from nemo.collections.asr.models import SortformerEncLabelModel
+
+                self.nemo_model = SortformerEncLabelModel.from_pretrained(self.nemo_model_name)
+                self.nemo_model.to(self.device_obj)
+                self.nemo_model.eval()
+                self.is_loaded = True
+                logger.info(f"NVIDIA NeMo Sortformer Diarization model loaded successfully on {self.device}.")
+                return
+            except Exception as nemo_err:
+                logger.warning(
+                    f"Failed to load NVIDIA NeMo model '{self.nemo_model_name}' ({nemo_err}). "
+                    f"Falling back to Pyannote pipeline..."
+                )
+                self.backend = "pyannote"
+
+        self._load_pyannote()
+
+    def _load_pyannote(self):
         if not self.hf_token:
             logger.warning("HF_TOKEN is not configured. Pyannote speaker diarization will be unavailable.")
             return
 
         try:
-            logger.info(f"Loading Diarization pipeline: {self.model_name} on {self.device}...")
+            logger.info(f"Loading Diarization pipeline: {self.pyannote_model_name} on {self.device}...")
             from pyannote.audio import Pipeline
 
             self.pipeline = Pipeline.from_pretrained(
-                self.model_name,
+                self.pyannote_model_name,
                 token=self.hf_token
             )
 
@@ -37,14 +61,11 @@ class SpeakerDiarizer:
                 logger.info("Pyannote Diarization pipeline loaded on CPU.")
 
             # Calibrate Pyannote hyperparameters
-            # IMPORTANT ORDER: call instantiate() FIRST (applies via Pyannote schema),
-            # then override attributes DIRECTLY AFTER so our values are never overwritten.
             try:
                 thresh  = getattr(WorkerConfig, "DIARIZATION_THRESHOLD", 0.63)
                 min_off = getattr(WorkerConfig, "MIN_DURATION_OFF", 0.20)
                 min_on  = getattr(WorkerConfig, "MIN_DURATION_ON", 0.08)
 
-                # Step 1: pipeline.instantiate() — respects Pyannote's internal schema
                 instantiate_params = {}
                 if thresh is not None:
                     instantiate_params["clustering"] = {"threshold": float(thresh)}
@@ -60,19 +81,15 @@ class SpeakerDiarizer:
                         self.pipeline.instantiate(instantiate_params)
                         logger.info(f"Pyannote pipeline.instantiate() applied: {instantiate_params}")
                     except Exception as inst_err:
-                        logger.debug(f"pipeline.instantiate() not available or failed ({inst_err}), using direct attrs only")
+                        logger.debug(f"pipeline.instantiate() not available ({inst_err}), using direct attrs")
 
-                # Step 2: Direct attribute override (always runs AFTER instantiate so it wins)
                 if thresh is not None:
                     if hasattr(self.pipeline, "clustering") and hasattr(self.pipeline.clustering, "threshold"):
                         self.pipeline.clustering.threshold = float(thresh)
-                        logger.info(f"[THRESHOLD] Pyannote clustering.threshold set to {float(thresh)}")
-                    # Pyannote 3.x alternative path
                     for attr in ("_clustering", "klustering"):
                         sub = getattr(self.pipeline, attr, None)
                         if sub is not None and hasattr(sub, "threshold"):
                             sub.threshold = float(thresh)
-                            logger.info(f"[THRESHOLD] Pyannote {attr}.threshold set to {float(thresh)}")
 
                 if hasattr(self.pipeline, "segmentation"):
                     seg = self.pipeline.segmentation
@@ -80,11 +97,10 @@ class SpeakerDiarizer:
                         seg.min_duration_off = float(min_off)
                     if min_on is not None and hasattr(seg, "min_duration_on"):
                         seg.min_duration_on = float(min_on)
-                    logger.info(f"[SEGMENTATION] min_duration_off={min_off}, min_duration_on={min_on}")
 
             except Exception as thresh_err:
                 logger.debug(f"Hyperparameter configuration note: {thresh_err}")
-            
+
             self.is_loaded = True
         except Exception as e:
             logger.error(f"Failed to load Pyannote diarization pipeline: {e}")
@@ -113,6 +129,81 @@ class SpeakerDiarizer:
         Runs diarization on audio and returns list of speaker intervals:
         [{ "start": 0.5, "end": 4.2, "speaker": "SPEAKER_00" }, ...]
         """
+        if self.backend == "nemo" and self.nemo_model is not None:
+            return self._diarize_nemo(audio_path, min_speakers=min_speakers, max_speakers=max_speakers)
+        return self._diarize_pyannote(audio_path, min_speakers=min_speakers, max_speakers=max_speakers)
+
+    def _diarize_nemo(
+        self,
+        audio_path: Path,
+        min_speakers: Optional[int] = None,
+        max_speakers: Optional[int] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Runs NVIDIA NeMo Sortformer end-to-end speaker diarization.
+        Sortformer outputs (start, end, speaker) chronologically sorted.
+        """
+        try:
+            logger.info(f"Running NVIDIA NeMo speaker diarization on {audio_path.name}...")
+            import torch
+            with torch.no_grad():
+                preds = self.nemo_model.diarize(audio=str(audio_path), batch_size=1)
+
+            if isinstance(preds, list) and len(preds) > 0 and isinstance(preds[0], list):
+                raw_segments = preds[0]
+            else:
+                raw_segments = preds or []
+
+            turns = []
+            for seg in raw_segments:
+                if len(seg) >= 3:
+                    st, et, spk_label = seg[0], seg[1], seg[2]
+                elif len(seg) == 2:
+                    st, et, spk_label = seg[0], seg[1], "speaker_0"
+                else:
+                    continue
+
+                st = round(float(st), 3)
+                et = round(float(et), 3)
+                if et <= st:
+                    continue
+
+                spk_str = str(spk_label).strip().lower()
+                num = None
+                if spk_str.startswith("speaker_"):
+                    try:
+                        num = int(spk_str.replace("speaker_", "").strip())
+                    except ValueError:
+                        pass
+                elif spk_str.isdigit():
+                    num = int(spk_str)
+
+                if num is not None:
+                    formatted_spk = f"SPEAKER_{num:02d}"
+                else:
+                    formatted_spk = f"SPEAKER_{spk_str.upper()}"
+
+                turns.append({
+                    "start": st,
+                    "end": et,
+                    "speaker": formatted_spk
+                })
+
+            unique_detected = len(set(t["speaker"] for t in turns))
+            logger.info(f"NVIDIA NeMo diarization successful: detected {len(turns)} turns across {unique_detected} distinct speakers.")
+            return turns
+        except Exception as e:
+            logger.error(f"NVIDIA NeMo diarization failed ({e}). Falling back to Pyannote...", exc_info=True)
+            if self.pipeline is not None:
+                return self._diarize_pyannote(audio_path, min_speakers, max_speakers)
+            return []
+
+    def _diarize_pyannote(
+        self,
+        audio_path: Path,
+        min_speakers: Optional[int] = None,
+        max_speakers: Optional[int] = None
+    ) -> List[Dict[str, Any]]:
         if not self.is_loaded or self.pipeline is None:
             logger.warning("Diarization pipeline not loaded.")
             return []
