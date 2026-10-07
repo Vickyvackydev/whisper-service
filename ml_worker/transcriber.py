@@ -106,6 +106,12 @@ class Transcriber:
             except Exception:
                 pass
 
+        prompt = WorkerConfig.WHISPER_INITIAL_PROMPT
+        if not prompt or str(prompt).strip().lower() in ("none", "false", "0", ""):
+            prompt = None
+        else:
+            prompt = prompt.strip()
+
         segments_iter, info = self.model.transcribe(
             str(audio_path),
             language=lang_arg,
@@ -116,9 +122,9 @@ class Transcriber:
             vad_filter=True,
             vad_parameters=vad_params,
             condition_on_previous_text=False, # Prevents hallucinations / skipping words
-            no_speech_threshold=0.8,
+            no_speech_threshold=0.6,
             compression_ratio_threshold=2.4,
-            initial_prompt=WorkerConfig.WHISPER_INITIAL_PROMPT
+            initial_prompt=prompt
         )
 
         detected_language = info.language
