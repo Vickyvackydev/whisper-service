@@ -47,6 +47,14 @@ class MLWorker:
         # 1. Connect to PostgreSQL
         self.db.connect()
 
+        # Set default CUDA device ordinal 0
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.set_device(0)
+                logger.info(f"Active CUDA device initialized to ordinal 0: {torch.cuda.get_device_name(0)}")
+            except Exception as e:
+                logger.warning(f"Could not pin CUDA device 0: {e}")
+
         # 2. Load Whisper Model (once at startup)
         self.transcriber.load_model()
 
@@ -189,6 +197,20 @@ class MLWorker:
                         error_details={"error_type": "GPU_OOM" if is_oom else type(proc_err).__name__, "details": str(proc_err)},
                         callback_url=callback_url
                     )
+
+                    # Fatal CUDA state corruption recovery (e.g. invalid device ordinal / driver stream failure):
+                    # Exit process immediately so systemd/docker supervisor restarts with a pristine CUDA context.
+                    is_fatal_cuda = any(pattern in err_str.lower() for pattern in [
+                        "invalid device ordinal",
+                        "cudaerrorinvaliddevice",
+                        "illegal memory access",
+                        "unspecified launch failure",
+                        "cuda error: all cuda-capable devices are busy"
+                    ])
+                    if is_fatal_cuda:
+                        logger.critical(f"FATAL CUDA DRIVER ERROR: {proc_err}. Exiting worker process for fresh restart...")
+                        time.sleep(1.0)
+                        os._exit(1)
 
             except Exception as loop_err:
                 logger.error(f"Worker main loop unexpected error: {loop_err}", exc_info=True)

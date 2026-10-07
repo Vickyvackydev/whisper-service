@@ -101,6 +101,11 @@ class InferencePipeline:
                     if progress_updater:
                         progress_updater("aligning", 78)
                     logger.info(f"[{job_id}] Running WhisperX Wav2Vec2 phoneme forced alignment (language={lang_code}, device={align_device})...")
+                    if align_device == "cuda" and torch and torch.cuda.is_available():
+                        try:
+                            torch.cuda.set_device(0)
+                        except Exception:
+                            pass
                     import whisperx
                     audio_arr = whisperx.load_audio(str(wav_path))
                     align_model, align_metadata = whisperx.load_align_model(

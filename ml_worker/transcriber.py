@@ -20,6 +20,7 @@ class Transcriber:
         
         # Check CUDA availability
         actual_device = self.device
+        device_index = 0
         if actual_device == "cuda" and not torch.cuda.is_available():
             logger.warning("CUDA requested but not available. Falling back to CPU.")
             actual_device = "cpu"
@@ -29,15 +30,26 @@ class Transcriber:
             if actual_device == "cpu":
                 self.compute_type = "int8"
 
+        if actual_device == "cuda":
+            try:
+                device_index = torch.cuda.current_device() if (torch and torch.cuda.is_available()) else 0
+                if torch and torch.cuda.is_available():
+                    torch.cuda.set_device(device_index)
+                logger.info(f"Pinned CTranslate2 / Whisper device to CUDA ordinal: {device_index}")
+            except Exception as dev_err:
+                logger.warning(f"Note verifying CUDA device index: {dev_err}")
+                device_index = 0
+
         self.model = WhisperModel(
             self.model_name,
             device=actual_device,
+            device_index=device_index,
             compute_type=self.compute_type,
             cpu_threads=WorkerConfig.WHISPER_CPU_THREADS,
             download_root=str(WorkerConfig.SCRATCH_DIR / "models" / "whisper")
         )
         self.device = actual_device
-        logger.info("Whisper model loaded successfully.")
+        logger.info(f"Whisper model loaded successfully on {actual_device}:{device_index}.")
 
     def transcribe(
         self,
@@ -87,6 +99,12 @@ class Transcriber:
             min_silence_duration_ms=250,    # Isolate rapid micro-pauses between speaker interchanges
             speech_pad_ms=300              # Pad 300ms to preserve leading/trailing word boundaries
         )
+
+        if self.device == "cuda" and torch and torch.cuda.is_available():
+            try:
+                torch.cuda.set_device(0)
+            except Exception:
+                pass
 
         segments_iter, info = self.model.transcribe(
             str(audio_path),

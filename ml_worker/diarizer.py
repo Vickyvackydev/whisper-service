@@ -146,6 +146,11 @@ class SpeakerDiarizer:
         try:
             logger.info(f"Running NVIDIA NeMo speaker diarization on {audio_path.name}...")
             import torch
+            if self.device == "cuda" and torch.cuda.is_available():
+                try:
+                    torch.cuda.set_device(0)
+                except Exception:
+                    pass
             with torch.inference_mode():
                 preds = self.nemo_model.diarize(audio=str(audio_path), batch_size=1)
 
@@ -278,6 +283,9 @@ class SpeakerDiarizer:
                     torch.cuda.empty_cache()
             else:
                 logger.error(f"NVIDIA NeMo diarization failed ({e}). Falling back to Pyannote...", exc_info=True)
+            if self.pipeline is None:
+                logger.info("Initializing Pyannote pipeline on-demand for fallback diarization...")
+                self._load_pyannote()
             if self.pipeline is not None:
                 return self._diarize_pyannote(audio_path, min_speakers, max_speakers)
             return []
@@ -294,6 +302,11 @@ class SpeakerDiarizer:
 
         try:
             logger.info(f"Running speaker diarization on {audio_path.name}...")
+            if self.device == "cuda" and torch.cuda.is_available():
+                try:
+                    torch.cuda.set_device(0)
+                except Exception:
+                    pass
             import soundfile as sf
             data, sample_rate = sf.read(str(audio_path), dtype="float32")
             if len(data.shape) > 1:
