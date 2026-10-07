@@ -141,5 +141,205 @@ class TestNormalizer(unittest.TestCase):
         words_out = [w["word"] for w in res["words"]]
         self.assertEqual(words_out, ["This", "is", "my", "client.", "Yes,", "My", "Lord."])
 
+    def test_slashes_and_no_spaces(self):
+        cases = [
+            ("the word slash should appear as /", "the word/should appear as/"),
+            ("plaintiff slash defendant", "Plaintiff/Defendant"),
+            ("plaintiff / defendant", "Plaintiff/Defendant"),
+            ("one slash two", "1/2"),
+            ("one / two", "1/2"),
+            ("fhc slash abj slash cs slash 55 slash 2024", "FHC/ABJ/CS/55/2024"),
+            ("May slash June", "May/June"),
+            ("and slash or", "and/or"),
+            ("yes slash no", "yes/no"),
+            ("Exhibit A slash 1", "Exhibit A/1"),
+            ("section 10 slash 12", "section 10/12"),
+            ("slash 2026", "/2026"),
+        ]
+        for inp, expected in cases:
+            with self.subTest(inp=inp):
+                self.assertEqual(normalize_case_numbers_and_slashes(inp), expected)
+
+    def test_exhibit_and_exhibits_capitalization(self):
+        cases = [
+            ("exhibit 1", "Exhibit 1"),
+            ("exhibit five", "Exhibit 5"),
+            ("exhibit 5A", "Exhibit 5A"),
+            ("exhibit five a", "Exhibit 5A"),
+            ("exhibit A", "Exhibit A"),
+            ("exhibit P1", "Exhibit P1"),
+            ("exhibits 1 and 2", "Exhibits 1 and 2"),
+            ("exhibits one and two", "Exhibits 1 and 2"),
+            ("Please look at exhibit 5.", "Please look at Exhibit 5."),
+            ("We refer to exhibits 1 and 2.", "We refer to Exhibits 1 and 2."),
+            ("We tender this as an Exhibit in Court.", "We tender this as an exhibit in Court."),
+            ("These Exhibits were marked.", "These exhibits were marked."),
+            ("Exhibit is admitted.", "Exhibit is admitted."),
+        ]
+        for inp, expected in cases:
+            with self.subTest(inp=inp):
+                self.assertEqual(normalize_case_numbers_and_slashes(inp), expected)
+
+    def test_courtroom_decorum_and_honorifics(self):
+        cases = [
+            ("as the court pleases", "As the Court pleases"),
+            ("The matter is adjourned, as the court pleases.", "The matter is adjourned, as the Court pleases."),
+            ("may it please the court", "May it please the Court"),
+            ("May it please the Court, my lord.", "May it please the Court, My Lord."),
+            ("if it may it please the court", "if it may it please the Court"),
+            ("much obliged", "Much obliged"),
+            ("We are much obliged to your lordship.", "We are much obliged to Your Lordship."),
+            ("my learned colleague", "My learned colleague"),
+            ("I agree with my learned colleague.", "I agree with my learned colleague."),
+            ("my noble lord", "My Noble Lord"),
+            ("I submit to my noble lord.", "I submit to My Noble Lord."),
+            ("my noble lordship", "My Noble Lordship"),
+            ("I submit to my noble lordship.", "I submit to My Noble Lordship."),
+            ("no objection", "No objection"),
+            ("We have no objection to the document.", "We have No objection to the document."),
+            ("honourable court", "Honourable Court"),
+            ("honorable court", "Honourable Court"),
+            ("your honor", "Your Honor"),
+            ("your honour", "Your Honour"),
+            ("your ladyship", "Your Ladyship"),
+            ("your ladyships", "Your Ladyships"),
+            ("your lordship", "Your Lordship"),
+            ("your lordships", "Your Lordships"),
+            ("your worship", "Your Worship"),
+            ("learned counsel", "Learned Counsel"),
+            ("learned friend", "Learned Friend"),
+            ("learned silk", "Learned Silk"),
+        ]
+        for inp, expected in cases:
+            with self.subTest(inp=inp):
+                self.assertEqual(normalize_case_numbers_and_slashes(inp), expected)
+
+    def test_latin_maxims_and_proceedings(self):
+        cases = [
+            ("without prejudice", "Without prejudice"),
+            ("This offer is without prejudice.", "This offer is without prejudice."),
+            ("with due respect", "With due respect"),
+            ("With due respect to my learned friend.", "With due respect to my Learned Friend."),
+            ("in witness whereof", "in witness Whereof"),
+            ("whereof", "Whereof"),
+            ("certified true copy", "Certified True Copy"),
+            ("cross-examination", "Cross-Examination"),
+            ("cross-examine", "cross-examine"),
+            ("examination-in-chief", "Examination-in-Chief"),
+            ("re-examination", "Re-examination"),
+            ("pre-trial", "Pre-trial"),
+            ("ruling", "Ruling"),
+            ("ordered as prayed", "Ordered as prayed"),
+            ("The application is ordered as prayed.", "The application is ordered as prayed."),
+            ("ex parte", "Ex Parte"),
+            ("in limine", "In Limine"),
+            ("per se", "Per Se"),
+            ("allocutus", "allocutus"),
+            ("estoppel", "estoppel"),
+            ("statute-barred", "statute-barred"),
+            ("inter alia", "inter alia"),
+            ("locus in quo", "locus in quo"),
+            ("locus standi", "locus standi"),
+            ("mutatis mutandis", "mutatis mutandis"),
+            ("obiter dictum", "obiter dictum"),
+            ("prima facie", "prima facie"),
+            ("ratio decidendi", "ratio decidendi"),
+            ("res judicata", "res judicata"),
+            ("subjudice", "subjudice"),
+            ("sub judice", "subjudice"),
+            ("suo motou", "suo motou"),
+            ("suo motu", "suo motou"),
+            ("ultra vires", "ultra vires"),
+            ("aforementioned", "aforementioned"),
+            ("aforesaid", "aforesaid"),
+        ]
+        for inp, expected in cases:
+            with self.subTest(inp=inp):
+                self.assertEqual(normalize_case_numbers_and_slashes(inp), expected)
+
+    def test_parties_and_court_entities(self):
+        cases = [
+            ("federal high court", "Federal High Court"),
+            ("state high court", "State High Court"),
+            ("court of appeal", "Court of Appeal"),
+            ("supreme court", "Supreme Court"),
+            ("national industrial court", "National Industrial Court"),
+            ("magistrate court", "Magistrate Court"),
+            ("customary court", "Customary Court"),
+            ("in chambers", "In Chambers"),
+            ("attorney general", "Attorney General"),
+            ("solicitor general", "Solicitor General"),
+            ("director of public prosecutions", "Director of Public Prosecutions"),
+            ("chief judge", "Chief Judge"),
+            ("chief justice", "Chief Justice"),
+            ("chief registrar", "Chief Registrar"),
+            ("deputy registrar", "Deputy Registrar"),
+            ("deputy sheriff", "Deputy Sheriff"),
+            ("presiding judge", "Presiding Judge"),
+            ("senior judge", "Senior Judge"),
+            ("legal practitioner", "legal practitioner"),
+            ("solicitor", "solicitor"),
+            ("co-defendant", "Co-Defendant"),
+            ("co-plaintiff", "Co-Plaintiff"),
+            ("co-respondent", "Co-Respondent"),
+            ("counter-claimant", "Counter-Claimant"),
+            ("defence witness", "Defence Witness"),
+            ("defense witness", "Defence Witness"),
+            ("prosecution witness", "Prosecution Witness"),
+            ("judgment creditor", "Judgment Creditor"),
+            ("judgment debtor", "Judgment Debtor"),
+            ("affidavit of service", "Affidavit of Service"),
+            ("counter-affidavit", "Counter-Affidavit"),
+            ("further affidavit", "Further Affidavit"),
+            ("originating summons", "Originating Summons"),
+            ("originating motion", "Originating Motion"),
+            ("writ of summons", "Writ of Summons"),
+            ("written address", "Written Address"),
+            ("statement of claim", "Statement of Claim"),
+            ("statement of defence", "Statement of Defence"),
+            ("statement of defense", "Statement of Defence"),
+            ("statement on oath", "Statement on Oath"),
+            ("motion on notice", "Motion on Notice"),
+            ("motion ex parte", "Motion Ex Parte"),
+            ("consent judgment", "Consent Judgment"),
+            ("consent order", "Consent Order"),
+            ("default judgment", "Default Judgment"),
+            ("interlocutory injunction", "Interlocutory Injunction"),
+            ("stay of execution", "Stay of Execution"),
+            ("stay of proceedings", "Stay of Proceedings"),
+            ("perpetual injunction", "Perpetual Injunction"),
+            ("declaratory relief", "Declaratory Relief"),
+            ("record of proceedings", "record of proceedings"),
+            ("subpoena", "subpoena"),
+            ("gazette", "gazette"),
+        ]
+        for inp, expected in cases:
+            with self.subTest(inp=inp):
+                self.assertEqual(normalize_case_numbers_and_slashes(inp), expected)
+
+    def test_word_tokens_slashed_merge_and_alignment(self):
+        seg = {
+            "text": "plaintiff slash defendant in exhibit 5",
+            "words": [
+                {"word": "plaintiff", "start": 0.0, "end": 0.4},
+                {"word": "slash", "start": 0.4, "end": 0.6},
+                {"word": "defendant", "start": 0.6, "end": 1.0},
+                {"word": "in", "start": 1.0, "end": 1.2},
+                {"word": "exhibit", "start": 1.2, "end": 1.5},
+                {"word": "five", "start": 1.5, "end": 1.8},
+            ]
+        }
+        res = normalize_segment(seg)
+        self.assertEqual(res["text"], "Plaintiff/Defendant in Exhibit 5")
+        words = res["words"]
+        self.assertEqual(len(words), 4)
+        self.assertEqual(words[0]["word"], "Plaintiff/Defendant")
+        self.assertEqual(words[0]["start"], 0.0)
+        self.assertEqual(words[0]["end"], 1.0)
+        self.assertEqual(words[1]["word"], "in")
+        self.assertEqual(words[2]["word"], "Exhibit")
+        self.assertEqual(words[3]["word"], "5")
+
 if __name__ == '__main__':
     unittest.main()
+

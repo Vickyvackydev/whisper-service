@@ -19,7 +19,7 @@ class WorkerConfig:
     WHISPER_CPU_THREADS: int = int(os.getenv("WHISPER_CPU_THREADS", "4"))
     WHISPER_INITIAL_PROMPT: str = os.getenv(
         "WHISPER_INITIAL_PROMPT",
-        "Suit No. 5, 5A, Suit No. FHC/ABJ/CS/55/2024, Court 1, Order 5 Rule 6(d), Exhibit 1A, Section 4, Count 1, page 10, paragraph 3, No. 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 2024, 2025, 2026. Court, Plaintiff, Defendant, Counsel, Your Lordship, Milord, My Lord."
+        "Suit No. FHC/ABJ/CS/55/2024. Plaintiff/Defendant, Claimant/Respondent, Appellant/Appellee. Exhibit 1, Exhibit A, Exhibits 1 and 2. As the Court pleases, may it please the Court, much obliged, my learned colleague. Your Lordship, Your Ladyship, Your Honour, Learned Silk, Learned Counsel, Chief Judge. Inter alia, locus standi, res judicata, prima facie, subjudice, ultra vires, mutatis mutandis, ratio decidendi, Ex Parte, In Limine, suo motou. Affidavit, Originating Summons, Writ of Summons, Certified True Copy, Cross-Examination, Examination-in-Chief, allocutus, statute-barred."
     )
     
     # Speaker Diarization

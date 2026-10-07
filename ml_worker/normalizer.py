@@ -28,6 +28,8 @@ UNITS = {
 
 NUM_PATTERN_STR = r'(?:zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|(?:twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety)(?:[\s-](?:one|two|three|four|five|six|seven|eight|nine))?|\d+)'
 
+EXHIBIT_ID_PATTERN = rf'(?:{NUM_PATTERN_STR}(?:[\s-]?[A-Za-z])?|[A-Za-z]\b|[A-Za-z]{{1,3}}\d+)'
+
 RATE_OR_TIME_NOUNS = {
     "day", "days", "week", "weeks", "month", "months", "year", "years",
     "time", "times", "minute", "minutes", "second", "seconds",
@@ -57,6 +59,9 @@ def is_number_or_word(s: str) -> bool:
         return True
     return False
 
+def clean_token(s: str) -> str:
+    return str(s).strip(PUNCT_CHARS).lower()
+
 def apply_proper_case(token: str, proper_word: str) -> str:
     if not token:
         return proper_word
@@ -72,53 +77,262 @@ def apply_proper_case(token: str, proper_word: str) -> str:
         suffix = suffix[1:]
     return f"{prefix}{proper_word}{suffix}"
 
-def clean_token(s: str) -> str:
-    return str(s).strip(PUNCT_CHARS).lower()
 
-COURT_REPLACEMENTS = [
-    # Honorifics & Court Address
-    (r'(?i)\bmy\s+lord\b', 'My Lord'),
-    (r'(?i)\bmilord\b', 'My Lord'),
-    (r'(?i)\bme\s+lord\b', 'My Lord'),
-    (r'(?i)\bmy\s+noble\s+lord\b', 'My Noble Lord'),
-    (r'(?i)\byour\s+h(?:onou?r)\b', 'Your Honour'),
-    (r'(?i)\byour\s+lordship\b', 'Your Lordship'),
-    (r'(?i)\byour\s+lordships\b', 'Your Lordships'),
-    (r'(?i)\byour\s+ladyship\b', 'Your Ladyship'),
-    (r'(?i)\byour\s+ladyships\b', 'Your Ladyships'),
-    (r'(?i)\byour\s+worship\b', 'Your Worship'),
-    (r'(?i)\byour\s+highness\b', 'Your Highness'),
-    (r'(?i)\blearned\s+silk\b', 'Learned Silk'),
-    (r'(?i)\blearned\s+friend\b', 'Learned Friend'),
-    (r'(?i)\blearned\s+counsel\b', 'Learned Counsel'),
-    (r'(?i)\blearned\s+colleague\b', 'Learned Colleague'),
-    (r'(?i)\bas\s+the\s+court\s+pleases\b', 'As the Court pleases'),
-    (r'(?i)\bas\s+(?:you\s+call|equal)\s+places?\b', 'As the Court pleases'),
-    (r'(?i)\bcall\s+places?\b', 'Court pleases'),
-    (r'(?i)\bmay\s+it\s+please\s+the\s+court\b', 'May it please the Court'),
-    (r'(?i)\bsenior\s+advocate\s+of\s+nigeria\b', 'Senior Advocate of Nigeria'),
-    (r'(?i)\bmotion\s+on\s+notice\b', 'Motion on Notice'),
-    (r'(?i)\bmotion\s+and\s+notice\b', 'Motion on Notice'),
-    (r'(?i)\bmotion\s+ex\s+parte\b', 'Motion Ex Parte'),
-    (r'(?i)\b(?:right|rate)\s+of\s+(?:summons|someone\'?s)\b', 'writ of summons'),
-    (r'(?i)\bfrontogect\b', 'front-loaded'),
-    (r'(?i)\bfront(?:al)?[\s-]+(?:ended|layer|dead|loaded)\s+processes\b', 'front-loaded processes'),
-    (r'(?i)\bfront[\s-]+(?:ended|layer|dead|loaded)\b', 'front-loaded'),
-    (r'(?i)\bsubsets?\s+service\b', 'substituted service'),
-    (r'(?i)\binterpleader\s+summon\b', 'interpleader summons'),
-    (r'(?i)\b(?:uncom|outcome|ancor)\s+proceedings\b', 'ongoing proceedings'),
-    (r'(?i)\b(?:Lord\s+)?Justice\s+Said(?:\s+you)?\b', 'Justice Saidu'),
-    (r'(?i)\b(?:Lord\s+)?Justice\s+(?:Seydoux|Seyidu|Seydu|Zeydo)\b', 'Justice Saidu'),
-    (r'(?i)\b(?:Seydoux|Seyidu|Seydu|Zeydo)\b', 'Saidu'),
-    (r'(?i)\bMr\.?\s+Komolafe\b', 'Mr. Komolafe'),
-    (r'(?i)\bKamolafe\b', 'Komolafe'),
-    (r'(?i)\badjourned\s+for\s+mentioned\b', 'adjourned for mention'),
-    (r'(?i)\bEU\s+health\b', 'ill-health'),
-    (r'(?i)\bEU\s+Health\b', 'Ill-health'),
-    (r'(?i)\bOrder\s+(?:8|eight)\s+rule\s+(?:6|six)\s*d\b', 'Order 8 Rule 6(d)'),
-    (r'(?i)\brule\s+(?:6|six)\s*d\b', 'Rule 6(d)'),
-    (r'(?i)\b(?:6|six)\s*d\b', '6(d)'),
+# ==============================================================================
+# CANONICAL COURTROOM REPLACEMENTS & PHRASES
+# ==============================================================================
+# Rules structure: (pattern, canonical_replacement, is_adaptive)
+# - is_adaptive=True: When at sentence start, capitalizes the first character;
+#                     otherwise preserves canonical casing (e.g. 'without prejudice').
+# - is_adaptive=False: Always preserves the exact canonical casing (e.g. 'Learned Counsel').
+
+COURT_RULES = [
+    # --------------------------------------------------------------------------
+    # 1. Judicial Decorum, Honorifics & Court Address
+    # --------------------------------------------------------------------------
+    (r'(?i)\bas\s+the\s+court\s+pleases\b', 'as the Court pleases', True),
+    (r'(?i)\bas\s+(?:you\s+call|equal)\s+places?\b', 'as the Court pleases', True),
+    (r'(?i)\bcall\s+places?\b', 'Court pleases', False),
+    (r'(?i)\bmay\s+it\s+please\s+the\s+court\b', 'may it please the Court', True),
+    (r'(?i)\bmay\s+it\s+please\b(?!\s+the\s+court\b)', 'may it please', True),
+    (r'(?i)\bmuch\s+obliged\b', 'much obliged', True),
+    (r'(?i)\b(?:my|me)\s+learned\s+colleague\b', 'my learned colleague', True),
+    (r'(?i)\b(?:my|me)\s+noble\s+lordship\b', 'My Noble Lordship', False),
+    (r'(?i)\b(?:my|me)\s+noble\s+lord\b', 'My Noble Lord', False),
+    (r'(?i)\bno\s+objection\b', 'No objection', False),
+    (r'(?i)\bhonou?rable\s+court\b', 'Honourable Court', False),
+    (r'(?i)\byour\s+honor\b', 'Your Honor', False),
+    (r'(?i)\byour\s+honour\b', 'Your Honour', False),
+    (r'(?i)\byour\s+ladyships\b', 'Your Ladyships', False),
+    (r'(?i)\byour\s+ladyship\b', 'Your Ladyship', False),
+    (r'(?i)\byour\s+lordships\b', 'Your Lordships', False),
+    (r'(?i)\byour\s+lordship\b', 'Your Lordship', False),
+    (r'(?i)\byour\s+worship\b', 'Your Worship', False),
+    (r'(?i)\byour\s+highness\b', 'Your Highness', False),
+    (r'(?i)\blearned\s+silk\b', 'Learned Silk', False),
+    (r'(?i)\blearned\s+friend\b', 'Learned Friend', False),
+    (r'(?i)\blearned\s+counsel\b', 'Learned Counsel', False),
+    (r'(?i)\bsenior\s+advocate\s+of\s+nigeria\b', 'Senior Advocate of Nigeria', False),
+    (r'(?i)\bmilord\b', 'My Lord', False),
+    (r'(?i)\bme\s+lord\b', 'My Lord', False),
+
+    # --------------------------------------------------------------------------
+    # 2. Judicial Officers & Court Personnel
+    # --------------------------------------------------------------------------
+    (r'(?i)\bdirector\s+of\s+public\s+prosecutions\b', 'Director of Public Prosecutions', False),
+    (r'(?i)\battorney\s+general\b', 'Attorney General', False),
+    (r'(?i)\bsolicitor\s+general\b', 'Solicitor General', False),
+    (r'(?i)\bchief\s+justice\b', 'Chief Justice', False),
+    (r'(?i)\bchief\s+judge\b', 'Chief Judge', False),
+    (r'(?i)\bpresiding\s+judge\b', 'Presiding Judge', False),
+    (r'(?i)\bsenior\s+judge\b', 'Senior Judge', False),
+    (r'(?i)\bchief\s+registrar\b', 'Chief Registrar', False),
+    (r'(?i)\bdeputy\s+registrar\b', 'Deputy Registrar', False),
+    (r'(?i)\bdeputy\s+sheriff\b', 'Deputy Sheriff', False),
+    (r'(?i)\blegal\s+practitioner\b', 'legal practitioner', False),
+    (r'(?i)\bsolicitor\b(?!\s+general)', 'solicitor', False),
+
+    # --------------------------------------------------------------------------
+    # 3. Parties to a Suit
+    # --------------------------------------------------------------------------
+    (r'(?i)\bdefence\s+witness\b', 'Defence Witness', False),
+    (r'(?i)\bdefense\s+witness\b', 'Defence Witness', False),
+    (r'(?i)\bprosecution\s+witness\b', 'Prosecution Witness', False),
+    (r'(?i)\bjudgment\s+creditor\b', 'Judgment Creditor', False),
+    (r'(?i)\bjudgment\s+debtor\b', 'Judgment Debtor', False),
+    (r'(?i)\bcounter[\s-]+claimant\b', 'Counter-Claimant', False),
+    (r'(?i)\bco[\s-]+defendant\b', 'Co-Defendant', False),
+    (r'(?i)\bco[\s-]+plaintiff\b', 'Co-Plaintiff', False),
+    (r'(?i)\bco[\s-]+respondent\b', 'Co-Respondent', False),
+
+    # --------------------------------------------------------------------------
+    # 4. Courts & Judicial Bodies
+    # --------------------------------------------------------------------------
+    (r'(?i)\bnational\s+industrial\s+court\b', 'National Industrial Court', False),
+    (r'(?i)\bfederal\s+high\s+court\b', 'Federal High Court', False),
+    (r'(?i)\bstate\s+high\s+court\b', 'State High Court', False),
+    (r'(?i)\bcourt\s+of\s+appeal\b', 'Court of Appeal', False),
+    (r'(?i)\bcourt\s+of\s+arbitration\b', 'Court of Arbitration', False),
+    (r'(?i)\bappellate\s+court\b', 'Appellate Court', False),
+    (r'(?i)\bcustomary\s+court\b', 'Customary Court', False),
+    (r'(?i)\bindustrial\s+court\b', 'Industrial Court', False),
+    (r'(?i)\blower\s+court\b', 'Lower Court', False),
+    (r'(?i)\bmagistrate(?:\'s)?\s+court\b', 'Magistrate Court', False),
+    (r'(?i)\bmatrimonial\s+court\b', 'Matrimonial Court', False),
+    (r'(?i)\bsupreme\s+court\b', 'Supreme Court', False),
+    (r'(?i)\bvacation\s+court\b', 'Vacation Court', False),
+    (r'(?i)\bhigh\s+court\b', 'High Court', False),
+    (r'(?i)\bin\s+chambers\b', 'In Chambers', False),
+    (r'(?i)\b(?:at|the)\s+bar\b', lambda m: m.group(0).split()[0] + ' Bar', False),
+    (r'(?i)\b(?:on|the)\s+bench\b', lambda m: m.group(0).split()[0] + ' Bench', False),
+
+    # --------------------------------------------------------------------------
+    # 5. Pleadings, Motions & Documents
+    # --------------------------------------------------------------------------
+    (r'(?i)\baffidavit\s+of\s+service\b', 'Affidavit of Service', False),
+    (r'(?i)\bcounter[\s-]+affidavit\b', 'Counter-Affidavit', False),
+    (r'(?i)\bfurther\s+affidavit\b', 'Further Affidavit', False),
+    (r'(?i)\bappellant(?:\'s)?\s+brief\b', "Appellant's Brief", False),
+    (r'(?i)\brespondent(?:\'s)?\s+brief\b', "Respondent's Brief", False),
+    (r'(?i)\bmemorandum\s+of\s+appeal\b', 'Memorandum of Appeal', False),
+    (r'(?i)\bnotice\s+of\s+appeal\b', 'Notice of Appeal', False),
+    (r'(?i)\boriginating\s+motion\b', 'Originating Motion', False),
+    (r'(?i)\boriginating\s+service\b', 'Originating Service', False),
+    (r'(?i)\boriginating\s+summons\b', 'Originating Summons', False),
+    (r'(?i)\bpower\s+of\s+attorney\b', 'Power of Attorney', False),
+    (r'(?i)\breport\s+of\s+service\b', 'Report of Service', False),
+    (r'(?i)\breport\s+of\s+settlement\b', 'Report of Settlement', False),
+    (r'(?i)\bstatement\s+of\s+claim\b', 'Statement of Claim', False),
+    (r'(?i)\bstatement\s+of\s+defen[sc]e\b', 'Statement of Defence', False),
+    (r'(?i)\bstatement\s+on\s+oath\b', 'Statement on Oath', False),
+    (r'(?i)\bstatutory\s+notice\b', 'Statutory Notice', False),
+    (r'(?i)\b(?:writ|right|rate)\s+of\s+(?:summons|someone\'?s)\b', 'Writ of Summons', False),
+    (r'(?i)\bwritten\s+address\b', 'Written Address', False),
+    (r'(?i)\bcause\s+list\b', 'Cause List', False),
+    (r'(?i)\bcounter[\s-]+claim\b', 'Counterclaim', False),
+    (r'(?i)\brecord\s+of\s+proceedings\b', 'record of proceedings', False),
+    (r'(?i)\bsubpoena\b', 'subpoena', False),
+    (r'(?i)\bgazette\b', 'gazette', False),
+
+    # --------------------------------------------------------------------------
+    # 6. Orders, Injunctions & Judgments
+    # --------------------------------------------------------------------------
+    (r'(?i)\binterlocutory\s+injunction\b', 'Interlocutory Injunction', False),
+    (r'(?i)\bconsent\s+judgment\b', 'Consent Judgment', False),
+    (r'(?i)\bconsent\s+order\b', 'Consent Order', False),
+    (r'(?i)\bdeclaratory\s+relief\b', 'Declaratory Relief', False),
+    (r'(?i)\bdefault\s+judgment\b', 'Default Judgment', False),
+    (r'(?i)\bgarnishee\s+order\b', 'Garnishee Order', False),
+    (r'(?i)\bmotion\s+ex\s+parte\b', 'Motion Ex Parte', False),
+    (r'(?i)\bmotion\s+(?:on|and)\s+notice\b', 'Motion on Notice', False),
+    (r'(?i)\border\s+of\s+court\b', 'Order of Court', False),
+    (r'(?i)\bperpetual\s+injunction\b', 'Perpetual Injunction', False),
+    (r'(?i)\bremand\s+order\b', 'Remand Order', False),
+    (r'(?i)\bstay\s+of\s+execution\b', 'Stay of Execution', False),
+    (r'(?i)\bstay\s+of\s+proceedings\b', 'Stay of Proceedings', False),
+    (r'(?i)\bsummary\s+judgment\b', 'Summary Judgment', False),
+    (r'(?i)\binterlocutory\b(?!\s+injunction\b)', 'interlocutory', False),
+    (r'(?i)\bordered\s+as\s+prayed\b', 'ordered as prayed', True),
+
+    # --------------------------------------------------------------------------
+    # 7. Court Proceedings & Trial Terms
+    # --------------------------------------------------------------------------
+    (r'(?i)\bcertified\s+true\s+copy\b', 'Certified True Copy', False),
+    (r'(?i)\bexamination[\s-]+in[\s-]+chief\b', 'Examination-in-Chief', False),
+    (r'(?i)\bcross[\s-]+examination\b', 'Cross-Examination', False),
+    (r'(?i)\bcross[\s-]+examine\b', 'cross-examine', False),
+    (r'(?i)\bre[\s-]+examination\b', 'Re-examination', False),
+    (r'(?i)\bpre[\s-]+trial\b', 'Pre-trial', False),
+    (r'(?i)\bpart[\s-]+heard\b', 'part-heard', False),
+    (r'(?i)\bfrontogect\b', 'front-loaded', False),
+    (r'(?i)\bfront(?:al)?[\s-]+(?:ended|layer|dead|loaded)\s+processes\b', 'front-loaded processes', False),
+    (r'(?i)\bfront[\s-]+(?:ended|layer|dead|loaded)\b', 'front-loaded', False),
+    (r'(?i)\bfront[\s-]+load\b', 'front-load', False),
+    (r'(?i)\b(?:substituted|subsets?)\s+service\b', 'substituted service', False),
+    (r'(?i)\badjourned\s+for\s+mentioned\b', 'adjourned for mention', False),
+    (r'(?i)\badjourned\s+date\b', 'adjourned date', False),
+    (r'(?i)\badjournment\b', 'adjournment', False),
+    (r'(?i)\baffixture\b', 'affixture', False),
+    (r'(?i)\bappearances\b', 'appearances', False),
+    (r'(?i)\bappearance\b', 'appearance', False),
+    (r'(?i)\badmissibility\b', 'admissibility', False),
+    (r'(?i)\bonus\b', 'onus', False),
+    (r'(?i)\boverruled\b', 'overruled', False),
+    (r'(?i)\bruling\b', 'Ruling', False),
+    (r'(?i)\binterpleader\s+summon\b', 'interpleader summons', False),
+    (r'(?i)\b(?:uncom|outcome|ancor)\s+proceedings\b', 'ongoing proceedings', False),
+
+    # --------------------------------------------------------------------------
+    # 8. Latin Maxims & Legal Doctrines
+    # --------------------------------------------------------------------------
+    (r'(?i)\bex[\s-]+parte\b', 'Ex Parte', False),
+    (r'(?i)\bin[\s-]+limine\b', 'In Limine', False),
+    (r'(?i)\bper\s+se\b', 'Per Se', False),
+    (r'(?i)\ballocutus\b', 'allocutus', False),
+    (r'(?i)\bestoppel\b', 'estoppel', False),
+    (r'(?i)\bstatute[\s-]+barred\b', 'statute-barred', False),
+    (r'(?i)\binter[\s-]+alia\b', 'inter alia', False),
+    (r'(?i)\blocus\s+in\s+quo\b', 'locus in quo', False),
+    (r'(?i)\blocus\s+standi\b', 'locus standi', False),
+    (r'(?i)\bmutatis\s+mutandis\b', 'mutatis mutandis', False),
+    (r'(?i)\bobiter\s+dictum\b', 'obiter dictum', False),
+    (r'(?i)\bprima\s+facie\b', 'prima facie', False),
+    (r'(?i)\bratio\s+decidendi\b', 'ratio decidendi', False),
+    (r'(?i)\bres\s+judicata\b', 'res judicata', False),
+    (r'(?i)\bsub[\s-]?judice\b', 'subjudice', False),
+    (r'(?i)\bsuo\s+mot(?:ou|u)\b', 'suo motou', False),
+    (r'(?i)\bultra\s+vires\b', 'ultra vires', False),
+
+    # --------------------------------------------------------------------------
+    # 9. Formal Connectives
+    # --------------------------------------------------------------------------
+    (r'(?i)\baforementioned\b', 'aforementioned', False),
+    (r'(?i)\baforesaid\b', 'aforesaid', False),
+    (r'(?i)\bwhereof\b', 'Whereof', False),
+    (r'(?i)\bwith\s+due\s+respect\b', 'with due respect', True),
+    (r'(?i)\bwithout\s+prejudice\b', 'without prejudice', True),
+
+    # --------------------------------------------------------------------------
+    # 10. Specific Names & Common Nigerian Court Entities
+    # --------------------------------------------------------------------------
+    (r'(?i)\b(?:Lord\s+)?Justice\s+Said(?:\s+you)?\b', 'Justice Saidu', False),
+    (r'(?i)\b(?:Lord\s+)?Justice\s+(?:Seydoux|Seyidu|Seydu|Zeydo)\b', 'Justice Saidu', False),
+    (r'(?i)\b(?:Seydoux|Seyidu|Seydu|Zeydo)\b', 'Saidu', False),
+    (r'(?i)\bMr\.?\s+Komolafe\b', 'Mr. Komolafe', False),
+    (r'(?i)\bKamolafe\b', 'Komolafe', False),
+    (r'(?i)\bEU\s+health\b', 'ill-health', True),
+    (r'(?i)\bOrder\s+(?:8|eight)\s+rule\s+(?:6|six)\s*d\b', 'Order 8 Rule 6(d)', False),
+    (r'(?i)\brule\s+(?:6|six)\s*d\b', 'Rule 6(d)', False),
+    (r'(?i)\b(?:6|six)\s*d\b', '6(d)', False),
 ]
+
+# Standalone single-word court roles and entities that should be capitalized
+COURT_TITLE_WORDS = {
+    "accused": "Accused",
+    "appellant": "Appellant",
+    "appellee": "Appellee",
+    "applicant": "Applicant",
+    "claimant": "Claimant",
+    "defendant": "Defendant",
+    "deponent": "Deponent",
+    "garnishee": "Garnishee",
+    "petitioner": "Petitioner",
+    "plaintiff": "Plaintiff",
+    "prosecution": "Prosecution",
+    "respondent": "Respondent",
+    "surety": "Surety",
+    "witness": "Witness",
+    "bailiff": "Bailiff",
+    "barrister": "Barrister",
+    "clerk": "Clerk",
+    "counsel": "Counsel",
+    "judge": "Judge",
+    "justice": "Justice",
+    "magistrate": "Magistrate",
+    "registrar": "Registrar",
+    "sheriff": "Sheriff",
+    "chamber": "Chamber",
+    "courtroom": "Courtroom",
+    "crown": "Crown",
+    "registry": "Registry",
+    "tribunal": "Tribunal",
+    "affidavit": "Affidavit",
+    "summons": "Summons",
+    "writ": "Writ",
+    "ruling": "Ruling",
+    "whereof": "Whereof",
+    "milord": "My Lord",
+    "lord": "Lord",
+    "lords": "Lords",
+    "lordship": "Lordship",
+    "lordships": "Lordships",
+    "ladyship": "Ladyship",
+    "ladyships": "Ladyships",
+    "worship": "Worship",
+    "highness": "Highness",
+    "honour": "Honour",
+    "honor": "Honour",
+}
 
 PRONOUN_I_REPLACEMENTS = [
     (r'\bi\b', 'I'),
@@ -128,19 +342,47 @@ PRONOUN_I_REPLACEMENTS = [
     (r"\bi'd\b", "I'd"),
 ]
 
+def apply_court_rules(text: str) -> str:
+    """
+    Applies courtroom phrase replacements with sentence-start awareness for conversational phrases.
+    """
+    for item in COURT_RULES:
+        pattern = item[0]
+        replacement = item[1]
+        is_adaptive = item[2] if len(item) > 2 else False
+
+        if callable(replacement):
+            text = re.sub(pattern, replacement, text)
+        elif is_adaptive:
+            def repl_adaptive(m, rep=replacement):
+                start_idx = m.start()
+                prefix = text[:start_idx].rstrip()
+                is_start = not prefix or prefix[-1] in ('.', '!', '?', ':', '\n')
+                if is_start and rep:
+                    return rep[0].upper() + rep[1:]
+                return rep
+            text = re.sub(pattern, repl_adaptive, text)
+        else:
+            text = re.sub(pattern, replacement, text)
+
+    return text
+
 def normalize_case_numbers_and_slashes(text: str) -> str:
     if not text:
         return text
-    
+
+    # --------------------------------------------------------------------------
     # 0. Normalize suit numbers and court identifiers
-    # e.g. "suit number", "suits number", "suit no", "suits no" -> "Suit No."
+    # --------------------------------------------------------------------------
     curr = re.sub(r'(?i)\b(?:suits?)\s+(?:numbers?|no\.?)\b', 'Suit No.', text)
     curr = re.sub(r'(?i)\bcase\s+(?:numbers?|no\.?)\b', 'Case No.', curr)
     curr = re.sub(r'(?i)\bcharge\s+(?:numbers?|no\.?)\b', 'Charge No.', curr)
     curr = re.sub(r'(?i)\bappeal\s+(?:numbers?|no\.?)\b', 'Appeal No.', curr)
     curr = re.sub(r'(?i)\bmatter\s+(?:numbers?|no\.?)\b', 'Matter No.', curr)
 
+    # --------------------------------------------------------------------------
     # 1. Year pronunciations: twenty nineteen -> 2019, twenty twenty-four -> 2024, etc.
+    # --------------------------------------------------------------------------
     year_map = [
         (r'(?i)\btwenty\s+(?:nineteen|19)\b', '2019'),
         (r'(?i)\btwenty\s+(?:twenty-one|twenty\s+one|21)\b', '2021'),
@@ -175,134 +417,203 @@ def normalize_case_numbers_and_slashes(text: str) -> str:
         curr
     )
 
-    # 2. Repeatedly resolve slashes between alphanumeric terms (e.g. FHC / L / CS / 485 / 2026 -> FHC/L/CS/485/2026)
+    # --------------------------------------------------------------------------
+    # 2. Slashes: "The word slash should appear as / (no space before and after)"
+    # --------------------------------------------------------------------------
+    # Replace the word "slash" (with optional dashes or spaces around it) with '/'
+    curr = re.sub(r'[\s-]*(?i:\bslash\b)[\s-]*', '/', curr)
+
+    # Repeatedly resolve slashes between alphanumeric terms (e.g. FHC / L / CS / 485 / 2026 -> FHC/L/CS/485/2026)
     prev = None
     while prev != curr:
         prev = curr
         curr = re.sub(
-            r'([A-Za-z0-9\.]+)[\s-]*(?:slash|Slash|\/|\\)[\s-]*([A-Za-z0-9\.]+)',
+            r'([A-Za-z0-9\.]+)[\s-]*(?:/|\\)[\s-]*([A-Za-z0-9\.]+)',
             r'\1/\2',
             curr
         )
-    
-    # 3. Handle standalone "-slash-" or "-slash " or " slash-"
-    curr = re.sub(r'[\s-]*(?:slash|Slash)[\s-]+', '/', curr)
 
-    # 4. Collapse multiple spaces around remaining slashes if any
+    # Clean any remaining spaces around slashes: no space before and after
     curr = re.sub(r'\s*/\s*', '/', curr)
+    curr = re.sub(r'/+', '/', curr)
 
-    # 5. Clean up legal misrecognitions & court honorifics
-    for pattern, replacement in COURT_REPLACEMENTS:
-        curr = re.sub(pattern, replacement, curr)
+    # --------------------------------------------------------------------------
+    # 3. Format Slashed Tokens (suit numbers vs regular words)
+    # --------------------------------------------------------------------------
+    def format_slashed_token(m):
+        raw = m.group(1)
+        parts = raw.split('/')
+        new_parts = []
+        has_digits = any(p.strip().isdigit() or p.strip().lower() in NUMBER_WORDS for p in parts)
+        has_suit_acronyms = any(p.strip().lower() in ('fhc', 'nicn', 'ca', 'sc', 'cs', 'cr', 'abj', 'l', 'm', 'cv') for p in parts)
+        is_suit_format = has_digits or has_suit_acronyms
 
-    # 6. Number + letter combinations: e.g. "five a" / "5 a" / "five A" / "5 A" / "five-a" -> "5A"
+        for p in parts:
+            p_clean = p.strip()
+            p_lower = p_clean.lower()
+            if p_lower in NUMBER_WORDS:
+                new_parts.append(str(NUMBER_WORDS[p_lower]))
+            elif p_lower in COURT_TITLE_WORDS:
+                new_parts.append(COURT_TITLE_WORDS[p_lower])
+            elif is_suit_format and (len(p_clean) <= 4 or p_clean.isupper()):
+                new_parts.append(p_clean.upper())
+            else:
+                new_parts.append(p_clean)
+        return "/".join(new_parts)
+
+    curr = re.sub(
+        r'\b([A-Za-z0-9\.]+(?:/[A-Za-z0-9\.]+)+)\b',
+        format_slashed_token,
+        curr
+    )
+
+    # --------------------------------------------------------------------------
+    # 4. Canonical Courtroom Rules & Terminology
+    # --------------------------------------------------------------------------
+    curr = apply_court_rules(curr)
+
+    # --------------------------------------------------------------------------
+    # 5. Number + Letter Combinations: e.g. "five a" / "5 a" -> "5A"
+    # --------------------------------------------------------------------------
     def repl_num_letter(m):
         num_str = m.group(1)
         letter = m.group(2).upper()
         parsed_num = parse_spoken_number(num_str)
         return f"{parsed_num}{letter}"
 
-    # Letter B-Z: any number followed by optional hyphen/space and letter
+    # Letter B-Z
     curr = re.sub(
         rf'\b({NUM_PATTERN_STR})[\s-]*([b-zB-Z])\b',
         repl_num_letter,
         curr
     )
 
-    # Letter A: ensure not followed by words like day, week, month, year, time, etc.
+    # Letter A (avoid collision with duration/rate words)
     curr = re.sub(
         rf'\b({NUM_PATTERN_STR})[\s-]*([aA])\b(?!\s+(?:day|days|week|weeks|month|months|year|years|time|times|minute|minutes|second|seconds|dollar|dollars|pound|pounds|penny|pennies|cent|cents|naira|share|shares|head|heads|piece|pieces))',
         repl_num_letter,
         curr
     )
 
-    # 7. Spoken numbers after court / legal keywords
-    # "Suit No. five" -> "Suit No. 5"
-    # "Court five" -> "Court 5"
-    # "Order five" -> "Order 5"
-    # "Rule six" -> "Rule 6"
-    # "Exhibit five" -> "Exhibit 5"
-    # "number five" -> "No. 5"
-    # "No. five" -> "No. 5"
+    # --------------------------------------------------------------------------
+    # 6. Spoken numbers after court / legal keywords
+    # --------------------------------------------------------------------------
     def repl_prefix_num(m):
         prefix = m.group(1)
         num_str = m.group(2)
         parsed = parse_spoken_number(num_str)
-        if prefix.lower() in ("number", "no"):
+        prefix_lower = prefix.lower().strip()
+        if prefix_lower in ("number", "no", "no."):
             prefix = "No."
-        elif prefix.lower() == "court":
+        elif prefix_lower == "court":
             prefix = "Court"
-        elif prefix.lower() == "order":
+        elif prefix_lower == "order":
             prefix = "Order"
-        elif prefix.lower() == "rule":
+        elif prefix_lower == "rule":
             prefix = "Rule"
-        elif prefix.lower() == "exhibit":
-            prefix = "Exhibit"
-        elif prefix.lower() == "room":
+        elif prefix_lower in ("exhibit", "exhibits"):
+            prefix = "Exhibit" if prefix_lower == "exhibit" else "Exhibits"
+        elif prefix_lower == "room":
             prefix = "Room"
-        elif prefix.lower() == "suit":
-            prefix = "Suit"
+        elif prefix_lower in ("suit", "suit no."):
+            prefix = "Suit No."
+        elif prefix_lower.startswith("suit"):
+            prefix = "Suit No."
+        elif prefix_lower.startswith("case"):
+            prefix = "Case No."
+        elif prefix_lower.startswith("charge"):
+            prefix = "Charge No."
+        elif prefix_lower.startswith("appeal"):
+            prefix = "Appeal No."
+        elif prefix_lower.startswith("matter"):
+            prefix = "Matter No."
         return f"{prefix} {parsed}"
 
     curr = re.sub(
-        rf'\b(Suit\s+No\.?|Case\s+No\.?|Charge\s+No\.?|Appeal\s+No\.?|Matter\s+No\.?|Court|Room|Order|Rule|Exhibit|No\.?|number|paragraph|section|clause|count|page|item)\s+({NUM_PATTERN_STR})\b',
+        rf'\b(Suit\s+No\.?|Case\s+No\.?|Charge\s+No\.?|Appeal\s+No\.?|Matter\s+No\.?|Court|Room|Order|Rule|Exhibit|Exhibits|No\.?|number|paragraph|section|clause|count|page|item)\s+({NUM_PATTERN_STR})\b',
         repl_prefix_num,
         curr,
         flags=re.IGNORECASE
     )
 
-    # 8. Uppercase slashed suit numbers (e.g. fhc/l/cs/485/2026 -> FHC/L/CS/485/2026)
-    # Also resolve any number words inside slashed tokens (e.g. /FIVE/ -> /5/)
-    def format_slashed_suit(m):
-        raw = m.group(1)
-        parts = raw.split('/')
-        new_parts = []
-        for p in parts:
-            p_clean = p.strip()
-            if p_clean.lower() in NUMBER_WORDS:
-                new_parts.append(str(NUMBER_WORDS[p_clean.lower()]))
-            else:
-                new_parts.append(p_clean.upper())
-        return "/".join(new_parts)
-
+    # --------------------------------------------------------------------------
+    # 7. Exhibit & Exhibits capitalization rules
+    # "Exhibit (when a number follows it, it should be capital E)"
+    # "Exhibits (when numbers follow it, it should be capital E)"
+    # --------------------------------------------------------------------------
     curr = re.sub(
-        r'\b([A-Za-z0-9\.]+(?:/[A-Za-z0-9\.]+)+)\b',
-        format_slashed_suit,
+        rf'(?i)\bexhibits\b(?=\s+{EXHIBIT_ID_PATTERN})',
+        'Exhibits',
+        curr
+    )
+    curr = re.sub(
+        rf'(?i)\bexhibit\b(?=\s+{EXHIBIT_ID_PATTERN})',
+        'Exhibit',
         curr
     )
 
-    # 9. Capitalize standalone pronoun "I" and its common contractions
+    # Handle subsequent numbers in Exhibits sequences (e.g. Exhibits 1 and two -> Exhibits 1 and 2)
+    curr = re.sub(
+        rf'\b(Exhibits\s+(?:\d+|[A-Za-z0-9]+)\s+(?:and|to|through)\s+)({NUM_PATTERN_STR})\b',
+        lambda m: f"{m.group(1)}{parse_spoken_number(m.group(2))}",
+        curr,
+        flags=re.IGNORECASE
+    )
+
+    # If exhibit/exhibits is NOT followed by a number or exhibit identifier,
+    # lowercase it mid-sentence (capitalize at sentence start)
+    def repl_exhibit_no_num(m):
+        tok = m.group(1)
+        start_idx = m.start()
+        prefix = curr[:start_idx].rstrip()
+        is_start = not prefix or prefix[-1] in ('.', '!', '?', ':', '\n')
+        if is_start:
+            return tok[0].upper() + tok[1:].lower()
+        return tok.lower()
+
+    curr = re.sub(
+        rf'(?i)\b(exhibits?)\b(?!\s+{EXHIBIT_ID_PATTERN})',
+        repl_exhibit_no_num,
+        curr
+    )
+
+    # --------------------------------------------------------------------------
+    # 8. Capitalize Standalone Pronoun "I" and contractions
+    # --------------------------------------------------------------------------
     for pattern, replacement in PRONOUN_I_REPLACEMENTS:
         curr = re.sub(pattern, replacement, curr)
-        
-    # 10. Normalize 'My' casing: only capitalize in court honorifics ("My Lord", "My Ladyship", etc.) or at sentence start
+
+    # --------------------------------------------------------------------------
+    # 9. Normalize 'My' casing: only capitalize in court honorifics or sentence start
+    # --------------------------------------------------------------------------
     curr = normalize_my_casing(curr)
 
     return curr
 
-COURT_MY_TRAILS = {'lord', 'lords', 'lordship', 'lordships', 'ladyship', 'ladyships', 'noble'}
+
+COURT_MY_TRAILS = {'lord', 'lords', 'lordship', 'lordships', 'ladyship', 'ladyships'}
 
 def normalize_my_casing(text: str) -> str:
     """
     Normalizes 'my' / 'My' casing across text:
-    - Court honorifics ('My Lord', 'My Lords', 'My Noble Lord', 'My Ladyship', 'My Lordship') are always capitalized.
+    - Court honorifics ('My Lord', 'My Lords', 'My Ladyship', 'My Lordship') are capitalized.
+    - 'My Noble Lord', 'My Noble Lordship', 'My learned colleague' are capitalized at sentence start, lowercase 'my' mid-sentence.
     - 'My' at the beginning of a sentence is kept capitalized.
-    - Any individual 'My' appearing in the middle of a sentence (e.g. 'this is my client', 'in my view', 'that is my submission')
-      is lowercased to 'my'.
+    - Any individual 'My' appearing in the middle of a sentence is lowercased to 'my'.
     """
     if not text:
         return text
 
-    # 1. First ensure court honorifics with 'my' or 'me' are properly capitalized
+    # First ensure court honorifics with 'my' or 'me' are properly formatted
+    text = re.sub(r'(?i)\b(?:my|me)\s+noble\s+lordships?\b', lambda m: 'My Noble Lordships' if m.group(0).lower().endswith('s') else 'My Noble Lordship', text)
     text = re.sub(r'(?i)\b(?:my|me)\s+noble\s+lords?\b', lambda m: 'My Noble Lords' if m.group(0).lower().endswith('s') else 'My Noble Lord', text)
     text = re.sub(r'(?i)\b(?:my|me)\s+lords?\b', lambda m: 'My Lords' if m.group(0).lower().endswith('s') else 'My Lord', text)
     text = re.sub(r'(?i)\b(?:my|me)\s+lordships?\b', lambda m: 'My Lordships' if m.group(0).lower().endswith('s') else 'My Lordship', text)
     text = re.sub(r'(?i)\b(?:my|me)\s+ladyships?\b', lambda m: 'My Ladyships' if m.group(0).lower().endswith('s') else 'My Ladyship', text)
 
-    # 2. Tokenize by words and spaces, keeping punctuation
+    # Tokenize by words and spaces, keeping punctuation
     tokens = re.split(r'(\s+)', text)
     new_tokens = []
-    
     sentence_start = True
 
     for i, tok in enumerate(tokens):
@@ -312,33 +623,37 @@ def normalize_my_casing(text: str) -> str:
 
         clean = tok.strip(PUNCT_CHARS)
 
-        if clean == 'My':
-            # Check next non-space token
-            next_word_clean = ''
-            for j in range(i + 1, len(tokens)):
-                if not tokens[j].isspace() and tokens[j]:
-                    next_word_clean = tokens[j].strip(PUNCT_CHARS).lower()
-                    break
+        next_word_clean = ''
+        for j in range(i + 1, len(tokens)):
+            if not tokens[j].isspace() and tokens[j]:
+                next_word_clean = tokens[j].strip(PUNCT_CHARS).lower()
+                break
 
-            is_court_honorific = next_word_clean in COURT_MY_TRAILS
-            if not is_court_honorific and not sentence_start:
-                # Replace 'My' with 'my', preserving any punctuation around it
-                start_pos = tok.find('My')
-                if start_pos != -1:
-                    tok = tok[:start_pos] + 'my' + tok[start_pos + 2:]
+        if clean.lower() == 'my':
+            if next_word_clean in COURT_MY_TRAILS or next_word_clean == 'noble':
+                tok = apply_proper_case(tok, 'My')
+            elif next_word_clean == 'learned':
+                casing = 'My' if sentence_start else 'my'
+                tok = apply_proper_case(tok, casing)
+            elif not sentence_start:
+                tok = apply_proper_case(tok, 'my')
 
         new_tokens.append(tok)
         sentence_start = any(tok.rstrip(PUNCT_CHARS).endswith(p) or tok.endswith(p) for p in ('.', '?', '!'))
 
     return ''.join(new_tokens)
 
+
 def clean_word_token(word: str) -> str:
+    """
+    Cleans and standardizes an individual word token.
+    """
     if not word:
         return word
     clean = word.strip()
     lower = clean.lower()
 
-    # Normalize slash tokens
+    # Normalize slash tokens to '/'
     if lower in ("-slash", "slash-", "-slash-", "slash", "\\"):
         return "/"
 
@@ -359,24 +674,15 @@ def clean_word_token(word: str) -> str:
         return "I'd"
 
     # Known court keywords title-casing when appearing as standalone word tokens
-    court_title_map = {
-        "milord": "My Lord",
-        "lordship": "Lordship",
-        "lordships": "Lordships",
-        "ladyship": "Ladyship",
-        "ladyships": "Ladyships",
-        "worship": "Worship",
-        "highness": "Highness",
-        "honour": "Honour",
-        "honor": "Honour",
-    }
-    if lower in court_title_map:
-        return court_title_map[lower]
+    clean_stripped = lower.strip(PUNCT_CHARS)
+    if clean_stripped in COURT_TITLE_WORDS:
+        proper = COURT_TITLE_WORDS[clean_stripped]
+        return apply_proper_case(clean, proper)
 
     # Specific court acronyms
-    court_acronyms = {"fhc", "nicn", "san"}
-    if lower in court_acronyms:
-        return clean.upper()
+    court_acronyms = {"fhc", "nicn", "san", "sc", "ca"}
+    if clean_stripped in court_acronyms:
+        return apply_proper_case(clean, clean_stripped.upper())
 
     # Clean number+letter combinations like "5a" -> "5A", "5-a" -> "5A"
     clean_no_punct = clean.strip(PUNCT_CHARS)
@@ -389,13 +695,12 @@ def clean_word_token(word: str) -> str:
 
     return clean
 
+
 def merge_number_letter_words(words: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     Merges sequences of word tokens representing numbers + letter suffix:
     ['five', 'a'] -> ['5A']
     ['5', 'a'] -> ['5A']
-    ['five', 'b'] -> ['5B']
-    ['1', 'a'] -> ['1A']
     Preserves exact timing from the first token's start to the last token's end.
     """
     if not words:
@@ -410,7 +715,6 @@ def merge_number_letter_words(words: List[Dict[str, Any]]) -> List[Dict[str, Any
         curr_text = str(curr.get("word", "")).strip()
         curr_clean = clean_token(curr_text)
 
-        # Check if curr is a number (e.g. "5", "five") and next is a single letter (e.g. "a", "A", "b")
         if i + 1 < n and is_number_or_word(curr_clean):
             next_item = words[i+1]
             next_text = str(next_item.get("word", "")).strip()
@@ -419,7 +723,6 @@ def merge_number_letter_words(words: List[Dict[str, Any]]) -> List[Dict[str, Any
             is_valid_letter = False
             if len(next_clean) == 1 and next_clean.isalpha():
                 if next_clean == "a":
-                    # Check next word after 'a'
                     has_rate_word = False
                     if i + 2 < n:
                         after_clean = clean_token(str(words[i+2].get("word", "")))
@@ -456,10 +759,14 @@ def merge_number_letter_words(words: List[Dict[str, Any]]) -> List[Dict[str, Any
 
     return merged
 
+
 def merge_slashed_words(words: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
-    Merges sequences of word tokens that form slashed suit/case numbers, e.g.:
-    ['FHC', '/', 'L', '/', 'CS', '/', '485', '/', '2026'] -> ['FHC/L/CS/485/2026']
+    Merges sequences of word tokens separated by '/' into a single word token
+    with NO space before or after the slash, e.g.:
+    ['FHC', '/', 'ABJ', '/', 'CS', '/', '55', '/', '2024'] -> ['FHC/ABJ/CS/55/2024']
+    ['plaintiff', '/', 'defendant'] -> ['plaintiff/defendant']
+    ['one', '/', 'two'] -> ['1/2']
     Preserves exact timing from the first token's start to the last token's end.
     """
     if not words:
@@ -473,7 +780,6 @@ def merge_slashed_words(words: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         curr = words[i]
         curr_word = str(curr.get("word", "")).strip()
 
-        # Check if this token or the next token initiates a slash sequence
         is_slash_start = False
         if i + 2 < n and str(words[i+1].get("word", "")).strip() == "/":
             is_slash_start = True
@@ -505,10 +811,27 @@ def merge_slashed_words(words: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 else:
                     break
 
-            # Clean double slashes & uppercase suit numbers
-            combined_text = re.sub(r'/+', '/', combined_text).upper()
+            # Format the merged slashed token (suit number uppercase vs normal words)
+            parts = combined_text.split('/')
+            formatted_parts = []
+            has_digits = any(p.strip().isdigit() or p.strip().lower() in NUMBER_WORDS for p in parts)
+            has_suit_acronyms = any(p.strip().lower() in ('fhc', 'nicn', 'ca', 'sc', 'cs', 'cr', 'abj', 'l', 'm', 'cv') for p in parts)
+            is_suit_format = has_digits or has_suit_acronyms
+
+            for p in parts:
+                p_clean = p.strip()
+                if p_clean.lower() in NUMBER_WORDS:
+                    formatted_parts.append(str(NUMBER_WORDS[p_clean.lower()]))
+                elif is_suit_format and (len(p_clean) <= 4 or p_clean.isupper()):
+                    formatted_parts.append(p_clean.upper())
+                else:
+                    formatted_parts.append(p_clean)
+
+            final_text = "/".join(formatted_parts)
+            final_text = re.sub(r'/+', '/', final_text)
+
             merged.append({
-                "word": combined_text,
+                "word": final_text,
                 "start": start_time,
                 "end": end_time,
                 "score": score,
@@ -523,20 +846,29 @@ def merge_slashed_words(words: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
     return merged
 
+
 def normalize_segment(segment: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Normalizes a transcription segment:
+    - Cleans up full text according to courtroom rules, slashes, numbers, and decorum.
+    - Synchronizes individual word tokens, timestamps, and multi-word phrase casing.
+    """
     if "text" in segment and segment["text"]:
         segment["text"] = normalize_case_numbers_and_slashes(segment["text"])
-        
+
     if "words" in segment and segment["words"]:
         # 1. Clean individual word tokens
         for w in segment["words"]:
             if "word" in w and w["word"]:
                 w["word"] = clean_word_token(w["word"])
-        
-        # 2. Merge number + letter combinations (e.g. ['five', 'a'] -> ['5A'] or ['5', 'a'] -> ['5A'])
+
+        # 2. Merge number + letter combinations (e.g. ['5', 'a'] -> ['5A'])
         words = merge_number_letter_words(segment["words"])
 
-        # 3. Contextual honorific casing & court numbers for two-word/three-word sequences
+        # 3. Merge slash sequences into unified tokens without spaces (e.g. ['plaintiff', '/', 'defendant'] -> ['plaintiff/defendant'])
+        words = merge_slashed_words(words)
+
+        # 4. Contextual honorific casing & court numbers for two-word/three-word sequences
         for idx in range(len(words) - 1):
             w1_clean = clean_token(words[idx].get("word", ""))
             w2_clean = clean_token(words[idx+1].get("word", ""))
@@ -585,48 +917,28 @@ def normalize_segment(segment: Dict[str, Any]) -> Dict[str, Any]:
                 if (w1_clean in ("suit", "suits", "case", "charge", "appeal", "matter")) and (w2_clean in ("no", "number")) and is_number_or_word(w3_clean):
                     words[idx+2]["word"] = apply_proper_case(words[idx+2]["word"], parse_spoken_number(w3_clean))
 
-        # 4. Legal terminology corrections across words
+        # 5. Exhibit casing synchronization across word tokens
         for idx in range(len(words)):
             w_clean = clean_token(words[idx].get("word", ""))
-            if w_clean == "kamolafe":
-                words[idx]["word"] = apply_proper_case(words[idx]["word"], "Komolafe")
-            elif w_clean in ("seydoux", "seyidu", "seydu", "zeydo"):
-                words[idx]["word"] = apply_proper_case(words[idx]["word"], "Saidu")
-            elif w_clean == "frontogect":
-                words[idx]["word"] = apply_proper_case(words[idx]["word"], "front-loaded")
+            if w_clean in ("exhibit", "exhibits"):
+                has_num_follower = False
+                if idx + 1 < len(words):
+                    next_clean = clean_token(words[idx+1].get("word", ""))
+                    if is_number_or_word(next_clean) or re.match(r'^[a-zA-Z0-9]+$', next_clean):
+                        # Verify not a common non-identifier English word
+                        if next_clean not in ("was", "is", "were", "are", "marked", "tendered", "admitted", "in", "to", "by", "that", "this"):
+                            has_num_follower = True
 
-            if idx + 1 < len(words):
-                w1_clean = w_clean
-                w2_clean = clean_token(words[idx+1].get("word", ""))
-                if w1_clean in ("right", "rate") and w2_clean == "of" and idx + 2 < len(words) and (clean_token(words[idx+2].get("word", "")) == "summons" or clean_token(words[idx+2].get("word", "")).startswith("someone")):
-                    words[idx]["word"] = apply_proper_case(words[idx]["word"], "writ")
-                    words[idx+2]["word"] = apply_proper_case(words[idx+2]["word"], "summons")
-                elif w1_clean == "front" and (w2_clean in ("ended", "-ended", "layer", "-layer", "dead", "-dead", "loaded", "-loaded")):
-                    words[idx]["word"] = apply_proper_case(words[idx]["word"], "front-loaded")
-                    words[idx+1]["word"] = ""
-                elif w1_clean in ("front-ended", "front-layer", "front-dead", "front-loaded", "frontloaded"):
-                    words[idx]["word"] = apply_proper_case(words[idx]["word"], "front-loaded")
-                elif w1_clean in ("subsets", "subset") and w2_clean == "service":
-                    words[idx]["word"] = apply_proper_case(words[idx]["word"], "substituted")
-                elif w1_clean == "interpleader" and w2_clean == "summon":
-                    words[idx+1]["word"] = apply_proper_case(words[idx+1]["word"], "summons")
-                elif w1_clean in ("uncom", "outcome", "ancor") and w2_clean == "proceedings":
-                    words[idx]["word"] = apply_proper_case(words[idx]["word"], "ongoing")
-                elif (w1_clean in ("as", "equal") and w2_clean in ("equal", "call") and idx + 2 < len(words) and clean_token(words[idx+2].get("word", "")) in ("places", "place")):
-                    words[idx]["word"] = "As"
-                    words[idx+1]["word"] = "the"
-                    words[idx+2]["word"] = "Court pleases"
-                elif w1_clean == "justice" and w2_clean == "said" and idx + 2 < len(words) and clean_token(words[idx+2].get("word", "")) in ("you", "u"):
-                    words[idx+1]["word"] = "Saidu"
-                    words[idx+2]["word"] = ""
-                elif w1_clean == "justice" and w2_clean == "said":
-                    words[idx+1]["word"] = "Saidu"
-                elif w1_clean == "for" and w2_clean == "mentioned":
-                    words[idx+1]["word"] = apply_proper_case(words[idx+1]["word"], "mention")
+                proper_ex = "Exhibits" if w_clean == "exhibits" else "Exhibit"
+                if has_num_follower:
+                    words[idx]["word"] = apply_proper_case(words[idx]["word"], proper_ex)
+                else:
+                    # Check if sentence start
+                    is_start = (idx == 0) or any(words[idx-1]["word"].rstrip(PUNCT_CHARS).endswith(p) for p in ('.', '!', '?'))
+                    if not is_start:
+                        words[idx]["word"] = apply_proper_case(words[idx]["word"], w_clean.lower())
 
-        words = [w for w in words if w.get("word")]
-
-        # 5. Lowercase individual 'My' that is NOT at start of sentence and NOT part of an honorific
+        # 6. Lowercase individual 'My' that is NOT at start of sentence and NOT part of an honorific
         sentence_start = True
         for idx in range(len(words)):
             raw_w = words[idx].get("word", "")
@@ -642,8 +954,6 @@ def normalize_segment(segment: Dict[str, Any]) -> Dict[str, Any]:
 
             sentence_start = any(raw_w.rstrip(PUNCT_CHARS).endswith(p) or raw_w.endswith(p) for p in ('.', '?', '!'))
 
-        # 6. Merge slash tokens for suit numbers (e.g. FHC / L / CS / 485 / 2026 -> FHC/L/CS/485/2026)
-        segment["words"] = merge_slashed_words(words)
-                
-    return segment
+        segment["words"] = words
 
+    return segment
