@@ -108,7 +108,6 @@ def convert_to_wav_16k_mono(input_path: Path, output_dir: Path) -> Tuple[Path, f
                 duration = float(info.duration)
                 if duration > 0:
                     logger.info(f"Converted audio via FFmpeg: duration={duration:.2f}s, path={wav_path}")
-                    return wav_path, duration
         except Exception as ffmpeg_err:
             logger.warning(f"FFmpeg attempt failed ({ffmpeg_err}). Using PyAV fallback...")
 
