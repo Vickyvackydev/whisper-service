@@ -587,15 +587,20 @@ class InferencePipeline:
                         w["speaker"] = target
 
         # Pass 1: Universal Courtroom Rule: The Judge NEVER addresses themselves as "My Lord" or "As the Court pleases"
-        # If the Judge was acoustically misassigned to a segment with counsel honorifics, reassign to Counsel
+        # If the Judge was acoustically misassigned to a segment with counsel honorifics, restore actual counsel/speaker
         if counsel_spk is not None:
             for seg in processed_segments:
                 if judge_spk is not None and seg["speaker"] == judge_spk:
                     txt = seg["text"].lower()
                     if any(p.search(txt) for p in re_counsel_honorifics):
-                        seg["speaker"] = counsel_spk
+                        orig_speakers = [w.get("speaker") for w in seg.get("words", []) if w.get("speaker") and w.get("speaker") != judge_spk]
+                        if orig_speakers:
+                            chosen_spk = max(set(orig_speakers), key=orig_speakers.count)
+                            seg["speaker"] = chosen_spk
+                        else:
+                            seg["speaker"] = counsel_spk
                         for w in seg.get("words", []):
-                            w["speaker"] = counsel_spk
+                            w["speaker"] = seg["speaker"]
 
         # Pass 1B: Universal Courtroom Rule: Only the Bench issues judicial orders, maintenance directives, and contempt warnings
         if judge_spk is not None:
@@ -606,6 +611,56 @@ class InferencePipeline:
                         seg["speaker"] = judge_spk
                         for w in seg.get("words", []):
                             w["speaker"] = judge_spk
+
+        # Boundary Phrase Healing: Detect severed courtroom opening/closing phrases across segments
+        # e.g. seg[i-1] ends with "...hearing. As the" and seg[i] begins with "Court pleases."
+        # The trailing words ("As the") belong to seg[i] ("As the Court pleases.").
+        for i in range(1, len(processed_segments)):
+            prev_seg = processed_segments[i - 1]
+            curr_seg = processed_segments[i]
+            prev_words = prev_seg.get("words", [])
+            curr_words = curr_seg.get("words", [])
+
+            if not prev_words or not curr_words:
+                continue
+
+            # Check if prev_words has terminal punctuation followed by 1-3 trailing words
+            for cut_len in (3, 2, 1):
+                if len(prev_words) > cut_len:
+                    trail_words = prev_words[-cut_len:]
+                    lead_words = prev_words[:-cut_len]
+
+                    last_lead_txt = lead_words[-1].get("word", "").strip()
+                    has_terminal = any(last_lead_txt.endswith(p) for p in (".", "?", "!"))
+
+                    if has_terminal:
+                        trail_txt = " ".join(w.get("word", "").strip() for w in trail_words).lower()
+                        curr_head = " ".join(w.get("word", "").strip() for w in curr_words[:3]).lower()
+                        combined = f"{trail_txt} {curr_head}"
+
+                        is_severed_phrase = (
+                            ("as the court pleases" in combined) or
+                            ("as your lordship pleases" in combined) or
+                            ("may it please the court" in combined) or
+                            ("with due respect" in combined) or
+                            ("objection" in trail_txt and "my lord" in combined) or
+                            (trail_txt == "as the" and "court" in curr_head) or
+                            (trail_txt == "as" and "court pleases" in curr_head)
+                        )
+
+                        if is_severed_phrase:
+                            logger.info(f"Boundary Phrase Healing: moving '{trail_txt}' from seg {i-1} to seg {i}")
+                            for w in trail_words:
+                                w["speaker"] = curr_seg["speaker"]
+
+                            curr_seg["words"] = trail_words + curr_words
+                            curr_seg["start"] = trail_words[0]["start"]
+                            curr_seg["text"] = " ".join(w.get("word", "") for w in curr_seg["words"]).strip()
+
+                            prev_seg["words"] = lead_words
+                            prev_seg["end"] = lead_words[-1]["end"]
+                            prev_seg["text"] = " ".join(w.get("word", "") for w in prev_seg["words"]).strip()
+                            break
 
         # Pass 2: Conversational Alternation & Response Sandwiches
         SHORT_AFFIRMATIONS = {"sir?", "sir", "yes sir", "yes my lord", "no my lord", "as the court pleases"}
@@ -623,7 +678,7 @@ class InferencePipeline:
                 # When Counsel submits to the Bench, the preceding segment was the Judge
                 if i > 0 and RE_SUBMISSION.search(txt_clean):
                     prev_seg = processed_segments[i - 1]
-                    if prev_seg["speaker"] == counsel_spk:
+                    if prev_seg["speaker"] != judge_spk and prev_seg["speaker"] != seg["speaker"]:
                         prev_seg["speaker"] = judge_spk
 
                 # Case C: Clarification Sandwich ("Sir?", "My Lord?", "Pardon?")
@@ -644,13 +699,15 @@ class InferencePipeline:
                     gap = seg["start"] - prev_seg["end"]
                     prev_tokens = prev_seg["text"].lower().strip(".,!?;:\"' ").split()
                     prev_last_word = prev_tokens[-1] if prev_tokens else ""
-                    if gap <= 0.8 and prev_last_word in DANGLING_CONJUNCTIONS:
-                        first_word = seg["text"].lower().strip(".,!?;:\"' ").split()[0] if seg["text"].strip() else ""
-                        if first_word not in {"i", "my", "we", "no", "yes"}:
-                            if prev_seg["speaker"] == judge_spk and RE_JUDGE_DIRECTIVES.search(prev_seg["text"]):
-                                seg["speaker"] = judge_spk
-                            elif seg["speaker"] == counsel_spk and prev_seg["speaker"] == judge_spk:
-                                prev_seg["speaker"] = counsel_spk
+                    prev_ends_sentence = any(prev_seg["text"].strip().endswith(p) for p in (".", "?", "!"))
+                    if gap <= 0.8:
+                        if prev_last_word in DANGLING_CONJUNCTIONS or not prev_ends_sentence:
+                            first_word = seg["text"].lower().strip(".,!?;:\"' ").split()[0] if seg["text"].strip() else ""
+                            if first_word not in {"i", "my", "we", "no", "yes"}:
+                                if prev_seg["speaker"] == judge_spk and RE_JUDGE_DIRECTIVES.search(prev_seg["text"]):
+                                    seg["speaker"] = judge_spk
+                                elif not RE_JUDGE_DIRECTIVES.search(seg["text"]) and not RE_SUBMISSION.search(seg["text"]):
+                                    seg["speaker"] = prev_seg["speaker"]
 
                 # Case F: Short Affirmations ("Sir?", "Yes sir", "As the Court pleases")
                 if txt_clean in SHORT_AFFIRMATIONS and seg["speaker"] == judge_spk:

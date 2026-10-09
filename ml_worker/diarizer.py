@@ -551,21 +551,8 @@ class SpeakerDiarizer:
                 curr = to_merge[curr]
             return curr
 
-        # Pure Sequential Monologue Detection (Zero Conversational Returns)
-        # In a real conversation, speakers alternate (return_speaker_count >= 1).
-        # If returns == 0 and audio duration <= 60s, non-dominant sequential blocks are acoustic splits of one speaker reading/speaking continuously.
-        # NOTE: Dominance (>85%), fragment (<2s), and similarity (>=0.72) heuristics were removed per consultant recommendations
-        # to ensure that short interjections (e.g. mother's 1-2s remarks) and distinct room voices (father vs judge) are never merged.
-        if return_speaker_count == 0 and total_audio_dur <= 60.0 and n_speakers >= 2:
-            target = get_root_target(dominant)
-            target_centroid = speaker_centroids.get(target)
-            for spk in ranked_speakers:
-                if spk != target and spk not in to_merge:
-                    spk_centroid = speaker_centroids.get(spk)
-                    if target_centroid is not None and spk_centroid is not None and float(np.dot(target_centroid, spk_centroid)) < 0.75:
-                        continue
-                    to_merge[spk] = target
-                    logger.info(f"[CONSOLIDATION] Merging '{spk}' into dominant '{target}' — pure sequential short monologue (returns=0, dur={total_audio_dur:.1f}s)")
+        # Note: Monologue over-merging was removed to strictly preserve distinct speakers 
+        # (e.g. Judge, Registrar, Petitioner Counsel, Respondent Counsel) during short court appearances.
 
         # 5. Apply Merges
         merged_turns = []

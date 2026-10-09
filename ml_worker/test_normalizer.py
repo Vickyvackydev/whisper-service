@@ -340,6 +340,44 @@ class TestNormalizer(unittest.TestCase):
         self.assertEqual(words[2]["word"], "Exhibit")
         self.assertEqual(words[3]["word"], "5")
 
+    def test_user_reported_court_rules(self):
+        cases = [
+            # 1. Suit number hyphen to slash conversion
+            ("Suit No. E-57D-2023 between Peter and Christiana", "Suit No. E/57D/2023 between Peter and Christiana"),
+            ("Motion Expatate E-447M-2023 for substituted service", "Motion Ex Parte E/447M/2023 for substituted service"),
+            ("FHC-ABJ-CS-55-2024", "FHC/ABJ/CS/55/2024"),
+            ("E-57D-2023", "E/57D/2023"),
+
+            # 2. Calendar months capitalized
+            ("25th of march 2025 for continuation", "25th of March 2025 for continuation"),
+            ("adjourned to 10th of january 2024", "adjourned to 10th of January 2024"),
+            ("in december last year", "in December last year"),
+
+            # 3. Nigerian states capitalized
+            ("High Court of enugu state", "High Court of Enugu state"),
+            ("sitting in lagos", "sitting in Lagos"),
+            ("matter in akwa ibom state", "matter in Akwa Ibom state"),
+            ("in cross river state", "in Cross River state"),
+            ("Federal Capital Territory", "Federal Capital Territory"),
+
+            # 4. Criminal Code Law capitalized
+            ("pursuant to the criminal code law", "pursuant to the Criminal Code Law"),
+            ("under the criminal code", "under the Criminal Code"),
+            ("under penal code law", "under Penal Code Law"),
+
+            # 5. Objection, my Lord vs My Lord
+            ("that objection, My Lord.", "that objection, my Lord."),
+            ("Objection, my Lord. The evidence is hearsay.", "Objection, my Lord. The evidence is hearsay."),
+            ("My Lord, Petitioner is present in court.", "My Lord, Petitioner is present in court."),
+
+            # 6. Demand / Demands lowercase mid-sentence
+            ("The defense Demands that we file today.", "The defense demands that we file today."),
+            ("Demand must be served on time.", "Demand must be served on time."),
+        ]
+        for inp, expected in cases:
+            with self.subTest(inp=inp):
+                self.assertEqual(normalize_case_numbers_and_slashes(inp), expected)
+
 if __name__ == '__main__':
     unittest.main()
 

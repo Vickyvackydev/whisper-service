@@ -204,7 +204,17 @@ COURT_RULES = [
     (r'(?i)\bdefault\s+judgment\b', 'Default Judgment', False),
     (r'(?i)\bgarnishee\s+order\b', 'Garnishee Order', False),
     (r'(?i)\bmotion\s+ex\s+parte\b', 'Motion Ex Parte', False),
+    (r'(?i)\bmotion\s+expatate\b', 'Motion Ex Parte', False),
+    (r'(?i)\bexpatate\b', 'ex parte', False),
     (r'(?i)\bmotion\s+(?:on|and)\s+notice\b', 'Motion on Notice', False),
+    (r'(?i)\bcriminal\s+code\s+law\b', 'Criminal Code Law', False),
+    (r'(?i)\bcriminal\s+code\b', 'Criminal Code', False),
+    (r'(?i)\bpenal\s+code\s+law\b', 'Penal Code Law', False),
+    (r'(?i)\bpenal\s+code\b', 'Penal Code', False),
+    (r'(?i)\bobjection,?\s+(?:my|me)\s+lord\b', 'objection, my Lord', True),
+    (r'(?i)\bakwa\s+ibom\b', 'Akwa Ibom', False),
+    (r'(?i)\bcross\s+river\b', 'Cross River', False),
+    (r'(?i)\bfederal\s+capital\s+territory\b', 'Federal Capital Territory', False),
     (r'(?i)\border\s+of\s+court\b', 'Order of Court', False),
     (r'(?i)\bperpetual\s+injunction\b', 'Perpetual Injunction', False),
     (r'(?i)\bremand\s+order\b', 'Remand Order', False),
@@ -342,6 +352,22 @@ PRONOUN_I_REPLACEMENTS = [
     (r"\bi'd\b", "I'd"),
 ]
 
+CALENDAR_MONTHS = [
+    "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December"
+]
+
+NIGERIAN_STATES = [
+    "Abia", "Adamawa", "Akwa Ibom", "Anambra", "Bauchi", "Bayelsa", "Benue", "Borno",
+    "Cross River", "Delta", "Ebonyi", "Edo", "Ekiti", "Enugu", "Gombe", "Imo",
+    "Jigawa", "Kaduna", "Kano", "Katsina", "Kebbi", "Kogi", "Kwara", "Lagos",
+    "Nasarawa", "Niger", "Ogun", "Ondo", "Osun", "Oyo", "Plateau", "Rivers",
+    "Sokoto", "Taraba", "Yobe", "Zamfara", "Federal Capital Territory", "Abuja"
+]
+
+CALENDAR_MONTHS_MAP = {m.lower(): m for m in CALENDAR_MONTHS}
+NIGERIAN_STATES_MAP = {s.lower(): s for s in NIGERIAN_STATES}
+
 def apply_court_rules(text: str) -> str:
     """
     Applies courtroom phrase replacements with sentence-start awareness for conversational phrases.
@@ -374,11 +400,11 @@ def normalize_case_numbers_and_slashes(text: str) -> str:
     # --------------------------------------------------------------------------
     # 0. Normalize suit numbers and court identifiers
     # --------------------------------------------------------------------------
-    curr = re.sub(r'(?i)\b(?:suits?)\s+(?:numbers?|no\.?)\b', 'Suit No.', text)
-    curr = re.sub(r'(?i)\bcase\s+(?:numbers?|no\.?)\b', 'Case No.', curr)
-    curr = re.sub(r'(?i)\bcharge\s+(?:numbers?|no\.?)\b', 'Charge No.', curr)
-    curr = re.sub(r'(?i)\bappeal\s+(?:numbers?|no\.?)\b', 'Appeal No.', curr)
-    curr = re.sub(r'(?i)\bmatter\s+(?:numbers?|no\.?)\b', 'Matter No.', curr)
+    curr = re.sub(r'(?i)\b(?:suits?)\s+(?:numbers?|no\.?)(?!\w)', 'Suit No.', text)
+    curr = re.sub(r'(?i)\bcase\s+(?:numbers?|no\.?)(?!\w)', 'Case No.', curr)
+    curr = re.sub(r'(?i)\bcharge\s+(?:numbers?|no\.?)(?!\w)', 'Charge No.', curr)
+    curr = re.sub(r'(?i)\bappeal\s+(?:numbers?|no\.?)(?!\w)', 'Appeal No.', curr)
+    curr = re.sub(r'(?i)\bmatter\s+(?:numbers?|no\.?)(?!\w)', 'Matter No.', curr)
 
     # --------------------------------------------------------------------------
     # 1. Year pronunciations: twenty nineteen -> 2019, twenty twenty-four -> 2024, etc.
@@ -414,6 +440,28 @@ def normalize_case_numbers_and_slashes(text: str) -> str:
         r'(zero|one|two|three|four|five|six|seven|eight|nine|\d)\s+'
         r'(zero|one|two|three|four|five|six|seven|eight|nine|\d)\b',
         repl_4digits,
+        curr
+    )
+
+    # Convert hyphenated suit numbers to slashes (e.g. E-57D-2023 -> E/57D/2023, E-447M-2023 -> E/447M/2023)
+    curr = re.sub(
+        r'\b([A-Za-z]{1,6})-([A-Za-z]{1,6})-([A-Za-z]{1,6})-(\d+[A-Za-z]?)-((?:19|20)\d{2})\b',
+        lambda m: f"{m.group(1).upper()}/{m.group(2).upper()}/{m.group(3).upper()}/{m.group(4).upper()}/{m.group(5)}",
+        curr
+    )
+    curr = re.sub(
+        r'\b([A-Za-z]{1,6})-([A-Za-z]{1,6})-(\d+[A-Za-z]?)-((?:19|20)\d{2})\b',
+        lambda m: f"{m.group(1).upper()}/{m.group(2).upper()}/{m.group(3).upper()}/{m.group(4)}",
+        curr
+    )
+    curr = re.sub(
+        r'\b([A-Za-z]{1,6})-(\d+[A-Za-z]?)-((?:19|20)\d{2})\b',
+        lambda m: f"{m.group(1).upper()}/{m.group(2).upper()}/{m.group(3)}",
+        curr
+    )
+    curr = re.sub(
+        r'(?i)\b(Suit\s+No\.?|Case\s+No\.?|Charge\s+No\.?|Appeal\s+No\.?|Matter\s+No\.?|Motion\s+(?:Ex\s+Parte|on\s+Notice))\s+([A-Za-z0-9]+(?:-[A-Za-z0-9]+)+(?:-(?:19|20)\d{2}))\b',
+        lambda m: f"{m.group(1)} {m.group(2).replace('-', '/').upper()}",
         curr
     )
 
@@ -471,6 +519,28 @@ def normalize_case_numbers_and_slashes(text: str) -> str:
     # 4. Canonical Courtroom Rules & Terminology
     # --------------------------------------------------------------------------
     curr = apply_court_rules(curr)
+
+    # Calendar Months capitalization
+    for mon in CALENDAR_MONTHS:
+        if mon != "May":
+            curr = re.sub(rf'(?i)\b{mon}\b', mon, curr)
+
+    # Month 'May': only capitalize in date/calendar contexts to avoid collision with modal verb 'may'
+    curr = re.sub(
+        r'(?i)\b(?:(?:\d{1,2}(?:st|nd|rd|th)?\s+)?of\s+|in\s+|since\s+|by\s+|until\s+|during\s+|on\s+|before\s+|after\s+)may\b',
+        lambda m: m.group(0)[:-3] + "May",
+        curr
+    )
+    curr = re.sub(
+        r'(?i)\bmay(?=\s+(?:\d{1,2}(?:st|nd|rd|th)?|\d{4})\b)',
+        'May',
+        curr
+    )
+
+    # Single-word Nigerian States capitalization
+    for st in NIGERIAN_STATES:
+        if " " not in st:
+            curr = re.sub(rf'(?i)\b{st}\b', st, curr)
 
     # --------------------------------------------------------------------------
     # 5. Number + Letter Combinations: e.g. "five a" / "5 a" -> "5A"
@@ -629,14 +699,32 @@ def normalize_my_casing(text: str) -> str:
                 next_word_clean = tokens[j].strip(PUNCT_CHARS).lower()
                 break
 
+        prev_word_clean = ''
+        for k in range(i - 1, -1, -1):
+            if not tokens[k].isspace() and tokens[k]:
+                prev_word_clean = tokens[k].strip(PUNCT_CHARS).lower()
+                break
+
         if clean.lower() == 'my':
-            if next_word_clean in COURT_MY_TRAILS or next_word_clean == 'noble':
+            if prev_word_clean == 'objection':
+                # User rule: objection, my Lord (never objection, My Lord)
+                tok = apply_proper_case(tok, 'my')
+            elif next_word_clean in COURT_MY_TRAILS or next_word_clean == 'noble':
                 tok = apply_proper_case(tok, 'My')
             elif next_word_clean == 'learned':
                 casing = 'My' if sentence_start else 'my'
                 tok = apply_proper_case(tok, casing)
             elif not sentence_start:
                 tok = apply_proper_case(tok, 'my')
+
+        # User rule: mid-sentence 'demand' or 'demands' must be lowercased
+        if clean.lower() in ('demand', 'demands') and not sentence_start:
+            tok = apply_proper_case(tok, clean.lower())
+
+        # User rule: 'objection' casing based on sentenceStart
+        if clean.lower() == 'objection':
+            casing = 'Objection' if sentence_start else 'objection'
+            tok = apply_proper_case(tok, casing)
 
         new_tokens.append(tok)
         sentence_start = any(tok.rstrip(PUNCT_CHARS).endswith(p) or tok.endswith(p) for p in ('.', '?', '!'))
@@ -660,6 +748,27 @@ def clean_word_token(word: str) -> str:
     # Clean leading/trailing hyphen if attached to number in case number like -21 or -2025
     if re.match(r'^-\d+', clean):
         clean = clean.lstrip('-')
+
+    # Hyphenated suit number tokens (e.g. E-57D-2023 -> E/57D/2023, E-447M-2023 -> E/447M/2023)
+    m_suit3 = re.match(r'(?i)^([a-zA-Z]{1,6})-(\d+[a-zA-Z]?)-((?:19|20)\d{2})([.,!?;:]*)$', clean)
+    if m_suit3:
+        return f"{m_suit3.group(1).upper()}/{m_suit3.group(2).upper()}/{m_suit3.group(3)}{m_suit3.group(4)}"
+    m_suit4 = re.match(r'(?i)^([a-zA-Z]{1,6})-([a-zA-Z]{1,6})-(\d+[a-zA-Z]?)-((?:19|20)\d{2})([.,!?;:]*)$', clean)
+    if m_suit4:
+        return f"{m_suit4.group(1).upper()}/{m_suit4.group(2).upper()}/{m_suit4.group(3).upper()}/{m_suit4.group(4)}{m_suit4.group(5)}"
+    m_suit5 = re.match(r'(?i)^([a-zA-Z]{1,6})-([a-zA-Z]{1,6})-([a-zA-Z]{1,6})-(\d+[a-zA-Z]?)-((?:19|20)\d{2})([.,!?;:]*)$', clean)
+    if m_suit5:
+        return f"{m_suit5.group(1).upper()}/{m_suit5.group(2).upper()}/{m_suit5.group(3).upper()}/{m_suit5.group(4).upper()}/{m_suit5.group(5)}{m_suit5.group(6)}"
+
+    clean_stripped = lower.strip(PUNCT_CHARS)
+
+    # Calendar months check
+    if clean_stripped in CALENDAR_MONTHS_MAP:
+        return apply_proper_case(clean, CALENDAR_MONTHS_MAP[clean_stripped])
+
+    # Nigerian states check (single word)
+    if clean_stripped in NIGERIAN_STATES_MAP:
+        return apply_proper_case(clean, NIGERIAN_STATES_MAP[clean_stripped])
 
     # Pronoun I normalization
     if lower == "i":
