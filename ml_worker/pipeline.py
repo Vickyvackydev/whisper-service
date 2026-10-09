@@ -374,7 +374,23 @@ class InferencePipeline:
             r"\bcan\s+i\s+see\s+the\b", r"\blet\s+me\s+see\s+the\b",
             r"\bwhat\s+are\s+you\s+(?:saying|talking\s+about|asking\s+for)\b",
             r"\bi\s+don't\s+like\s+this\s+idea\s+of\b",
-            r"\bis\s+that\s+what\s+(?:you|was)\s+granted\b"
+            r"\bis\s+that\s+what\s+(?:you|was)\s+granted\b",
+            r"\byou\s+may\s+call\s+the\b",
+            r"\bcall\s+the\s+(?:first\s+|next\s+)?(?:matter|case|suit|cause)\b",
+            r"\byou\s+may\s+(?:go\s+ahead|proceed)\b",
+            r"\bchoose\s+the\s+one\s+you\s+want\b",
+            r"\bwhat\s+you\s+asked\s+for\s+is\s+what\b",
+            r"\bthe\s+order\s+you\s+asked\s+for\b",
+            r"\b(?:there'?s|is\s+there)\s+(?:no|a)\s+subsequent\s+process\b",
+            r"\bwhy\s+did\s+you\s+say\b",
+            r"\bcounsel\s+saying\s+the\s+judge\s+said\b",
+            r"\bit'?s\s+(?:not\s+fair|a\s+new\s+legal\s+year)\b",
+            r"\bplease,\s+mr\.?\s+[a-z]+\b",
+            r"\bmr\.?\s+[a-z]+,\s+it'?s\b",
+            r"\b(?:does\s+not|doesn'?t)\s+talk\s+about\b",
+            r"\bit\s+identifies\s+the\s+processes\b",
+            r"\bgranted\s+as\s+prayed\b",
+            r"\bmotion\s+(?:is\s+)?granted\b"
         ]
         re_judge_authority = [re.compile(p, re.IGNORECASE) for p in JUDGE_AUTHORITY_PATTERNS]
 
@@ -669,16 +685,16 @@ class InferencePipeline:
                 seg = processed_segments[i]
                 txt_clean = seg["text"].lower().strip(".,!?;:\"' ")
 
-                # Case A: Bench Document Inquiries ("Can I see the prayer?", "Can I see the order?")
-                if RE_BENCH_INQUIRY.search(txt_clean):
+                # Case A: Bench Authority & Document Inquiries ("Can I see the prayer?", "Well, choose the one you want.")
+                if RE_BENCH_INQUIRY.search(txt_clean) or any(p.search(txt_clean) for p in re_judge_authority):
                     seg["speaker"] = judge_spk
                     continue
 
-                # Case B: Submission Sandwich ("As the Court pleases")
+                # Case B: Submission Sandwich ("As the Court pleases", "Yes, My Lord")
                 # When Counsel submits to the Bench, the preceding segment was the Judge
-                if i > 0 and RE_SUBMISSION.search(txt_clean):
+                if i > 0 and (RE_SUBMISSION.search(txt_clean) or txt_clean in {"yes, my lord", "no, my lord", "yes sir", "no sir"}):
                     prev_seg = processed_segments[i - 1]
-                    if prev_seg["speaker"] != judge_spk and prev_seg["speaker"] != seg["speaker"]:
+                    if prev_seg["speaker"] != judge_spk and not any(p.search(prev_seg["text"].lower()) for p in re_counsel_honorifics):
                         prev_seg["speaker"] = judge_spk
 
                 # Case C: Clarification Sandwich ("Sir?", "My Lord?", "Pardon?")
@@ -693,24 +709,19 @@ class InferencePipeline:
                     if seg["speaker"] == judge_spk:
                         seg["speaker"] = counsel_spk
 
-                # Case E: Run-on Sentence Continuation across brief pauses (gap <= 0.8s)
+                # Case E: Safe Continuation for Judicial Directives
+                # Only joins across a brief pause (<= 0.4s) when the Judge was reading an active directive with a dangling conjunction
                 if i > 0:
                     prev_seg = processed_segments[i - 1]
                     gap = seg["start"] - prev_seg["end"]
                     prev_tokens = prev_seg["text"].lower().strip(".,!?;:\"' ").split()
                     prev_last_word = prev_tokens[-1] if prev_tokens else ""
-                    prev_ends_sentence = any(prev_seg["text"].strip().endswith(p) for p in (".", "?", "!"))
-                    if gap <= 0.8:
-                        if prev_last_word in DANGLING_CONJUNCTIONS or not prev_ends_sentence:
-                            first_word = seg["text"].lower().strip(".,!?;:\"' ").split()[0] if seg["text"].strip() else ""
-                            if first_word not in {"i", "my", "we", "no", "yes"}:
-                                if prev_seg["speaker"] == judge_spk and RE_JUDGE_DIRECTIVES.search(prev_seg["text"]):
-                                    seg["speaker"] = judge_spk
-                                elif not RE_JUDGE_DIRECTIVES.search(seg["text"]) and not RE_SUBMISSION.search(seg["text"]):
-                                    seg["speaker"] = prev_seg["speaker"]
+                    if gap <= 0.4 and prev_last_word in DANGLING_CONJUNCTIONS:
+                        if prev_seg["speaker"] == judge_spk and RE_JUDGE_DIRECTIVES.search(prev_seg["text"]):
+                            seg["speaker"] = judge_spk
 
-                # Case F: Short Affirmations ("Sir?", "Yes sir", "As the Court pleases")
-                if txt_clean in SHORT_AFFIRMATIONS and seg["speaker"] == judge_spk:
+                # Case F: Short Affirmations & Submissions ("Sir?", "Yes sir", "As the Court pleases")
+                if (txt_clean in SHORT_AFFIRMATIONS or any(p.search(txt_clean) for p in re_counsel_honorifics)) and seg["speaker"] == judge_spk:
                     seg["speaker"] = counsel_spk
 
         # Synchronize word-level speakers with the resolved segment speaker

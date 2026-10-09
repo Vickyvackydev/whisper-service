@@ -378,6 +378,60 @@ class TestNormalizer(unittest.TestCase):
             with self.subTest(inp=inp):
                 self.assertEqual(normalize_case_numbers_and_slashes(inp), expected)
 
+    def test_reconstruct_speaker_turns_courtroom_alternation(self):
+        from ml_worker.pipeline import InferencePipeline
+        pipeline = InferencePipeline.__new__(InferencePipeline)
+
+        segments = [
+            {"start": 0.901, "end": 3.863, "text": "My Lord is giving me a new name.", "speaker": "SPEAKER_00",
+             "words": [{"word": tok, "start": 0.9 + i*0.3, "end": 0.9 + (i+1)*0.3, "speaker": "SPEAKER_00"}
+                       for i, tok in enumerate("My Lord is giving me a new name.".split())]},
+            {"start": 5.143, "end": 8.966, "text": "Well, choose the one you want.", "speaker": "SPEAKER_00",
+             "words": [{"word": tok, "start": 5.1 + i*0.4, "end": 5.1 + (i+1)*0.4, "speaker": "SPEAKER_00"}
+                       for i, tok in enumerate("Well, choose the one you want.".split())]},
+            {"start": 10.327, "end": 11.187, "text": "What are you talking about?", "speaker": "SPEAKER_01",
+             "words": [{"word": tok, "start": 10.3 + i*0.2, "end": 10.3 + (i+1)*0.2, "speaker": "SPEAKER_01"}
+                       for i, tok in enumerate("What are you talking about?".split())]},
+            {"start": 11.588, "end": 11.888, "text": "My Lord,", "speaker": "SPEAKER_00",
+             "words": [{"word": tok, "start": 11.5 + i*0.2, "end": 11.5 + (i+1)*0.2, "speaker": "SPEAKER_00"}
+                       for i, tok in enumerate("My Lord,".split())]},
+            {"start": 26.498, "end": 27.798, "text": "Can I see the prayer?", "speaker": "SPEAKER_01",
+             "words": [{"word": tok, "start": 26.4 + i*0.2, "end": 26.4 + (i+1)*0.2, "speaker": "SPEAKER_01"}
+                       for i, tok in enumerate("Can I see the prayer?".split())]},
+            {"start": 28.339, "end": 28.539, "text": "Sir?", "speaker": "SPEAKER_00",
+             "words": [{"word": "Sir?", "start": 28.3, "end": 28.5, "speaker": "SPEAKER_00"}]},
+            {"start": 28.679, "end": 29.359, "text": "Can I see the order?", "speaker": "SPEAKER_01",
+             "words": [{"word": tok, "start": 28.6 + i*0.2, "end": 28.6 + (i+1)*0.2, "speaker": "SPEAKER_01"}
+                       for i, tok in enumerate("Can I see the order?".split())]},
+            {"start": 29.68, "end": 30.1, "text": "Yes, My Lord.", "speaker": "SPEAKER_00",
+             "words": [{"word": tok, "start": 29.6 + i*0.2, "end": 29.6 + (i+1)*0.2, "speaker": "SPEAKER_00"}
+                       for i, tok in enumerate("Yes, My Lord.".split())]},
+            {"start": 139.881, "end": 140.945, "text": "the order you asked", "speaker": "SPEAKER_01",
+             "words": [{"word": tok, "start": 139.8 + i*0.2, "end": 139.8 + (i+1)*0.2, "speaker": "SPEAKER_01"}
+                       for i, tok in enumerate("the order you asked".split())]},
+            {"start": 140.985, "end": 141.888, "text": "for yes sir does", "speaker": "SPEAKER_00",
+             "words": [{"word": tok, "start": 140.9 + i*0.2, "end": 140.9 + (i+1)*0.2, "speaker": "SPEAKER_00"}
+                       for i, tok in enumerate("for yes sir does".split())]},
+            {"start": 141.908, "end": 142.31, "text": "not talk about", "speaker": "SPEAKER_01",
+             "words": [{"word": tok, "start": 141.9 + i*0.1, "end": 141.9 + (i+1)*0.1, "speaker": "SPEAKER_01"}
+                       for i, tok in enumerate("not talk about".split())]},
+            {"start": 151.643, "end": 152.739, "text": "There's no subsequent process there.", "speaker": "SPEAKER_01",
+             "words": [{"word": tok, "start": 151.6 + i*0.2, "end": 151.6 + (i+1)*0.2, "speaker": "SPEAKER_01"}
+                       for i, tok in enumerate("There's no subsequent process there.".split())]},
+            {"start": 156.966, "end": 157.56, "text": "As the Court pleases.", "speaker": "SPEAKER_00",
+             "words": [{"word": tok, "start": 156.9 + i*0.2, "end": 156.9 + (i+1)*0.2, "speaker": "SPEAKER_00"}
+                       for i, tok in enumerate("As the Court pleases.".split())]},
+        ]
+
+        stitched = {"segments": segments}
+        processed, num_speakers = pipeline.reconstruct_speaker_turns(stitched)
+
+        self.assertEqual(processed[0]["text"], "My Lord is giving me a new name.")
+        self.assertNotEqual(processed[1]["speaker"], processed[0]["speaker"])
+        self.assertEqual(processed[1]["speaker"], processed[2]["speaker"])
+        self.assertEqual(processed[3]["speaker"], processed[0]["speaker"])
+
 if __name__ == '__main__':
     unittest.main()
+
 
