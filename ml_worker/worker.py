@@ -10,7 +10,7 @@ import time
 import signal
 import threading
 import logging
-from typing import Optional, Set
+from typing import Optional
 import torch
 
 from ml_worker.config import WorkerConfig
@@ -36,25 +36,13 @@ class MLWorker:
         self.pipeline: Optional[InferencePipeline] = None
         
         self.is_running = False
-        self.concurrency = max(1, getattr(self.config, "WORKER_CONCURRENCY", 2))
-        self._state_lock = threading.Lock()
-        self.active_job_ids: Set[str] = set()
-        self.last_active_time = time.time()
+        self.current_job_id: Optional[str] = None
+        self.worker_status = "idle"
         self.heartbeat_thread: Optional[threading.Thread] = None
-
-    @property
-    def current_job_id(self) -> Optional[str]:
-        with self._state_lock:
-            return next(iter(self.active_job_ids), None)
-
-    @property
-    def worker_status(self) -> str:
-        with self._state_lock:
-            return "busy" if len(self.active_job_ids) > 0 else "idle"
 
     def initialize_models(self):
         logger.info("==================================================")
-        logger.info(f"Initializing ML Worker: {self.config.WORKER_ID} (concurrency={self.concurrency})")
+        logger.info(f"Initializing ML Worker: {self.config.WORKER_ID}")
         logger.info("==================================================")
         
         # 1. Connect to PostgreSQL
@@ -68,7 +56,7 @@ class MLWorker:
             except Exception as e:
                 logger.warning(f"Could not pin CUDA device 0: {e}")
 
-        # 2. Load Whisper Model (once at startup, shared across concurrent worker slots)
+        # 2. Load Whisper Model (once at startup)
         self.transcriber.load_model()
 
         # 3. Load Diarization Pipeline (once at startup if enabled)
@@ -117,45 +105,31 @@ class MLWorker:
             
             time.sleep(self.config.HEARTBEAT_INTERVAL)
 
-    def _worker_slot_loop(self, slot_id: int):
-        # When running 3+ concurrent slots, dedicate the highest slot as an Express Fast-Lane (prefer_newest=True)
-        # so brand-new live uploads are processed immediately without waiting behind bulk backlog jobs.
-        prefer_newest = (self.concurrency >= 3 and slot_id == self.concurrency)
-        lane_label = "EXPRESS-NEWEST" if prefer_newest else "FIFO-QUEUE"
-        logger.info(f"[Slot-{slot_id} ({lane_label})] Concurrent job slot started.")
+    def run(self):
+        self.initialize_models()
+        self.is_running = True
+
+        # Start heartbeat background thread
+        self.heartbeat_thread = threading.Thread(target=self.heartbeat_loop, daemon=True)
+        self.heartbeat_thread.start()
+
+        logger.info(f"Worker {self.config.WORKER_ID} listening 24/7 for transcription jobs on PostgreSQL queue (auto-shutdown disabled)...")
+        job_counter = 0
+
         while self.is_running:
-            job_id: Optional[str] = None
             try:
-                # 1. Atomic job dequeue
+                # Every 4th job, check newest job first (Express lane so live users don't wait behind old bulk uploads)
+                prefer_newest = (job_counter % 4 == 3)
                 job = self.db.dequeue_job(self.config.WORKER_ID, prefer_newest=prefer_newest)
                 if not job:
-                    with self._state_lock:
-                        active_count = len(self.active_job_ids)
-                        idle_seconds = time.time() - self.last_active_time
-
-                    if (
-                        slot_id == 1
-                        and active_count == 0
-                        and self.config.IDLE_SHUTDOWN_MINUTES > 0
-                        and idle_seconds >= (self.config.IDLE_SHUTDOWN_MINUTES * 60)
-                    ):
-                        logger.info(
-                            f"Worker idle for {int(idle_seconds // 60)}m "
-                            f"(>= {self.config.IDLE_SHUTDOWN_MINUTES}m threshold). Triggering RunPod auto-stop..."
-                        )
-                        self.trigger_runpod_auto_stop()
-                        self.stop()
-                        os._exit(0)
-
                     time.sleep(self.config.POLL_INTERVAL)
                     continue
 
+                job_counter += 1
                 job_id = str(job["id"])
-                with self._state_lock:
-                    self.active_job_ids.add(job_id)
-                    self.last_active_time = time.time()
-
-                logger.info(f"[Slot-{slot_id}] ==> Dequeued Job {job_id} (Audio: {job['audio_url']})")
+                self.current_job_id = job_id
+                self.worker_status = "busy"
+                logger.info(f"==> Dequeued Job {job_id} (Audio: {job['audio_url']})")
 
                 # 2. Process job with progress updates
                 def update_progress(stage: str, progress: int):
@@ -188,10 +162,10 @@ class MLWorker:
                         processing_time=result["processing_time"],
                         callback_url=callback_url
                     )
-                    logger.info(f"[Slot-{slot_id}] ==> Successfully completed Job {job_id}")
+                    logger.info(f"==> Successfully completed Job {job_id}")
 
                 except torch.cuda.OutOfMemoryError as oom:
-                    logger.error(f"[Slot-{slot_id}] GPU OOM while processing Job {job_id}: {oom}")
+                    logger.error(f"GPU OOM while processing Job {job_id}: {oom}")
                     gc.collect()
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
@@ -202,7 +176,7 @@ class MLWorker:
                         callback_url=callback_url
                     )
                 except Exception as proc_err:
-                    logger.error(f"[Slot-{slot_id}] Error processing Job {job_id}: {proc_err}", exc_info=True)
+                    logger.error(f"Error processing Job {job_id}: {proc_err}", exc_info=True)
                     err_str = str(proc_err)
                     is_oom = "out of memory" in err_str.lower() or ("cuda" in err_str.lower() and "memory" in err_str.lower())
                     if is_oom:
@@ -216,94 +190,19 @@ class MLWorker:
                         callback_url=callback_url
                     )
 
-                    # Fatal CUDA state corruption recovery
-                    is_fatal_cuda = any(pattern in err_str.lower() for pattern in [
-                        "invalid device ordinal",
-                        "cudaerrorinvaliddevice",
-                        "illegal memory access",
-                        "unspecified launch failure",
-                        "cuda error: all cuda-capable devices are busy"
-                    ])
-                    if is_fatal_cuda:
-                        logger.critical(f"FATAL CUDA DRIVER ERROR: {proc_err}. Exiting worker process for fresh restart...")
-                        time.sleep(1.0)
-                        os._exit(1)
-
             except Exception as loop_err:
-                logger.error(f"[Slot-{slot_id}] Worker loop unexpected error: {loop_err}", exc_info=True)
+                logger.error(f"Worker main loop unexpected error: {loop_err}", exc_info=True)
                 time.sleep(2.0)
             finally:
-                if job_id is not None:
-                    with self._state_lock:
-                        self.active_job_ids.discard(job_id)
-                        self.last_active_time = time.time()
-                        remaining_active = len(self.active_job_ids)
-                    try:
-                        gc.collect()
-                        if remaining_active == 0 and torch and torch.cuda.is_available():
-                            torch.cuda.empty_cache()
-                    except Exception as cleanup_err:
-                        logger.debug(f"Post-job GPU cleanup note: {cleanup_err}")
-
-    def run(self):
-        self.initialize_models()
-        self.is_running = True
-
-        # Start heartbeat background thread
-        self.heartbeat_thread = threading.Thread(target=self.heartbeat_loop, daemon=True)
-        self.heartbeat_thread.start()
-
-        logger.info(
-            f"Worker {self.config.WORKER_ID} listening for transcription jobs with {self.concurrency} concurrent slots "
-            f"(Idle shutdown after {self.config.IDLE_SHUTDOWN_MINUTES}m)..."
-        )
-
-        slot_threads = []
-        for slot_id in range(2, self.concurrency + 1):
-            t = threading.Thread(target=self._worker_slot_loop, args=(slot_id,), daemon=True)
-            t.start()
-            slot_threads.append(t)
-
-        # Run slot 1 on main thread
-        self._worker_slot_loop(1)
-
-    def trigger_runpod_auto_stop(self):
-        pod_id = self.config.RUNPOD_POD_ID or "yf989jc63uke3g"
-        api_key = self.config.RUNPOD_API_KEY
-        
-        logger.info(f"Initiating auto-stop for RunPod Pod ID: {pod_id}...")
-
-        # Method 1: Native runpodctl CLI tool (built into every RunPod container)
-        try:
-            import subprocess
-            cmd = ["runpodctl", "stop", "pod", pod_id]
-            res = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
-            if res.returncode == 0:
-                logger.info(f"Successfully stopped pod using runpodctl CLI: {res.stdout.strip()}")
-                return
-            else:
-                logger.warning(f"runpodctl stop pod returned code {res.returncode}: {res.stderr.strip() or res.stdout.strip()}")
-        except Exception as cli_err:
-            logger.warning(f"runpodctl CLI execution failed ({cli_err}). Trying REST API v2...")
-
-        # Method 2: RunPod REST API v2
-        if api_key:
-            try:
-                import urllib.request
-                import json
-
-                url = f"https://api.runpod.io/v2/pods/{pod_id}/action"
-                req_data = json.dumps({"action": "stop"}).encode("utf-8")
-                headers = {
-                    "Content-Type": "application/json",
-                    "Authorization": f"Bearer {api_key}",
-                }
-                req = urllib.request.Request(url, data=req_data, headers=headers, method="POST")
-                with urllib.request.urlopen(req, timeout=10) as resp:
-                    logger.info(f"Successfully triggered RunPod REST API v2 stop for Pod ID: {pod_id} (HTTP {resp.status})")
-                    return
-            except Exception as api_err:
-                logger.error(f"REST API v2 stop failed: {api_err}")
+                self.current_job_id = None
+                self.worker_status = "idle"
+                # Always release cached GPU tensors and run garbage collection between jobs
+                try:
+                    gc.collect()
+                    if torch and torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                except Exception as cleanup_err:
+                    logger.debug(f"Post-job GPU cleanup note: {cleanup_err}")
 
     def stop(self):
         logger.info("Stopping ML Worker...")
@@ -313,6 +212,10 @@ class MLWorker:
 
 if __name__ == "__main__":
     worker = MLWorker()
+
+    # Ignore SIGHUP so closing the RunPod web terminal never terminates the worker
+    if hasattr(signal, "SIGHUP"):
+        signal.signal(signal.SIGHUP, signal.SIG_IGN)
 
     def handle_signal(sig, frame):
         logger.info(f"Signal {sig} received, exiting...")

@@ -45,10 +45,10 @@ class WorkerConfig:
     MIN_DURATION_OFF: float = float(os.getenv("MIN_DURATION_OFF", "0.20"))
     ENABLE_DIARIZATION_DEFAULT: bool = os.getenv("ENABLE_DIARIZATION_DEFAULT", "true").lower() in ("true", "1", "yes")
     
-    # Worker Identifiers & Concurrency (Default 4 concurrent slots for 20GB RTX 4000 Ada GPU)
+    # Worker Identifiers & Concurrency
     WORKER_ID: str = os.getenv("WORKER_ID", f"gpu-worker-{socket.gethostname()}-{uuid.uuid4().hex[:6]}")
-    WORKER_CONCURRENCY: int = max(1, int(os.getenv("WORKER_CONCURRENCY", "4")))
-    WHISPER_NUM_WORKERS: int = max(1, int(os.getenv("WHISPER_NUM_WORKERS", os.getenv("WORKER_CONCURRENCY", "4"))))
+    WORKER_CONCURRENCY: int = 1
+    WHISPER_NUM_WORKERS: int = 1
     HEARTBEAT_INTERVAL: float = float(os.getenv("HEARTBEAT_INTERVAL", "5.0"))
     POLL_INTERVAL: float = float(os.getenv("POLL_INTERVAL", "0.5"))
     
@@ -57,8 +57,8 @@ class WorkerConfig:
     MAX_AUDIO_DOWNLOAD_BYTES: int = int(os.getenv("MAX_AUDIO_DOWNLOAD_BYTES", str(1024 * 1024 * 1024 * 2)))  # 2 GB
     SCRATCH_DIR: Path = Path(os.getenv("SCRATCH_DIR", os.path.join(os.path.expanduser("~"), ".whisper_scratch")))
 
-    # RunPod Auto-Stop & Cost Management
-    IDLE_SHUTDOWN_MINUTES: int = int(os.getenv("IDLE_SHUTDOWN_MINUTES", "15"))
+    # RunPod Auto-Stop Disabled by Default (0 = Never shut down GPU pod; court is always working)
+    IDLE_SHUTDOWN_MINUTES: int = 0
     RUNPOD_API_KEY: str = os.getenv("RUNPOD_API_KEY", "")
     RUNPOD_POD_ID: str = os.getenv("RUNPOD_POD_ID", os.getenv("RUNPOD_POD_ID_ENV", ""))
 
