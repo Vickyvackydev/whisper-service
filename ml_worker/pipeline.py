@@ -2,6 +2,7 @@ import gc
 import re
 import time
 import logging
+import threading
 from collections import Counter
 from pathlib import Path
 from typing import Dict, Any, Optional, Callable, List, Tuple
@@ -30,7 +31,22 @@ class InferencePipeline:
     def __init__(self, transcriber: Transcriber, diarizer: SpeakerDiarizer):
         self.transcriber = transcriber
         self.diarizer = diarizer
+        self._align_lock = threading.Lock()
+        self._diarize_lock = threading.Lock()
+        self._align_models: Dict[str, Tuple[Any, Any]] = {}
         WorkerConfig.ensure_scratch_dir()
+
+    def _get_cached_align_model(self, lang_code: str, align_device: str):
+        import whisperx
+        key = f"{lang_code}:{align_device}"
+        if key not in self._align_models:
+            logger.info(f"Loading & caching WhisperX Wav2Vec2 alignment model for language={lang_code} on {align_device}...")
+            align_model, align_metadata = whisperx.load_align_model(
+                language_code=lang_code,
+                device=align_device
+            )
+            self._align_models[key] = (align_model, align_metadata)
+        return self._align_models[key]
 
     def process(
         self,
@@ -101,28 +117,25 @@ class InferencePipeline:
                     if progress_updater:
                         progress_updater("aligning", 78)
                     logger.info(f"[{job_id}] Running WhisperX Wav2Vec2 phoneme forced alignment (language={lang_code}, device={align_device})...")
-                    if align_device == "cuda" and torch and torch.cuda.is_available():
-                        try:
-                            torch.cuda.set_device(0)
-                        except Exception:
-                            pass
                     import whisperx
                     audio_arr = whisperx.load_audio(str(wav_path))
-                    align_model, align_metadata = whisperx.load_align_model(
-                        language_code=lang_code,
-                        device=align_device
-                    )
-                    aligned_result = whisperx.align(
-                        segments,
-                        align_model,
-                        align_metadata,
-                        audio_arr,
-                        align_device,
-                        return_char_alignments=False
-                    )
+                    with self._align_lock:
+                        if align_device == "cuda" and torch and torch.cuda.is_available():
+                            try:
+                                torch.cuda.set_device(0)
+                            except Exception:
+                                pass
+                        align_model, align_metadata = self._get_cached_align_model(lang_code, align_device)
+                        aligned_result = whisperx.align(
+                            segments,
+                            align_model,
+                            align_metadata,
+                            audio_arr,
+                            align_device,
+                            return_char_alignments=False
+                        )
 
-                    # Release alignment model and audio buffer from memory immediately
-                    del align_model
+                    # Release audio buffer immediately (align_model stays cached in VRAM for instant reuse across 200+ jobs)
                     del audio_arr
                     gc.collect()
                     if torch and align_device == "cuda":
@@ -146,7 +159,8 @@ class InferencePipeline:
                 if progress_updater:
                     progress_updater("diarizing", 85)
                 logger.info(f"[{job_id}] Running {self.diarizer.backend.upper()} diarization on {wav_path}...")
-                diarize_df = self.diarizer.diarize_dataframe(wav_path)
+                with self._diarize_lock:
+                    diarize_df = self.diarizer.diarize_dataframe(wav_path)
                 logger.info(f"[{job_id}] Diarization generated {len(diarize_df)} intervals.")
 
                 # Release diarization memory immediately

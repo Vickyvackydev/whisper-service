@@ -15,7 +15,7 @@ class WorkerConfig:
     # ML Models
     WHISPER_MODEL: str = os.getenv("WHISPER_MODEL", "large-v3")
     WHISPER_DEVICE: str = os.getenv("WHISPER_DEVICE", "cuda" if os.getenv("CUDA_VISIBLE_DEVICES") or os.path.exists("/usr/local/cuda") else "auto")
-    WHISPER_COMPUTE_TYPE: str = os.getenv("WHISPER_COMPUTE_TYPE", "float16")  # float16, int8_float16, int8
+    WHISPER_COMPUTE_TYPE: str = os.getenv("WHISPER_COMPUTE_TYPE", "int8_float16")  # float16, int8_float16, int8
     WHISPER_CPU_THREADS: int = int(os.getenv("WHISPER_CPU_THREADS", "4"))
     WHISPER_INITIAL_PROMPT: str = os.getenv(
         "WHISPER_INITIAL_PROMPT",
@@ -45,8 +45,10 @@ class WorkerConfig:
     
     # Worker Identifiers & Concurrency
     WORKER_ID: str = os.getenv("WORKER_ID", f"gpu-worker-{socket.gethostname()}-{uuid.uuid4().hex[:6]}")
+    WORKER_CONCURRENCY: int = max(1, int(os.getenv("WORKER_CONCURRENCY", "2")))
+    WHISPER_NUM_WORKERS: int = max(1, int(os.getenv("WHISPER_NUM_WORKERS", os.getenv("WORKER_CONCURRENCY", "2"))))
     HEARTBEAT_INTERVAL: float = float(os.getenv("HEARTBEAT_INTERVAL", "5.0"))
-    POLL_INTERVAL: float = float(os.getenv("POLL_INTERVAL", "1.0"))
+    POLL_INTERVAL: float = float(os.getenv("POLL_INTERVAL", "0.5"))
     
     # Audio & Safety limits
     MAX_AUDIO_DURATION_SECONDS: int = int(os.getenv("MAX_AUDIO_DURATION_SECONDS", "14400"))  # 4 hours

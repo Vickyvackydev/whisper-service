@@ -17,7 +17,7 @@ class Database:
         logger.info("Initializing PostgreSQL connection pool for ML Worker...")
         self.pool = pool.ThreadedConnectionPool(
             minconn=2,
-            maxconn=10,
+            maxconn=24,
             dsn=self.db_url
         )
         logger.info("PostgreSQL worker connection pool established.")
@@ -239,6 +239,18 @@ class Database:
                     gpu_memory_used_mb, model_loaded, diarization_loaded,
                     status, current_job_id
                 ))
+
+                # Also refresh worker_heartbeat_at on all active processing jobs owned by this worker
+                # so long-running stages (downloading, ffmpeg, alignment, diarization > 45s) never trigger false stale-job resets.
+                cur.execute(
+                    """
+                    UPDATE transcription_jobs
+                    SET worker_heartbeat_at = NOW(),
+                        updated_at = NOW()
+                    WHERE worker_id = %s AND status = 'processing';
+                    """,
+                    (worker_id,)
+                )
                 conn.commit()
         except Exception as e:
             conn.rollback()

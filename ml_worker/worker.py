@@ -5,11 +5,12 @@ import sys
 if "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
+import gc
 import time
 import signal
 import threading
 import logging
-from typing import Optional
+from typing import Optional, Set
 import torch
 
 from ml_worker.config import WorkerConfig
@@ -35,13 +36,25 @@ class MLWorker:
         self.pipeline: Optional[InferencePipeline] = None
         
         self.is_running = False
-        self.current_job_id: Optional[str] = None
-        self.worker_status = "idle"
+        self.concurrency = max(1, getattr(self.config, "WORKER_CONCURRENCY", 2))
+        self._state_lock = threading.Lock()
+        self.active_job_ids: Set[str] = set()
+        self.last_active_time = time.time()
         self.heartbeat_thread: Optional[threading.Thread] = None
+
+    @property
+    def current_job_id(self) -> Optional[str]:
+        with self._state_lock:
+            return next(iter(self.active_job_ids), None)
+
+    @property
+    def worker_status(self) -> str:
+        with self._state_lock:
+            return "busy" if len(self.active_job_ids) > 0 else "idle"
 
     def initialize_models(self):
         logger.info("==================================================")
-        logger.info(f"Initializing ML Worker: {self.config.WORKER_ID}")
+        logger.info(f"Initializing ML Worker: {self.config.WORKER_ID} (concurrency={self.concurrency})")
         logger.info("==================================================")
         
         # 1. Connect to PostgreSQL
@@ -55,7 +68,7 @@ class MLWorker:
             except Exception as e:
                 logger.warning(f"Could not pin CUDA device 0: {e}")
 
-        # 2. Load Whisper Model (once at startup)
+        # 2. Load Whisper Model (once at startup, shared across concurrent worker slots)
         self.transcriber.load_model()
 
         # 3. Load Diarization Pipeline (once at startup if enabled)
@@ -104,38 +117,41 @@ class MLWorker:
             
             time.sleep(self.config.HEARTBEAT_INTERVAL)
 
-    def run(self):
-        self.initialize_models()
-        self.is_running = True
-
-        # Start heartbeat background thread
-        self.heartbeat_thread = threading.Thread(target=self.heartbeat_loop, daemon=True)
-        self.heartbeat_thread.start()
-
-        logger.info(f"Worker {self.config.WORKER_ID} listening for transcription jobs on PostgreSQL queue (Idle shutdown after {self.config.IDLE_SHUTDOWN_MINUTES}m)...")
-        last_active_time = time.time()
-
+    def _worker_slot_loop(self, slot_id: int):
+        logger.info(f"[Slot-{slot_id}] Concurrent job slot started.")
         while self.is_running:
+            job_id: Optional[str] = None
             try:
                 # 1. Atomic job dequeue
                 job = self.db.dequeue_job(self.config.WORKER_ID)
                 if not job:
-                    idle_seconds = time.time() - last_active_time
-                    if self.config.IDLE_SHUTDOWN_MINUTES > 0 and idle_seconds >= (self.config.IDLE_SHUTDOWN_MINUTES * 60):
-                        logger.info(f"Worker idle for {int(idle_seconds // 60)}m (>= {self.config.IDLE_SHUTDOWN_MINUTES}m threshold). Triggering RunPod auto-stop...")
+                    with self._state_lock:
+                        active_count = len(self.active_job_ids)
+                        idle_seconds = time.time() - self.last_active_time
+
+                    if (
+                        slot_id == 1
+                        and active_count == 0
+                        and self.config.IDLE_SHUTDOWN_MINUTES > 0
+                        and idle_seconds >= (self.config.IDLE_SHUTDOWN_MINUTES * 60)
+                    ):
+                        logger.info(
+                            f"Worker idle for {int(idle_seconds // 60)}m "
+                            f"(>= {self.config.IDLE_SHUTDOWN_MINUTES}m threshold). Triggering RunPod auto-stop..."
+                        )
                         self.trigger_runpod_auto_stop()
                         self.stop()
-                        sys.exit(0)
+                        os._exit(0)
+
                     time.sleep(self.config.POLL_INTERVAL)
                     continue
 
-                # Reset idle timer when a job is dequeued
-                last_active_time = time.time()
-
                 job_id = str(job["id"])
-                self.current_job_id = job_id
-                self.worker_status = "busy"
-                logger.info(f"==> Dequeued Job {job_id} (Audio: {job['audio_url']})")
+                with self._state_lock:
+                    self.active_job_ids.add(job_id)
+                    self.last_active_time = time.time()
+
+                logger.info(f"[Slot-{slot_id}] ==> Dequeued Job {job_id} (Audio: {job['audio_url']})")
 
                 # 2. Process job with progress updates
                 def update_progress(stage: str, progress: int):
@@ -168,11 +184,10 @@ class MLWorker:
                         processing_time=result["processing_time"],
                         callback_url=callback_url
                     )
-                    logger.info(f"==> Successfully completed Job {job_id}")
+                    logger.info(f"[Slot-{slot_id}] ==> Successfully completed Job {job_id}")
 
                 except torch.cuda.OutOfMemoryError as oom:
-                    logger.error(f"GPU OOM while processing Job {job_id}: {oom}")
-                    import gc
+                    logger.error(f"[Slot-{slot_id}] GPU OOM while processing Job {job_id}: {oom}")
                     gc.collect()
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
@@ -183,11 +198,10 @@ class MLWorker:
                         callback_url=callback_url
                     )
                 except Exception as proc_err:
-                    logger.error(f"Error processing Job {job_id}: {proc_err}", exc_info=True)
+                    logger.error(f"[Slot-{slot_id}] Error processing Job {job_id}: {proc_err}", exc_info=True)
                     err_str = str(proc_err)
                     is_oom = "out of memory" in err_str.lower() or ("cuda" in err_str.lower() and "memory" in err_str.lower())
                     if is_oom:
-                        import gc
                         gc.collect()
                         if torch.cuda.is_available():
                             torch.cuda.empty_cache()
@@ -198,8 +212,7 @@ class MLWorker:
                         callback_url=callback_url
                     )
 
-                    # Fatal CUDA state corruption recovery (e.g. invalid device ordinal / driver stream failure):
-                    # Exit process immediately so systemd/docker supervisor restarts with a pristine CUDA context.
+                    # Fatal CUDA state corruption recovery
                     is_fatal_cuda = any(pattern in err_str.lower() for pattern in [
                         "invalid device ordinal",
                         "cudaerrorinvaliddevice",
@@ -213,19 +226,42 @@ class MLWorker:
                         os._exit(1)
 
             except Exception as loop_err:
-                logger.error(f"Worker main loop unexpected error: {loop_err}", exc_info=True)
+                logger.error(f"[Slot-{slot_id}] Worker loop unexpected error: {loop_err}", exc_info=True)
                 time.sleep(2.0)
             finally:
-                self.current_job_id = None
-                self.worker_status = "idle"
-                # Always release cached GPU tensors and run garbage collection between jobs
-                try:
-                    import gc
-                    gc.collect()
-                    if torch and torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                except Exception as cleanup_err:
-                    logger.debug(f"Post-job GPU cleanup note: {cleanup_err}")
+                if job_id is not None:
+                    with self._state_lock:
+                        self.active_job_ids.discard(job_id)
+                        self.last_active_time = time.time()
+                        remaining_active = len(self.active_job_ids)
+                    try:
+                        gc.collect()
+                        if remaining_active == 0 and torch and torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                    except Exception as cleanup_err:
+                        logger.debug(f"Post-job GPU cleanup note: {cleanup_err}")
+
+    def run(self):
+        self.initialize_models()
+        self.is_running = True
+
+        # Start heartbeat background thread
+        self.heartbeat_thread = threading.Thread(target=self.heartbeat_loop, daemon=True)
+        self.heartbeat_thread.start()
+
+        logger.info(
+            f"Worker {self.config.WORKER_ID} listening for transcription jobs with {self.concurrency} concurrent slots "
+            f"(Idle shutdown after {self.config.IDLE_SHUTDOWN_MINUTES}m)..."
+        )
+
+        slot_threads = []
+        for slot_id in range(2, self.concurrency + 1):
+            t = threading.Thread(target=self._worker_slot_loop, args=(slot_id,), daemon=True)
+            t.start()
+            slot_threads.append(t)
+
+        # Run slot 1 on main thread
+        self._worker_slot_loop(1)
 
     def trigger_runpod_auto_stop(self):
         pod_id = self.config.RUNPOD_POD_ID or "yf989jc63uke3g"

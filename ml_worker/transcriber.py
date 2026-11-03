@@ -14,9 +14,13 @@ class Transcriber:
         self.model_name = WorkerConfig.WHISPER_MODEL
         self.device = WorkerConfig.WHISPER_DEVICE
         self.compute_type = WorkerConfig.WHISPER_COMPUTE_TYPE
+        self.num_workers = getattr(WorkerConfig, "WHISPER_NUM_WORKERS", 2)
 
     def load_model(self):
-        logger.info(f"Loading Whisper model: {self.model_name} (device={self.device}, compute_type={self.compute_type})")
+        logger.info(
+            f"Loading Whisper model: {self.model_name} "
+            f"(device={self.device}, compute_type={self.compute_type}, num_workers={self.num_workers})"
+        )
         
         # Check CUDA availability
         actual_device = self.device
@@ -46,10 +50,11 @@ class Transcriber:
             device_index=device_index,
             compute_type=self.compute_type,
             cpu_threads=WorkerConfig.WHISPER_CPU_THREADS,
+            num_workers=self.num_workers,
             download_root=str(WorkerConfig.SCRATCH_DIR / "models" / "whisper")
         )
         self.device = actual_device
-        logger.info(f"Whisper model loaded successfully on {actual_device}:{device_index}.")
+        logger.info(f"Whisper model loaded successfully on {actual_device}:{device_index} (num_workers={self.num_workers}).")
 
     def transcribe(
         self,
@@ -63,12 +68,13 @@ class Transcriber:
         if self.model is None:
             self.load_model()
 
-        # Configure decoding based on transcription mode
+        # Configure decoding based on transcription mode.
+        # Avoid 6-step temperature cascade on noisy courtroom silence which causes 6x-30x slowdowns.
         beam_size = 1
         temperature = 0.0
         if mode == "accurate":
             beam_size = 5
-            temperature = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
+            temperature = [0.0, 0.2]
         elif mode == "balanced":
             beam_size = 3
             temperature = 0.0
@@ -81,22 +87,19 @@ class Transcriber:
             lang_arg = None
 
         # Determine task ('translate' vs 'transcribe')
-        # Whisper's native GPU model ONLY translates any spoken language -> English ('en').
-        # If target language is explicitly English ('en') or translation to English is requested:
-        if target_lang_arg == "en" or (enable_translation and (target_lang_arg is None or target_lang_arg == "en")):
+        # Only run 'translate' when translation to English is explicitly enabled and source is not already English.
+        if enable_translation and (target_lang_arg is None or target_lang_arg == "en") and lang_arg != "en":
             task = "translate"
         else:
-            # For non-English target languages (e.g., target='fr', 'es', 'de') or auto-detect matching target,
-            # run 'transcribe' so Whisper outputs text in the detected spoken language (e.g. French audio -> French text).
             task = "transcribe"
 
         logger.info(f"Running Whisper inference: task={task}, source_language={lang_arg}, target_language={target_lang_arg or ('en' if task == 'translate' else lang_arg)}")
 
-        # Optimal VAD and decoding parameters for high accuracy & preserving music/vocals
+        # Optimal VAD and decoding parameters for high accuracy & preserving courtroom speech
         vad_params = dict(
             threshold=0.20,                # High sensitivity: captures quick remarks & courtroom interjections
             min_speech_duration_ms=100,    # Catch rapid interjections (e.g. 100ms+)
-            min_silence_duration_ms=250,    # Isolate rapid micro-pauses between speaker interchanges
+            min_silence_duration_ms=250,   # Isolate rapid micro-pauses between speaker interchanges
             speech_pad_ms=300              # Pad 300ms to preserve leading/trailing word boundaries
         )
 
