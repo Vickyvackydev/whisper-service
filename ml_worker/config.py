@@ -17,6 +17,8 @@ class WorkerConfig:
     WHISPER_DEVICE: str = os.getenv("WHISPER_DEVICE", "cuda" if os.getenv("CUDA_VISIBLE_DEVICES") or os.path.exists("/usr/local/cuda") else "auto")
     WHISPER_COMPUTE_TYPE: str = os.getenv("WHISPER_COMPUTE_TYPE", "int8_float16")  # float16, int8_float16, int8
     WHISPER_CPU_THREADS: int = int(os.getenv("WHISPER_CPU_THREADS", "4"))
+    WHISPER_BATCH_SIZE: int = max(1, int(os.getenv("WHISPER_BATCH_SIZE", "16")))
+    FORCE_WHISPERX_ALIGNMENT: bool = os.getenv("FORCE_WHISPERX_ALIGNMENT", "false").lower() in ("true", "1", "yes")
     WHISPER_INITIAL_PROMPT: str = os.getenv(
         "WHISPER_INITIAL_PROMPT",
         "Official courtroom transcript of legal proceedings and counsel submissions before the court."
@@ -43,10 +45,10 @@ class WorkerConfig:
     MIN_DURATION_OFF: float = float(os.getenv("MIN_DURATION_OFF", "0.20"))
     ENABLE_DIARIZATION_DEFAULT: bool = os.getenv("ENABLE_DIARIZATION_DEFAULT", "true").lower() in ("true", "1", "yes")
     
-    # Worker Identifiers & Concurrency
+    # Worker Identifiers & Concurrency (Default 4 concurrent slots for 20GB RTX 4000 Ada GPU)
     WORKER_ID: str = os.getenv("WORKER_ID", f"gpu-worker-{socket.gethostname()}-{uuid.uuid4().hex[:6]}")
-    WORKER_CONCURRENCY: int = max(1, int(os.getenv("WORKER_CONCURRENCY", "2")))
-    WHISPER_NUM_WORKERS: int = max(1, int(os.getenv("WHISPER_NUM_WORKERS", os.getenv("WORKER_CONCURRENCY", "2"))))
+    WORKER_CONCURRENCY: int = max(1, int(os.getenv("WORKER_CONCURRENCY", "4")))
+    WHISPER_NUM_WORKERS: int = max(1, int(os.getenv("WHISPER_NUM_WORKERS", os.getenv("WORKER_CONCURRENCY", "4"))))
     HEARTBEAT_INTERVAL: float = float(os.getenv("HEARTBEAT_INTERVAL", "5.0"))
     POLL_INTERVAL: float = float(os.getenv("POLL_INTERVAL", "0.5"))
     

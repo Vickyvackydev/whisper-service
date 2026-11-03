@@ -42,14 +42,17 @@ class Database:
                 pass
 
 
-    def dequeue_job(self, worker_id: str) -> Optional[Dict[str, Any]]:
+    def dequeue_job(self, worker_id: str, prefer_newest: bool = False) -> Optional[Dict[str, Any]]:
         """
         Atomically leases the next queued transcription job using FOR UPDATE SKIP LOCKED.
+        When prefer_newest=True (Express Fast-Lane slot), leases the most recently submitted job
+        so live courtroom users never wait behind a large bulk backlog.
         """
         conn = self.get_conn()
+        order_dir = "DESC" if prefer_newest else "ASC"
         try:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                query = """
+                query = f"""
                     UPDATE transcription_jobs
                     SET status = 'processing',
                         stage = 'downloading',
@@ -61,7 +64,7 @@ class Database:
                         SELECT id
                         FROM transcription_jobs
                         WHERE status = 'queued'
-                        ORDER BY created_at ASC
+                        ORDER BY created_at {order_dir}
                         LIMIT 1
                         FOR UPDATE SKIP LOCKED
                     )

@@ -118,12 +118,16 @@ class MLWorker:
             time.sleep(self.config.HEARTBEAT_INTERVAL)
 
     def _worker_slot_loop(self, slot_id: int):
-        logger.info(f"[Slot-{slot_id}] Concurrent job slot started.")
+        # When running 3+ concurrent slots, dedicate the highest slot as an Express Fast-Lane (prefer_newest=True)
+        # so brand-new live uploads are processed immediately without waiting behind bulk backlog jobs.
+        prefer_newest = (self.concurrency >= 3 and slot_id == self.concurrency)
+        lane_label = "EXPRESS-NEWEST" if prefer_newest else "FIFO-QUEUE"
+        logger.info(f"[Slot-{slot_id} ({lane_label})] Concurrent job slot started.")
         while self.is_running:
             job_id: Optional[str] = None
             try:
                 # 1. Atomic job dequeue
-                job = self.db.dequeue_job(self.config.WORKER_ID)
+                job = self.db.dequeue_job(self.config.WORKER_ID, prefer_newest=prefer_newest)
                 if not job:
                     with self._state_lock:
                         active_count = len(self.active_job_ids)
