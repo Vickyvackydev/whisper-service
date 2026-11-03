@@ -279,17 +279,45 @@ class Database:
                     status, current_job_id
                 ))
 
-                # Also refresh worker_heartbeat_at on all active processing jobs owned by this worker
-                # so long-running stages (downloading, ffmpeg, alignment, diarization > 45s) never trigger false stale-job resets.
-                cur.execute(
-                    """
-                    UPDATE transcription_jobs
-                    SET worker_heartbeat_at = NOW(),
-                        updated_at = NOW()
-                    WHERE worker_id = %s AND status = 'processing';
-                    """,
-                    (worker_id,)
-                )
+                # Refresh worker_heartbeat_at ONLY on the specific current_job_id being processed by this worker,
+                # and automatically recover any orphaned 'processing' jobs left over from a previous run of this worker_id.
+                if current_job_id:
+                    cur.execute(
+                        """
+                        UPDATE transcription_jobs
+                        SET worker_heartbeat_at = NOW(),
+                            updated_at = NOW()
+                        WHERE id = %s AND status = 'processing';
+                        """,
+                        (current_job_id,)
+                    )
+                    cur.execute(
+                        """
+                        UPDATE transcription_jobs
+                        SET status = 'queued',
+                            stage = 'queued',
+                            progress = 0,
+                            worker_id = NULL,
+                            worker_heartbeat_at = NULL,
+                            updated_at = NOW()
+                        WHERE worker_id = %s AND status = 'processing' AND id != %s;
+                        """,
+                        (worker_id, current_job_id)
+                    )
+                else:
+                    cur.execute(
+                        """
+                        UPDATE transcription_jobs
+                        SET status = 'queued',
+                            stage = 'queued',
+                            progress = 0,
+                            worker_id = NULL,
+                            worker_heartbeat_at = NULL,
+                            updated_at = NOW()
+                        WHERE worker_id = %s AND status = 'processing';
+                        """,
+                        (worker_id,)
+                    )
                 conn.commit()
         except Exception as e:
             conn.rollback()
