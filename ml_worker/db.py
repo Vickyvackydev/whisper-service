@@ -158,6 +158,42 @@ class Database:
         finally:
             self.put_conn(conn)
 
+    def requeue_job(self, job_id: str, error_message: str) -> bool:
+        """
+        Re-queues a job on transient GPU / CUDA errors if retry_count < GREATEST(max_retries, 3)
+        so courtroom uploads recover automatically instead of failing permanently.
+        """
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                query = """
+                    UPDATE transcription_jobs
+                    SET status = 'queued',
+                        stage = 'queued',
+                        progress = 0,
+                        worker_id = NULL,
+                        worker_heartbeat_at = NULL,
+                        retry_count = retry_count + 1,
+                        error_message = %s,
+                        updated_at = NOW()
+                    WHERE id = %s
+                      AND retry_count < GREATEST(COALESCE(max_retries, 3), 3)
+                    RETURNING retry_count;
+                """
+                cur.execute(query, (f"Transient recovery: {error_message}", job_id))
+                row = cur.fetchone()
+                conn.commit()
+                if row:
+                    logger.info(f"Job {job_id} automatically re-queued for self-healing retry (attempt #{row[0]}).")
+                    return True
+                return False
+        except Exception as e:
+            conn.rollback()
+            logger.error(f"Failed to re-queue job {job_id}: {e}")
+            return False
+        finally:
+            self.put_conn(conn)
+
     def fail_job(
         self,
         job_id: str,

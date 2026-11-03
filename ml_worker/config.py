@@ -17,7 +17,8 @@ class WorkerConfig:
     WHISPER_DEVICE: str = os.getenv("WHISPER_DEVICE", "cuda" if os.getenv("CUDA_VISIBLE_DEVICES") or os.path.exists("/usr/local/cuda") else "auto")
     WHISPER_COMPUTE_TYPE: str = os.getenv("WHISPER_COMPUTE_TYPE", "int8_float16")  # float16, int8_float16, int8
     WHISPER_CPU_THREADS: int = int(os.getenv("WHISPER_CPU_THREADS", "4"))
-    WHISPER_BATCH_SIZE: int = max(1, int(os.getenv("WHISPER_BATCH_SIZE", "16")))
+    # Capped at batch_size=4 on 20GB VRAM so Whisper large-v3 + NeMo Sortformer never OOM on multi-hour courtroom audio
+    WHISPER_BATCH_SIZE: int = min(4, max(1, int(os.getenv("WHISPER_BATCH_SIZE", "4"))))
     FORCE_WHISPERX_ALIGNMENT: bool = os.getenv("FORCE_WHISPERX_ALIGNMENT", "false").lower() in ("true", "1", "yes")
     WHISPER_INITIAL_PROMPT: str = os.getenv(
         "WHISPER_INITIAL_PROMPT",

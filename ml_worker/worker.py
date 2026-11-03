@@ -118,8 +118,9 @@ class MLWorker:
 
         while self.is_running:
             try:
-                # Every 4th job, check newest job first (Express lane so live users don't wait behind old bulk uploads)
-                prefer_newest = (job_counter % 4 == 3)
+                # Fair-Share Express Lane: every 3rd job pulls the newest upload (ORDER BY created_at DESC)
+                # so live courtroom users never wait behind a 200+ bulk backlog!
+                prefer_newest = (job_counter % 3 == 2)
                 job = self.db.dequeue_job(self.config.WORKER_ID, prefer_newest=prefer_newest)
                 if not job:
                     time.sleep(self.config.POLL_INTERVAL)
@@ -169,24 +170,40 @@ class MLWorker:
                     gc.collect()
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
-                    self.db.fail_job(
-                        job_id=job_id,
-                        error_message="Inference failed due to GPU Out of Memory (OOM)",
-                        error_details={"error_type": "GPU_OOM", "details": str(oom)},
-                        callback_url=callback_url
-                    )
+                    if not self.db.requeue_job(job_id, f"GPU Out of Memory: {oom}"):
+                        self.db.fail_job(
+                            job_id=job_id,
+                            error_message="Inference failed due to GPU Out of Memory (OOM)",
+                            error_details={"error_type": "GPU_OOM", "details": str(oom)},
+                            callback_url=callback_url
+                        )
                 except Exception as proc_err:
                     logger.error(f"Error processing Job {job_id}: {proc_err}", exc_info=True)
                     err_str = str(proc_err)
-                    is_oom = "out of memory" in err_str.lower() or ("cuda" in err_str.lower() and "memory" in err_str.lower())
-                    if is_oom:
+                    err_lower = err_str.lower()
+                    is_oom = "out of memory" in err_lower or ("cuda" in err_lower and "memory" in err_lower)
+                    is_cuda_transient = is_oom or any(
+                        kw in err_lower for kw in ("invalid device ordinal", "cudaerror", "parallel_for", "cublas", "cudnn")
+                    )
+                    if is_cuda_transient:
                         gc.collect()
                         if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
+                            try:
+                                torch.cuda.set_device(0)
+                                torch.cuda.empty_cache()
+                            except Exception:
+                                pass
+                        if self.db.requeue_job(job_id, err_str):
+                            if "invalid device ordinal" in err_lower or "cudaerror" in err_lower:
+                                logger.warning("CUDA device context error detected; self-restarting worker process in-place to reset CUDA context...")
+                                self.db.close()
+                                os.execv(sys.executable, [sys.executable, "-m", "ml_worker.worker"])
+                            continue
+
                     self.db.fail_job(
                         job_id=job_id,
-                        error_message=str(proc_err),
-                        error_details={"error_type": "GPU_OOM" if is_oom else type(proc_err).__name__, "details": str(proc_err)},
+                        error_message=err_str,
+                        error_details={"error_type": "GPU_OOM" if is_oom else type(proc_err).__name__, "details": err_str},
                         callback_url=callback_url
                     )
 

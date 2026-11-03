@@ -1,3 +1,4 @@
+import gc
 import logging
 from pathlib import Path
 from typing import Optional, Dict, Any, List
@@ -19,8 +20,9 @@ class Transcriber:
         self.model_name = WorkerConfig.WHISPER_MODEL
         self.device = WorkerConfig.WHISPER_DEVICE
         self.compute_type = WorkerConfig.WHISPER_COMPUTE_TYPE
-        self.num_workers = getattr(WorkerConfig, "WHISPER_NUM_WORKERS", 4)
-        self.batch_size = getattr(WorkerConfig, "WHISPER_BATCH_SIZE", 16)
+        # Strictly 1 CTranslate2 worker thread to prevent parallel_for cudaErrorInvalidDevice
+        self.num_workers = 1
+        self.batch_size = min(4, max(1, getattr(WorkerConfig, "WHISPER_BATCH_SIZE", 4)))
 
     def load_model(self):
         logger.info(
@@ -133,12 +135,48 @@ class Transcriber:
         else:
             prompt = prompt.strip()
 
-        segments_iter = None
+        raw_segments = None
         info = None
 
         if self.batched_model is not None and self.batch_size > 1:
             try:
                 segments_iter, info = self.batched_model.transcribe(
+                    str(audio_path),
+                    language=lang_arg,
+                    task=task,
+                    beam_size=1,
+                    temperature=0.0,
+                    word_timestamps=True,
+                    vad_filter=True,
+                    vad_parameters=vad_params,
+                    condition_on_previous_text=False,
+                    no_speech_threshold=0.6,
+                    compression_ratio_threshold=2.4,
+                    initial_prompt=prompt,
+                    batch_size=self.batch_size
+                )
+                # Materialize the lazy generator inside the try block so any mid-iteration CUDA OOM or device error
+                # is caught and falls back to unbatched decoding within the same job!
+                temp_segments = []
+                for seg in segments_iter:
+                    temp_segments.append(seg)
+                    if progress_callback and info and info.duration:
+                        progress_callback(seg.end, info.duration)
+                raw_segments = temp_segments
+            except Exception as batch_err:
+                logger.warning(f"Batched transcribe encountered error ({batch_err}); clearing CUDA cache and falling back to safe unbatched transcribe...")
+                raw_segments = None
+                gc.collect()
+                if torch and torch.cuda.is_available():
+                    try:
+                        torch.cuda.set_device(0)
+                        torch.cuda.empty_cache()
+                    except Exception:
+                        pass
+
+        if raw_segments is None:
+            try:
+                segments_iter, info = self.model.transcribe(
                     str(audio_path),
                     language=lang_arg,
                     task=task,
@@ -150,28 +188,44 @@ class Transcriber:
                     condition_on_previous_text=False,
                     no_speech_threshold=0.6,
                     compression_ratio_threshold=2.4,
-                    initial_prompt=prompt,
-                    batch_size=self.batch_size
+                    initial_prompt=prompt
                 )
-            except Exception as batch_err:
-                logger.warning(f"Batched transcribe fallback to standard transcribe ({batch_err})")
-                segments_iter = None
-
-        if segments_iter is None:
-            segments_iter, info = self.model.transcribe(
-                str(audio_path),
-                language=lang_arg,
-                task=task,
-                beam_size=beam_size,
-                temperature=temperature,
-                word_timestamps=True,
-                vad_filter=True,
-                vad_parameters=vad_params,
-                condition_on_previous_text=False,
-                no_speech_threshold=0.6,
-                compression_ratio_threshold=2.4,
-                initial_prompt=prompt
-            )
+                temp_segments = []
+                for seg in segments_iter:
+                    temp_segments.append(seg)
+                    if progress_callback and info and info.duration:
+                        progress_callback(seg.end, info.duration)
+                raw_segments = temp_segments
+            except Exception as unbatched_err:
+                logger.warning(f"Standard transcribe encountered error ({unbatched_err}); reloading WhisperModel and retrying greedy beam_size=1...")
+                gc.collect()
+                if torch and torch.cuda.is_available():
+                    try:
+                        torch.cuda.set_device(0)
+                        torch.cuda.empty_cache()
+                    except Exception:
+                        pass
+                self.load_model()
+                segments_iter, info = self.model.transcribe(
+                    str(audio_path),
+                    language=lang_arg,
+                    task=task,
+                    beam_size=1,
+                    temperature=0.0,
+                    word_timestamps=True,
+                    vad_filter=True,
+                    vad_parameters=vad_params,
+                    condition_on_previous_text=False,
+                    no_speech_threshold=0.6,
+                    compression_ratio_threshold=2.4,
+                    initial_prompt=prompt
+                )
+                temp_segments = []
+                for seg in segments_iter:
+                    temp_segments.append(seg)
+                    if progress_callback and info and info.duration:
+                        progress_callback(seg.end, info.duration)
+                raw_segments = temp_segments
 
         detected_language = info.language
         language_probability = info.language_probability
@@ -181,7 +235,7 @@ class Transcriber:
         full_text_parts = []
         total_words = 0
 
-        for seg in segments_iter:
+        for seg in raw_segments:
             text = seg.text.strip()
 
             words_data = []
@@ -213,9 +267,6 @@ class Transcriber:
             if seg_dict["text"]:
                 full_text_parts.append(seg_dict["text"])
             segments_list.append(seg_dict)
-
-            if progress_callback:
-                progress_callback(seg.end, duration)
 
         full_text = " ".join(full_text_parts)
 
