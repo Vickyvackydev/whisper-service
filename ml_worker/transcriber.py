@@ -16,18 +16,16 @@ logger = logging.getLogger("ml_worker.transcriber")
 class Transcriber:
     def __init__(self):
         self.model: Optional[WhisperModel] = None
-        self.batched_model: Optional[Any] = None
         self.model_name = WorkerConfig.WHISPER_MODEL
         self.device = WorkerConfig.WHISPER_DEVICE
         self.compute_type = WorkerConfig.WHISPER_COMPUTE_TYPE
         # Strictly 1 CTranslate2 worker thread to prevent parallel_for cudaErrorInvalidDevice
         self.num_workers = 1
-        self.batch_size = min(4, max(1, getattr(WorkerConfig, "WHISPER_BATCH_SIZE", 4)))
 
     def load_model(self):
         logger.info(
             f"Loading Whisper model: {self.model_name} "
-            f"(device={self.device}, compute_type={self.compute_type}, num_workers={self.num_workers}, batch_size={self.batch_size})"
+            f"(device={self.device}, compute_type={self.compute_type}, num_workers={self.num_workers})"
         )
         
         # Check CUDA availability
@@ -61,13 +59,6 @@ class Transcriber:
             num_workers=self.num_workers,
             download_root=str(WorkerConfig.SCRATCH_DIR / "models" / "whisper")
         )
-        if BatchedInferencePipeline is not None and self.batch_size > 1:
-            try:
-                self.batched_model = BatchedInferencePipeline(model=self.model)
-                logger.info(f"Enabled faster-whisper BatchedInferencePipeline (batch_size={self.batch_size}).")
-            except Exception as batch_init_err:
-                logger.warning(f"Could not initialize BatchedInferencePipeline ({batch_init_err}), using standard WhisperModel.")
-                self.batched_model = None
 
         self.device = actual_device
         logger.info(f"Whisper model loaded successfully on {actual_device}:{device_index} (num_workers={self.num_workers}).")
@@ -84,15 +75,16 @@ class Transcriber:
         if self.model is None:
             self.load_model()
 
-        # High-throughput decoding configuration:
-        # beam_size=3 with temperature=0.0 achieves near-identical WER to beam_size=5 on large-v3 while running ~2x faster.
+        # Configure decoding based on transcription mode.
+        # Avoid 6-step temperature cascade on noisy courtroom silence which causes 6x-30x slowdowns,
+        # while preserving 5-beam search and [0.0, 0.2] fallback for full word recall and segment boundary accuracy.
         beam_size = 1
-        temperature = 0.0
+        temperature: Any = 0.0
         if mode == "accurate":
-            beam_size = 3
-            temperature = 0.0
+            beam_size = 5
+            temperature = [0.0, 0.2]
         elif mode == "balanced":
-            beam_size = 2
+            beam_size = 3
             temperature = 0.0
 
         lang_arg = language.lower().strip() if (language and language.lower().strip() not in ("auto", "none")) else None
@@ -112,7 +104,7 @@ class Transcriber:
         logger.info(
             f"Running Whisper inference: task={task}, source_language={lang_arg}, "
             f"target_language={target_lang_arg or ('en' if task == 'translate' else lang_arg)}, "
-            f"batched={self.batched_model is not None}"
+            f"beam_size={beam_size}, temperature={temperature}"
         )
 
         # Optimal VAD and decoding parameters for high accuracy & preserving courtroom speech
@@ -138,94 +130,57 @@ class Transcriber:
         raw_segments = None
         info = None
 
-        if self.batched_model is not None and self.batch_size > 1:
-            try:
-                segments_iter, info = self.batched_model.transcribe(
-                    str(audio_path),
-                    language=lang_arg,
-                    task=task,
-                    beam_size=1,
-                    temperature=0.0,
-                    word_timestamps=True,
-                    vad_filter=True,
-                    vad_parameters=vad_params,
-                    condition_on_previous_text=False,
-                    no_speech_threshold=0.6,
-                    compression_ratio_threshold=2.4,
-                    initial_prompt=prompt,
-                    batch_size=self.batch_size
-                )
-                # Materialize the lazy generator inside the try block so any mid-iteration CUDA OOM or device error
-                # is caught and falls back to unbatched decoding within the same job!
-                temp_segments = []
-                for seg in segments_iter:
-                    temp_segments.append(seg)
-                    if progress_callback and info and info.duration:
-                        progress_callback(seg.end, info.duration)
-                raw_segments = temp_segments
-            except Exception as batch_err:
-                logger.warning(f"Batched transcribe encountered error ({batch_err}); clearing CUDA cache and falling back to safe unbatched transcribe...")
-                raw_segments = None
-                gc.collect()
-                if torch and torch.cuda.is_available():
-                    try:
-                        torch.cuda.set_device(0)
-                        torch.cuda.empty_cache()
-                    except Exception:
-                        pass
-
-        if raw_segments is None:
-            try:
-                segments_iter, info = self.model.transcribe(
-                    str(audio_path),
-                    language=lang_arg,
-                    task=task,
-                    beam_size=beam_size,
-                    temperature=temperature,
-                    word_timestamps=True,
-                    vad_filter=True,
-                    vad_parameters=vad_params,
-                    condition_on_previous_text=False,
-                    no_speech_threshold=0.6,
-                    compression_ratio_threshold=2.4,
-                    initial_prompt=prompt
-                )
-                temp_segments = []
-                for seg in segments_iter:
-                    temp_segments.append(seg)
-                    if progress_callback and info and info.duration:
-                        progress_callback(seg.end, info.duration)
-                raw_segments = temp_segments
-            except Exception as unbatched_err:
-                logger.warning(f"Standard transcribe encountered error ({unbatched_err}); reloading WhisperModel and retrying greedy beam_size=1...")
-                gc.collect()
-                if torch and torch.cuda.is_available():
-                    try:
-                        torch.cuda.set_device(0)
-                        torch.cuda.empty_cache()
-                    except Exception:
-                        pass
-                self.load_model()
-                segments_iter, info = self.model.transcribe(
-                    str(audio_path),
-                    language=lang_arg,
-                    task=task,
-                    beam_size=1,
-                    temperature=0.0,
-                    word_timestamps=True,
-                    vad_filter=True,
-                    vad_parameters=vad_params,
-                    condition_on_previous_text=False,
-                    no_speech_threshold=0.6,
-                    compression_ratio_threshold=2.4,
-                    initial_prompt=prompt
-                )
-                temp_segments = []
-                for seg in segments_iter:
-                    temp_segments.append(seg)
-                    if progress_callback and info and info.duration:
-                        progress_callback(seg.end, info.duration)
-                raw_segments = temp_segments
+        try:
+            segments_iter, info = self.model.transcribe(
+                str(audio_path),
+                language=lang_arg,
+                task=task,
+                beam_size=beam_size,
+                temperature=temperature,
+                word_timestamps=True,
+                vad_filter=True,
+                vad_parameters=vad_params,
+                condition_on_previous_text=False,
+                no_speech_threshold=0.6,
+                compression_ratio_threshold=2.4,
+                initial_prompt=prompt
+            )
+            temp_segments = []
+            for seg in segments_iter:
+                temp_segments.append(seg)
+                if progress_callback and info and info.duration:
+                    progress_callback(seg.end, info.duration)
+            raw_segments = temp_segments
+        except Exception as unbatched_err:
+            logger.warning(f"Standard transcribe encountered error ({unbatched_err}); reloading WhisperModel and retrying...")
+            gc.collect()
+            if torch and torch.cuda.is_available():
+                try:
+                    torch.cuda.set_device(0)
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
+            self.load_model()
+            segments_iter, info = self.model.transcribe(
+                str(audio_path),
+                language=lang_arg,
+                task=task,
+                beam_size=3,
+                temperature=0.0,
+                word_timestamps=True,
+                vad_filter=True,
+                vad_parameters=vad_params,
+                condition_on_previous_text=False,
+                no_speech_threshold=0.6,
+                compression_ratio_threshold=2.4,
+                initial_prompt=prompt
+            )
+            temp_segments = []
+            for seg in segments_iter:
+                temp_segments.append(seg)
+                if progress_callback and info and info.duration:
+                    progress_callback(seg.end, info.duration)
+            raw_segments = temp_segments
 
         detected_language = info.language
         language_probability = info.language_probability

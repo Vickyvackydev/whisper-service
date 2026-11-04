@@ -113,53 +113,41 @@ class InferencePipeline:
 
             if segments and len(segments) > 0:
                 lang_code = whisper_result.get("language") or "en"
-                # Only run the extra Wav2Vec2 forced alignment pass if any segment is missing Whisper word timestamps
-                # or if FORCE_WHISPERX_ALIGNMENT is explicitly enabled. This saves a full extra GPU pass on every job.
-                has_whisper_words = all(bool(s.get("words")) for s in segments if s.get("text", "").strip())
-                force_align = getattr(WorkerConfig, "FORCE_WHISPERX_ALIGNMENT", False)
+                try:
+                    if progress_updater:
+                        progress_updater("aligning", 78)
+                    logger.info(f"[{job_id}] Running WhisperX Wav2Vec2 phoneme forced alignment (language={lang_code}, device={align_device})...")
+                    import whisperx
+                    audio_arr = whisperx.load_audio(str(wav_path))
+                    with self._align_lock:
+                        if align_device == "cuda" and torch and torch.cuda.is_available():
+                            try:
+                                torch.cuda.set_device(0)
+                            except Exception:
+                                pass
+                        align_model, align_metadata = self._get_cached_align_model(lang_code, align_device)
+                        aligned_result = whisperx.align(
+                            segments,
+                            align_model,
+                            align_metadata,
+                            audio_arr,
+                            align_device,
+                            return_char_alignments=False
+                        )
 
-                if has_whisper_words and not force_align:
-                    logger.info(
-                        f"[{job_id}] Native faster-whisper word timestamps present across all {len(segments)} segments; "
-                        f"skipping redundant Wav2Vec2 alignment pass for faster turnaround."
-                    )
+                    # Release audio buffer immediately (align_model stays cached in VRAM for instant reuse across 200+ jobs)
+                    del audio_arr
+                    gc.collect()
+                    if torch and align_device == "cuda":
+                        torch.cuda.empty_cache()
+
+                    logger.info(f"[{job_id}] Phoneme forced alignment successful across {len(aligned_result.get('segments', []))} segments.")
+                except Exception as align_err:
+                    logger.warning(f"[{job_id}] WhisperX phoneme alignment skipped or failed ({align_err}). Retaining Whisper timestamps.")
                     aligned_result = {"segments": segments}
-                else:
-                    try:
-                        if progress_updater:
-                            progress_updater("aligning", 78)
-                        logger.info(f"[{job_id}] Running WhisperX Wav2Vec2 phoneme forced alignment (language={lang_code}, device={align_device})...")
-                        import whisperx
-                        audio_arr = whisperx.load_audio(str(wav_path))
-                        with self._align_lock:
-                            if align_device == "cuda" and torch and torch.cuda.is_available():
-                                try:
-                                    torch.cuda.set_device(0)
-                                except Exception:
-                                    pass
-                            align_model, align_metadata = self._get_cached_align_model(lang_code, align_device)
-                            aligned_result = whisperx.align(
-                                segments,
-                                align_model,
-                                align_metadata,
-                                audio_arr,
-                                align_device,
-                                return_char_alignments=False
-                            )
-
-                        # Release audio buffer immediately (align_model stays cached in VRAM for instant reuse across 200+ jobs)
-                        del audio_arr
-                        gc.collect()
-                        if torch and align_device == "cuda":
-                            torch.cuda.empty_cache()
-
-                        logger.info(f"[{job_id}] Phoneme forced alignment successful across {len(aligned_result.get('segments', []))} segments.")
-                    except Exception as align_err:
-                        logger.warning(f"[{job_id}] WhisperX phoneme alignment skipped or failed ({align_err}). Retaining Whisper timestamps.")
-                        aligned_result = {"segments": segments}
-                        gc.collect()
-                        if torch and torch.cuda.is_available():
-                            torch.cuda.empty_cache()
+                    gc.collect()
+                    if torch and torch.cuda.is_available():
+                        torch.cuda.empty_cache()
 
             # Diarization & Word Midpoint Stitching
             total_align_segs = len(aligned_result.get("segments", []))
