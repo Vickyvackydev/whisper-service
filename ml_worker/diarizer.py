@@ -133,6 +133,281 @@ class SpeakerDiarizer:
             return self._diarize_nemo(audio_path, min_speakers=min_speakers, max_speakers=max_speakers)
         return self._diarize_pyannote(audio_path, min_speakers=min_speakers, max_speakers=max_speakers)
 
+    def _parse_nemo_preds(self, preds: Any, offset_sec: float = 0.0) -> List[Dict[str, Any]]:
+        if isinstance(preds, tuple):
+            preds = preds[0]
+
+        if isinstance(preds, str):
+            raw_segments = preds.strip().splitlines()
+        elif isinstance(preds, list):
+            if len(preds) > 0 and isinstance(preds[0], list) and not isinstance(preds[0], str):
+                raw_segments = preds[0]
+            else:
+                raw_segments = preds
+        else:
+            raw_segments = []
+
+        turns = []
+        for item in raw_segments:
+            if not item:
+                continue
+
+            st, et, spk_label = None, None, None
+
+            # Format A: String line (e.g. "0.905 3.720 speaker_0" or RTTM "SPEAKER file 1 0.905 2.815 <NA> <NA> speaker_0 <NA> <NA>")
+            if isinstance(item, str):
+                parts = item.strip().split()
+                if not parts:
+                    continue
+                if parts[0] == "SPEAKER" and len(parts) >= 8:
+                    try:
+                        st = float(parts[3])
+                        dur = float(parts[4])
+                        et = st + dur
+                        spk_label = parts[7]
+                    except (ValueError, IndexError):
+                        continue
+                elif len(parts) >= 3:
+                    try:
+                        st = float(parts[0])
+                        et = float(parts[1])
+                        spk_label = parts[2]
+                    except ValueError:
+                        continue
+                elif len(parts) == 2:
+                    try:
+                        st = float(parts[0])
+                        et = float(parts[1])
+                        spk_label = "speaker_0"
+                    except ValueError:
+                        continue
+
+            # Format B: List or tuple: [start, end, speaker]
+            elif isinstance(item, (list, tuple)):
+                if len(item) >= 3:
+                    try:
+                        st = float(item[0])
+                        et = float(item[1])
+                        spk_label = str(item[2])
+                    except (ValueError, TypeError):
+                        continue
+                elif len(item) == 2:
+                    try:
+                        st = float(item[0])
+                        et = float(item[1])
+                        spk_label = "speaker_0"
+                    except (ValueError, TypeError):
+                        continue
+
+            if st is None or et is None or spk_label is None:
+                continue
+
+            st = round(float(st) + offset_sec, 3)
+            et = round(float(et) + offset_sec, 3)
+            if et <= st:
+                continue
+
+            spk_str = str(spk_label).strip().lower()
+            num = None
+            if spk_str.startswith("speaker_"):
+                try:
+                    num = int(spk_str.replace("speaker_", "").strip())
+                except ValueError:
+                    pass
+            elif spk_str.isdigit():
+                num = int(spk_str)
+
+            if num is not None:
+                formatted_spk = f"SPEAKER_{num:02d}"
+            else:
+                formatted_spk = f"SPEAKER_{spk_str.upper()}"
+
+            turns.append({
+                "start": st,
+                "end": et,
+                "speaker": formatted_spk
+            })
+        return turns
+
+    def _diarize_nemo_chunked(
+        self,
+        audio_path: Path,
+        audio_data: np.ndarray,
+        sample_rate: int,
+        chunk_sec: float = 480.0,
+        overlap_sec: float = 30.0
+    ) -> List[Dict[str, Any]]:
+        """
+        Runs NVIDIA NeMo Sortformer in overlapping windows (default 8-min chunks with 30s overlap)
+        and stitches speaker identities across chunk boundaries using overlap turn co-occurrence
+        and acoustic centroid cosine similarity. Guarantees bounded VRAM and zero Pyannote fallback.
+        """
+        import gc
+        import os
+        import tempfile
+        import soundfile as sf
+
+        total_samples = len(audio_data)
+        total_sec = total_samples / float(sample_rate)
+        step_sec = max(60.0, chunk_sec - overlap_sec)
+
+        logger.info(
+            f"Running chunked NVIDIA NeMo Sortformer diarization on {audio_path.name} "
+            f"(duration={total_sec:.1f}s, chunk={chunk_sec:.0f}s, overlap={overlap_sec:.0f}s)..."
+        )
+
+        global_turns: List[Dict[str, Any]] = []
+        global_centroids: Dict[str, np.ndarray] = {}
+
+        chunk_idx = 0
+        start_sec = 0.0
+        while start_sec < total_sec:
+            end_sec = min(total_sec, start_sec + chunk_sec)
+            if total_sec - end_sec < overlap_sec + 15.0:
+                end_sec = total_sec
+
+            start_samp = int(start_sec * sample_rate)
+            end_samp = int(end_sec * sample_rate)
+            chunk_audio = audio_data[start_samp:end_samp]
+
+            tmp_chunk_path = None
+            try:
+                fd, tmp_str = tempfile.mkstemp(suffix=f"_nemo_chunk{chunk_idx}.wav")
+                os.close(fd)
+                tmp_chunk_path = Path(tmp_str)
+                sf.write(str(tmp_chunk_path), chunk_audio, sample_rate)
+
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+                with torch.inference_mode():
+                    preds = self.nemo_model.diarize(audio=str(tmp_chunk_path), batch_size=1)
+
+                chunk_turns = self._parse_nemo_preds(preds, offset_sec=start_sec)
+            finally:
+                if tmp_chunk_path and tmp_chunk_path.exists():
+                    try:
+                        tmp_chunk_path.unlink()
+                    except Exception:
+                        pass
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+            if chunk_turns:
+                # Extract centroids for speakers in this chunk
+                chunk_centroids: Dict[str, np.ndarray] = {}
+                local_speakers = sorted(set(t["speaker"] for t in chunk_turns))
+                for spk in local_speakers:
+                    spk_turns = [t for t in chunk_turns if t["speaker"] == spk and (t["end"] - t["start"]) >= 0.4]
+                    if not spk_turns:
+                        spk_turns = [t for t in chunk_turns if t["speaker"] == spk]
+                    feats = []
+                    for st in spk_turns[:8]:
+                        s_i = max(0, int(st["start"] * sample_rate))
+                        e_i = min(total_samples, int(st["end"] * sample_rate))
+                        if e_i - s_i >= int(0.3 * sample_rate):
+                            feat = self._extract_audio_feature(audio_data[s_i:e_i], sample_rate)
+                            if feat is not None:
+                                feats.append(feat)
+                    if feats:
+                        avg_f = np.mean(feats, axis=0)
+                        nrm = np.linalg.norm(avg_f)
+                        if nrm > 1e-6:
+                            chunk_centroids[spk] = avg_f / nrm
+
+                if chunk_idx == 0 or not global_turns:
+                    global_turns.extend(chunk_turns)
+                    global_centroids.update(chunk_centroids)
+                else:
+                    # Map local_speakers -> global_speakers using:
+                    # 1. Temporal overlap in [start_sec, start_sec + overlap_sec]
+                    # 2. Acoustic centroid similarity
+                    overlap_end = start_sec + overlap_sec
+                    prev_overlap_turns = [t for t in global_turns if t["end"] > start_sec and t["start"] < overlap_end]
+                    curr_overlap_turns = [t for t in chunk_turns if t["end"] > start_sec and t["start"] < overlap_end]
+
+                    spk_map: Dict[str, str] = {}
+                    used_global = set()
+
+                    for lspk in local_speakers:
+                        best_gspk = None
+                        best_score = -1.0
+
+                        all_global_spks = sorted(set(t["speaker"] for t in global_turns))
+                        for gspk in all_global_spks:
+                            if gspk in used_global:
+                                continue
+                            ov_dur = 0.0
+                            total_l_ov = 0.0
+                            for lt in curr_overlap_turns:
+                                if lt["speaker"] != lspk:
+                                    continue
+                                total_l_ov += (min(lt["end"], overlap_end) - max(lt["start"], start_sec))
+                                for gt in prev_overlap_turns:
+                                    if gt["speaker"] != gspk:
+                                        continue
+                                    o = min(lt["end"], gt["end"], overlap_end) - max(lt["start"], gt["start"], start_sec)
+                                    if o > 0:
+                                        ov_dur += o
+                            ov_ratio = (ov_dur / total_l_ov) if total_l_ov > 0.2 else 0.0
+
+                            ac_sim = 0.0
+                            if lspk in chunk_centroids and gspk in global_centroids:
+                                ac_sim = float(np.dot(chunk_centroids[lspk], global_centroids[gspk]))
+
+                            combined = (ov_ratio * 0.65) + (ac_sim * 0.35) if total_l_ov > 0.2 else ac_sim
+                            if combined > best_score:
+                                best_score = combined
+                                best_gspk = gspk
+
+                        if best_gspk is not None and best_score >= 0.45:
+                            spk_map[lspk] = best_gspk
+                            used_global.add(best_gspk)
+                            if lspk in chunk_centroids and best_gspk in global_centroids:
+                                blended = 0.7 * global_centroids[best_gspk] + 0.3 * chunk_centroids[lspk]
+                                nrm = np.linalg.norm(blended)
+                                if nrm > 1e-6:
+                                    global_centroids[best_gspk] = blended / nrm
+                        else:
+                            new_id = f"SPEAKER_{len(set(t['speaker'] for t in global_turns)) + len(spk_map):02d}"
+                            spk_map[lspk] = new_id
+                            if lspk in chunk_centroids:
+                                global_centroids[new_id] = chunk_centroids[lspk]
+
+                    # Stitch at the midpoint of the overlap window to avoid boundary edge artifacts
+                    stitch_time = start_sec + (overlap_sec * 0.5)
+                    kept_global = []
+                    for gt in global_turns:
+                        if gt["end"] <= stitch_time:
+                            kept_global.append(gt)
+                        elif gt["start"] < stitch_time:
+                            gt_copy = dict(gt)
+                            gt_copy["end"] = round(stitch_time, 3)
+                            if gt_copy["end"] > gt_copy["start"]:
+                                kept_global.append(gt_copy)
+                    global_turns = kept_global
+
+                    for lt in chunk_turns:
+                        mapped_spk = spk_map.get(lt["speaker"], lt["speaker"])
+                        if lt["end"] <= stitch_time:
+                            continue
+                        st_clamped = max(lt["start"], round(stitch_time, 3))
+                        if lt["end"] > st_clamped:
+                            global_turns.append({
+                                "start": st_clamped,
+                                "end": lt["end"],
+                                "speaker": mapped_spk
+                            })
+
+            if end_sec >= total_sec:
+                break
+            start_sec += step_sec
+            chunk_idx += 1
+
+        return global_turns
+
     def _diarize_nemo(
         self,
         audio_path: Path,
@@ -142,153 +417,103 @@ class SpeakerDiarizer:
         """
         Runs NVIDIA NeMo Sortformer end-to-end speaker diarization.
         Sortformer outputs (start, end, speaker) chronologically sorted.
+        Strictly uses NeMo Sortformer (with automatic chunked fallback on long audio or tight VRAM)
+        and never degrades to Pyannote when configured for NeMo.
         """
-        try:
-            logger.info(f"Running NVIDIA NeMo speaker diarization on {audio_path.name}...")
-            import torch
-            if self.device == "cuda" and torch.cuda.is_available():
-                try:
-                    torch.cuda.set_device(0)
-                except Exception:
-                    pass
-            with torch.inference_mode():
-                preds = self.nemo_model.diarize(audio=str(audio_path), batch_size=1)
+        import gc
+        import soundfile as sf
 
-            # Purge intermediate NeMo tensors immediately after forward pass
-            import gc
+        logger.info(f"Running NVIDIA NeMo speaker diarization on {audio_path.name}...")
+        if self.device == "cuda" and torch.cuda.is_available():
+            try:
+                torch.cuda.set_device(0)
+                gc.collect()
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+
+        data, sample_rate = sf.read(str(audio_path), dtype="float32")
+        if len(data.shape) > 1:
+            data = data.mean(axis=1)
+        data = np.ascontiguousarray(data, dtype=np.float32)
+        duration_sec = len(data) / float(sample_rate) if sample_rate > 0 else 0.0
+
+        free_vram_gb = 99.0
+        if self.device == "cuda" and torch.cuda.is_available():
+            try:
+                free_bytes, total_bytes = torch.cuda.mem_get_info(0)
+                free_vram_gb = free_bytes / (1024 ** 3)
+                logger.info(f"GPU VRAM before NeMo Sortformer: {free_vram_gb:.2f} GiB free / {total_bytes / (1024 ** 3):.2f} GiB total (audio={duration_sec:.1f}s)")
+            except Exception:
+                pass
+
+        turns: List[Dict[str, Any]] = []
+        # Proactively use chunked Sortformer if audio > 12 mins or free VRAM < 3.2 GiB
+        use_chunked = (duration_sec > 720.0) or (free_vram_gb < 3.2)
+        chunk_sec = 300.0 if free_vram_gb < 3.2 else 480.0
+
+        if not use_chunked:
+            try:
+                with torch.inference_mode():
+                    preds = self.nemo_model.diarize(audio=str(audio_path), batch_size=1)
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                turns = self._parse_nemo_preds(preds, offset_sec=0.0)
+            except (torch.cuda.OutOfMemoryError, RuntimeError, Exception) as e:
+                err_msg = str(e)
+                is_oom = "out of memory" in err_msg.lower() or ("cuda" in err_msg.lower() and "memory" in err_msg.lower())
+                if is_oom:
+                    logger.warning(
+                        f"NVIDIA NeMo full-file Sortformer hit CUDA OOM on {audio_path.name} ({duration_sec:.1f}s). "
+                        f"Clearing GPU cache and retrying with chunked NVIDIA NeMo Sortformer (240s windows)..."
+                    )
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    use_chunked = True
+                    chunk_sec = 240.0
+                else:
+                    logger.error(f"NVIDIA NeMo full-file diarization error ({e}), retrying with chunked NeMo Sortformer...", exc_info=True)
+                    use_chunked = True
+                    chunk_sec = 240.0
+
+        if use_chunked:
+            try:
+                turns = self._diarize_nemo_chunked(
+                    audio_path=audio_path,
+                    audio_data=data,
+                    sample_rate=sample_rate,
+                    chunk_sec=chunk_sec,
+                    overlap_sec=30.0
+                )
+            except Exception as chunk_err:
+                logger.error(f"Chunked NVIDIA NeMo Sortformer failed ({chunk_err}), retrying with 120s micro-windows...", exc_info=True)
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                turns = self._diarize_nemo_chunked(
+                    audio_path=audio_path,
+                    audio_data=data,
+                    sample_rate=sample_rate,
+                    chunk_sec=120.0,
+                    overlap_sec=20.0
+                )
+
+        # Post-diarization consolidation to prevent pitch/pause fractures
+        try:
+            turns = self._consolidate_fragmented_speakers(turns, audio_data=data, sample_rate=sample_rate)
+        except Exception as consol_e:
+            logger.debug(f"NeMo post-consolidation note ({consol_e}), using raw turns")
+        finally:
+            del data
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
-            if isinstance(preds, tuple):
-                preds = preds[0]
-
-            if isinstance(preds, str):
-                raw_segments = preds.strip().splitlines()
-            elif isinstance(preds, list):
-                if len(preds) > 0 and isinstance(preds[0], list) and not isinstance(preds[0], str):
-                    raw_segments = preds[0]
-                else:
-                    raw_segments = preds
-            else:
-                raw_segments = []
-
-            turns = []
-            for item in raw_segments:
-                if not item:
-                    continue
-
-                st, et, spk_label = None, None, None
-
-                # Format A: String line (e.g. "0.905 3.720 speaker_0" or RTTM "SPEAKER file 1 0.905 2.815 <NA> <NA> speaker_0 <NA> <NA>")
-                if isinstance(item, str):
-                    parts = item.strip().split()
-                    if not parts:
-                        continue
-                    if parts[0] == "SPEAKER" and len(parts) >= 8:
-                        # RTTM format: SPEAKER <file> <chnl> <tbeg> <tdur> <ortho> <stype> <name> <conf>
-                        try:
-                            st = float(parts[3])
-                            dur = float(parts[4])
-                            et = st + dur
-                            spk_label = parts[7]
-                        except (ValueError, IndexError):
-                            continue
-                    elif len(parts) >= 3:
-                        # Standard NeMo string: "start end speaker"
-                        try:
-                            st = float(parts[0])
-                            et = float(parts[1])
-                            spk_label = parts[2]
-                        except ValueError:
-                            continue
-                    elif len(parts) == 2:
-                        try:
-                            st = float(parts[0])
-                            et = float(parts[1])
-                            spk_label = "speaker_0"
-                        except ValueError:
-                            continue
-
-                # Format B: List or tuple: [start, end, speaker]
-                elif isinstance(item, (list, tuple)):
-                    if len(item) >= 3:
-                        try:
-                            st = float(item[0])
-                            et = float(item[1])
-                            spk_label = str(item[2])
-                        except (ValueError, TypeError):
-                            continue
-                    elif len(item) == 2:
-                        try:
-                            st = float(item[0])
-                            et = float(item[1])
-                            spk_label = "speaker_0"
-                        except (ValueError, TypeError):
-                            continue
-
-                if st is None or et is None or spk_label is None:
-                    continue
-
-                st = round(float(st), 3)
-                et = round(float(et), 3)
-                if et <= st:
-                    continue
-
-                spk_str = str(spk_label).strip().lower()
-                num = None
-                if spk_str.startswith("speaker_"):
-                    try:
-                        num = int(spk_str.replace("speaker_", "").strip())
-                    except ValueError:
-                        pass
-                elif spk_str.isdigit():
-                    num = int(spk_str)
-
-                if num is not None:
-                    formatted_spk = f"SPEAKER_{num:02d}"
-                else:
-                    formatted_spk = f"SPEAKER_{spk_str.upper()}"
-
-                turns.append({
-                    "start": st,
-                    "end": et,
-                    "speaker": formatted_spk
-                })
-
-            # Post-diarization consolidation to prevent pitch/pause fractures
-            try:
-                import soundfile as sf
-                data, sample_rate = sf.read(str(audio_path), dtype="float32")
-                if len(data.shape) > 1:
-                    data = data.mean(axis=1)
-                data = np.ascontiguousarray(data, dtype=np.float32)
-                turns = self._consolidate_fragmented_speakers(turns, audio_data=data, sample_rate=sample_rate)
-                del data
-                gc.collect()
-            except Exception as consol_e:
-                logger.debug(f"NeMo post-consolidation note ({consol_e}), using raw turns")
-
-            unique_detected = len(set(t["speaker"] for t in turns))
-            logger.info(f"NVIDIA NeMo diarization successful: detected {len(turns)} turns across {unique_detected} distinct speakers.")
-            return turns
-        except (torch.cuda.OutOfMemoryError, RuntimeError, Exception) as e:
-            err_msg = str(e)
-            is_oom = "out of memory" in err_msg.lower() or ("cuda" in err_msg.lower() and "memory" in err_msg.lower())
-            if is_oom:
-                logger.error(f"NVIDIA NeMo Sortformer OOM on {audio_path.name}: {e}. Clearing GPU cache and falling back to Pyannote...")
-                import gc
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-            else:
-                logger.error(f"NVIDIA NeMo diarization failed ({e}). Falling back to Pyannote...", exc_info=True)
-            if self.pipeline is None:
-                logger.info("Initializing Pyannote pipeline on-demand for fallback diarization...")
-                self._load_pyannote()
-            if self.pipeline is not None:
-                return self._diarize_pyannote(audio_path, min_speakers, max_speakers)
-            return []
+        unique_detected = len(set(t["speaker"] for t in turns))
+        logger.info(f"NVIDIA NeMo diarization successful: detected {len(turns)} turns across {unique_detected} distinct speakers.")
+        return turns
 
     def _diarize_pyannote(
         self,
@@ -592,6 +817,7 @@ class SpeakerDiarizer:
 
         logger.info(f"[CONSOLIDATION] {n_speakers} raw speakers → {len(ordered)} consolidated speakers.")
         return stitched_turns
+
     def assign_speakers(
         self,
         segments: List[Dict[str, Any]],
@@ -833,4 +1059,3 @@ class SpeakerDiarizer:
         unique_speakers = len(set(s["speaker"] for s in refined_segments))
         logger.info(f"Assigned {unique_speakers} unique speakers across {len(refined_segments)} refined segments.")
         return refined_segments, unique_speakers
-

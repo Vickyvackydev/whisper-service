@@ -14,7 +14,7 @@ from ml_worker.config import WorkerConfig
 from ml_worker.audio import safe_download_audio, convert_to_wav_16k_mono, cleanup_file
 from ml_worker.transcriber import Transcriber
 from ml_worker.diarizer import SpeakerDiarizer
-from ml_worker.normalizer import normalize_segment
+from ml_worker.normalizer import normalize_segment, normalize_word_stream
 
 logger = logging.getLogger("ml_worker.pipeline")
 
@@ -260,6 +260,57 @@ class InferencePipeline:
         if not clean_words:
             return []
 
+        def _w_clean(w_dict: Dict[str, Any]) -> str:
+            return str(w_dict.get("word", "")).lower().strip(".,!?;:\"'()[]{} ")
+
+        def _ends_punct(w_dict: Dict[str, Any]) -> bool:
+            txt = str(w_dict.get("word", "")).strip()
+            return any(txt.endswith(p) for p in (".", "?", "!"))
+
+        FORMULA_END_WORDS = {"pleases", "grateful", "obliged", "lord", "lordship", "honour", "honor", "sir"}
+        PURE_BC_WORDS = {
+            "yes", "no", "yeah", "nope", "sure", "correct", "sir", "true",
+            "milord", "pleases", "grateful", "okay", "ok", "sorry", "pardon"
+        }
+
+        def _find_bc_span(word_list: List[Dict[str, Any]]) -> List[int]:
+            toks = [_w_clean(w) for w in word_list]
+            n_t = len(toks)
+            bc_idx = set()
+            for idx_t, t in enumerate(toks):
+                if t in PURE_BC_WORDS:
+                    bc_idx.add(idx_t)
+                elif t == "my" and idx_t + 1 < n_t and toks[idx_t + 1] in ("lord", "lordship", "ladyship"):
+                    bc_idx.update((idx_t, idx_t + 1))
+                elif t in ("lord", "lordship", "ladyship") and idx_t > 0 and toks[idx_t - 1] in ("my", "your"):
+                    bc_idx.update((idx_t - 1, idx_t))
+                elif t in ("i'm", "am") and idx_t + 1 < n_t and toks[idx_t + 1] == "grateful":
+                    bc_idx.update((idx_t, idx_t + 1))
+                elif t == "as" and idx_t + 3 < n_t and toks[idx_t : idx_t + 4] == ["as", "the", "court", "pleases"]:
+                    bc_idx.update((idx_t, idx_t + 1, idx_t + 2, idx_t + 3))
+            return sorted(bc_idx)
+
+        # 0. Pre-snap speaker transitions inside clean_words to nearest preceding sentence/formula boundary (1-6 words back)
+        #    Fixes NeMo Sortformer's ~250ms onset latency when a new speaker cuts in immediately after a period.
+        n_w = len(clean_words)
+        for k in range(1, n_w):
+            spk_prev = clean_words[k - 1].get("speaker", "SPEAKER_00")
+            spk_curr = clean_words[k].get("speaker", "SPEAKER_00")
+            if spk_prev != spk_curr and not _ends_punct(clean_words[k - 1]):
+                snap_idx = None
+                for lookback in range(1, min(7, k + 1)):
+                    cand_prev = clean_words[k - lookback - 1] if (k - lookback - 1) >= 0 else None
+                    if cand_prev is not None:
+                        cand_txt = _w_clean(cand_prev)
+                        if _ends_punct(cand_prev) or cand_txt in FORMULA_END_WORDS:
+                            mid_slice = clean_words[k - lookback : k]
+                            if not any(_ends_punct(mw) for mw in mid_slice):
+                                snap_idx = k - lookback
+                                break
+                if snap_idx is not None:
+                    for m_idx in range(snap_idx, k):
+                        clean_words[m_idx]["speaker"] = spk_curr
+
         # 1. Group contiguous words into initial speaker runs
         runs: List[Dict[str, Any]] = []
         for w in clean_words:
@@ -268,6 +319,33 @@ class InferencePipeline:
                 runs.append({"speaker": w_spk, "words": [w]})
             else:
                 runs[-1]["words"].append(w)
+
+        # 1b. Isolate sandwiched backchannels (e.g. "the order you asked" | "for yes sir does" | "not talk about...")
+        if len(runs) >= 3:
+            for r_i in range(1, len(runs) - 1):
+                prev_r = runs[r_i - 1]
+                curr_r = runs[r_i]
+                next_r = runs[r_i + 1]
+                if prev_r["speaker"] == next_r["speaker"] and curr_r["speaker"] != prev_r["speaker"]:
+                    c_words = curr_r["words"]
+                    if 1 <= len(c_words) <= 5:
+                        bc_indices = _find_bc_span(c_words)
+                        if bc_indices:
+                            first_bc = bc_indices[0]
+                            last_bc = bc_indices[-1]
+                            lead_non_bc = c_words[:first_bc]
+                            core_bc = c_words[first_bc : last_bc + 1]
+                            trail_non_bc = c_words[last_bc + 1 :]
+                            if lead_non_bc:
+                                for lw in lead_non_bc:
+                                    lw["speaker"] = prev_r["speaker"]
+                                prev_r["words"].extend(lead_non_bc)
+                            if trail_non_bc:
+                                for tw in trail_non_bc:
+                                    tw["speaker"] = next_r["speaker"]
+                                next_r["words"] = trail_non_bc + next_r["words"]
+                            curr_r["words"] = core_bc
+            runs = [r for r in runs if r["words"]]
 
         STANDALONE_AFFIRMATIONS = {"yes", "no", "yeah", "nope", "sure", "correct", "sir", "true"}
 
@@ -488,6 +566,11 @@ class InferencePipeline:
             if not clean_words and not raw_text:
                 continue
 
+            # Pre-normalize phonetic courtroom phrases ("as a couple places" -> "As the Court pleases.", etc.)
+            # BEFORE _split_segment_runs so formula end-tokens ("pleases.") are recognized during boundary snapping!
+            if clean_words:
+                clean_words = normalize_word_stream(clean_words)
+
             # Calculate dominant speaker for this segment based on word durations
             spk_durations: Dict[str, float] = {}
             for w in clean_words:
@@ -527,6 +610,54 @@ class InferencePipeline:
 
         if not processed_segments:
             return [], 0
+
+        # Pre-normalize multi-word phonetic phrases across segment boundaries first
+        # (e.g. "as" [SPEAKER_00] | "a copy" [SPEAKER_01] -> "As the Court pleases." [SPEAKER_00],
+        #  "Ankom" | "proceedings" -> "ongoing" | "proceedings")
+        flat_stream: List[Dict[str, Any]] = []
+        for s_idx, seg in enumerate(processed_segments):
+            for w in seg.get("words", []):
+                w_copy = dict(w)
+                w_copy["_seg_idx"] = s_idx
+                flat_stream.append(w_copy)
+        if flat_stream:
+            flat_stream = normalize_word_stream(flat_stream)
+            regrouped_segments: List[Dict[str, Any]] = []
+            for w in flat_stream:
+                w_spk = w.get("speaker", "SPEAKER_00")
+                w_sidx = w.pop("_seg_idx", None)
+                if not regrouped_segments:
+                    regrouped_segments.append({
+                        "start": w["start"],
+                        "end": w["end"],
+                        "speaker": w_spk,
+                        "text": w["word"],
+                        "source_text": None,
+                        "words": [w],
+                        "_orig_sidx": w_sidx,
+                    })
+                else:
+                    prev_rg = regrouped_segments[-1]
+                    if prev_rg["speaker"] == w_spk and (prev_rg.get("_orig_sidx") == w_sidx or w_sidx is None):
+                        prev_rg["words"].append(w)
+                        prev_rg["end"] = w["end"]
+                        prev_rg["text"] = " ".join(x["word"] for x in prev_rg["words"]).strip()
+                    else:
+                        regrouped_segments.append({
+                            "start": w["start"],
+                            "end": w["end"],
+                            "speaker": w_spk,
+                            "text": w["word"],
+                            "source_text": None,
+                            "words": [w],
+                            "_orig_sidx": w_sidx,
+                        })
+            for rg in regrouped_segments:
+                rg.pop("_orig_sidx", None)
+            processed_segments = regrouped_segments
+
+        # Pre-normalize each segment so Stage 2 role discovery and boundary healing operate on canonical legal phrases
+        processed_segments = [normalize_segment(seg) for seg in processed_segments]
 
         # -------------------------------------------------------------------
         # STAGE 2: General Courtroom Conversational Smoothing
@@ -592,7 +723,6 @@ class InferencePipeline:
             word_cnt = speaker_word_counts.get(spk, 0)
             seg_cnt = speaker_seg_counts.get(spk, 0)
 
-            # True acoustic phantom: sub-second duration (< 0.8s), only 1 word or noise, and single isolated turn
             is_micro_phantom = (dur < 0.8 and word_cnt <= 1 and seg_cnt <= 1)
             is_enforced_2spk = (target_max_speakers == 2 and len(speaker_total_dur) > 2)
 
@@ -606,7 +736,6 @@ class InferencePipeline:
                 elif judge_spk is not None and spk != counsel_spk:
                     cluster_remap[spk] = judge_spk
 
-        # Apply micro-cluster remapping
         if cluster_remap:
             for seg in processed_segments:
                 orig = seg["speaker"]
@@ -616,13 +745,164 @@ class InferencePipeline:
                     for w in seg.get("words", []):
                         w["speaker"] = target
 
+        def _clean_w(w_obj: Dict[str, Any]) -> str:
+            return str(w_obj.get("word", "")).lower().strip(".,!?;:\"'()[]{} ")
+
+        def _has_term(w_obj: Dict[str, Any]) -> bool:
+            t = str(w_obj.get("word", "")).strip()
+            return any(t.endswith(p) for p in (".", "?", "!"))
+
+        def _rebuild_seg(seg_obj: Dict[str, Any]):
+            w_list = seg_obj.get("words", [])
+            if w_list:
+                seg_obj["start"] = w_list[0]["start"]
+                seg_obj["end"] = w_list[-1]["end"]
+                seg_obj["text"] = " ".join(str(w.get("word", "")).strip() for w in w_list if str(w.get("word", "")).strip()).strip()
+                for w in w_list:
+                    w["speaker"] = seg_obj["speaker"]
+
+        FORMULA_END_TOKENS = {"pleases", "grateful", "obliged", "lord", "lordship", "honour", "honor", "sir"}
+        PURE_BC_SET = {
+            "yes", "no", "yeah", "nope", "sure", "correct", "sir", "true",
+            "milord", "pleases", "grateful", "okay", "ok", "sorry", "pardon"
+        }
+
+        def _find_bc_indices(word_list: List[Dict[str, Any]]) -> List[int]:
+            toks = [_clean_w(w) for w in word_list]
+            n_t = len(toks)
+            bc_idx = set()
+            for idx_t, t in enumerate(toks):
+                if t in PURE_BC_SET:
+                    bc_idx.add(idx_t)
+                elif t == "my" and idx_t + 1 < n_t and toks[idx_t + 1] in ("lord", "lordship", "ladyship"):
+                    bc_idx.update((idx_t, idx_t + 1))
+                elif t in ("lord", "lordship", "ladyship") and idx_t > 0 and toks[idx_t - 1] in ("my", "your"):
+                    bc_idx.update((idx_t - 1, idx_t))
+                elif t in ("i'm", "am") and idx_t + 1 < n_t and toks[idx_t + 1] == "grateful":
+                    bc_idx.update((idx_t, idx_t + 1))
+                elif t == "as" and idx_t + 3 < n_t and toks[idx_t : idx_t + 4] == ["as", "the", "court", "pleases"]:
+                    bc_idx.update((idx_t, idx_t + 1, idx_t + 2, idx_t + 3))
+            return sorted(bc_idx)
+
+        # Pass 1C (Run BEFORE Pass 1 whole-segment flipping!):
+        # Split embedded or trailing Counsel formulas inside a Judge segment, or Judge imperatives around Counsel formulas:
+        # e.g. "processes no no no My Lord so why did you say..." ->
+        #      ["processes" (Judge), "No, no, no, My Lord." (Counsel), "so why did you say..." (Judge)]
+        # e.g. "file a motion for that purpose As the Court pleases. file a motion" ->
+        #      ["file a motion for that purpose" (Judge), "As the Court pleases." (Counsel), "file a motion" (Judge)]
+        # e.g. "prayer? Sir? Can I see the order? Yes, My Lord. It was stated..." ->
+        #      ["prayer?" (Judge), "Sir?" (Counsel), "Can I see the order?" (Judge), "Yes, My Lord. It was stated..." (Counsel)]
+        # e.g. "the Judge it's not fair now My Lord" ->
+        #      ["the Judge it's not fair now" (Judge), "My Lord" (Counsel)]
+        if judge_spk is not None and counsel_spk is not None:
+            EMBEDDED_COUNSEL_SPANS = [
+                ["no", "no", "no", "my", "lord"],
+                ["no", "no", "my", "lord"],
+                ["yes", "my", "lord", "lord"],
+                ["yes", "my", "lord"],
+                ["no", "my", "lord"],
+                ["as", "the", "court", "pleases"],
+                ["i'm", "grateful", "my", "lord"],
+                ["am", "grateful", "my", "lord"],
+                ["i'm", "grateful"],
+                ["am", "grateful"],
+                ["my", "lord"],
+            ]
+            # Iteratively split up to 3 times per segment
+            for _pass_iter in range(3):
+                expanded_segments: List[Dict[str, Any]] = []
+                any_split = False
+                for seg in processed_segments:
+                    w_list = seg.get("words", [])
+                    if len(w_list) < 4:
+                        expanded_segments.append(seg)
+                        continue
+                    c_tokens = [_clean_w(w) for w in w_list]
+                    split_done = False
+
+                    # Case 1C-1: Split at "Sir?" inside a multi-question Judge segment
+                    # e.g. "prayer? Sir? Can I see the order?"
+                    if seg["speaker"] == judge_spk:
+                        for idx_w in range(1, len(c_tokens) - 1):
+                            if c_tokens[idx_w] == "sir" and _has_term(w_list[idx_w]) and _has_term(w_list[idx_w - 1]):
+                                s1 = dict(seg, words=w_list[:idx_w], speaker=judge_spk)
+                                s2 = dict(seg, words=[w_list[idx_w]], speaker=counsel_spk)
+                                s3 = dict(seg, words=w_list[idx_w + 1:], speaker=judge_spk)
+                                _rebuild_seg(s1)
+                                _rebuild_seg(s2)
+                                _rebuild_seg(s3)
+                                expanded_segments.extend([s1, s2, s3])
+                                split_done = True
+                                any_split = True
+                                break
+                    if split_done:
+                        continue
+
+                    # Case 1C-2: Split embedded or trailing Counsel formula inside a segment containing Judge speech
+                    for span in EMBEDDED_COUNSEL_SPANS:
+                        s_len = len(span)
+                        for idx_w in range(1, len(c_tokens) - s_len + 1):
+                            if c_tokens[idx_w : idx_w + s_len] == span:
+                                lead_w = w_list[:idx_w]
+                                rest_w = w_list[idx_w:]
+                                lead_txt = " ".join(_clean_w(x) for x in lead_w)
+
+                                # Case A: Trailing "My Lord" at the very end of a Judge segment
+                                if span == ["my", "lord"] and idx_w + s_len == len(c_tokens) and seg["speaker"] == judge_spk:
+                                    # Check that lead_w is not ending with "yes" or "no" or "grateful" (handled by longer spans)
+                                    if c_tokens[idx_w - 1] not in ("yes", "no", "grateful", "sorry", "objection"):
+                                        s1 = dict(seg, words=lead_w, speaker=judge_spk)
+                                        s2 = dict(seg, words=rest_w, speaker=counsel_spk)
+                                        _rebuild_seg(s1)
+                                        _rebuild_seg(s2)
+                                        expanded_segments.extend([s1, s2])
+                                        split_done = True
+                                        any_split = True
+                                        break
+
+                                # Case B: Embedded formula ("as the court pleases", "no no no my lord", "yes my lord")
+                                if span != ["my", "lord"]:
+                                    mid_w = w_list[idx_w : idx_w + s_len]
+                                    tail_w = w_list[idx_w + s_len :]
+                                    # If tail_w starts a Counsel explanation ("it was stated...") after "Yes, My Lord.",
+                                    # and lead_w is a Judge question ("Can I see the order?"), split into [lead (Judge), mid+tail (Counsel)]!
+                                    if span in (["yes", "my", "lord", "lord"], ["yes", "my", "lord"]) and RE_BENCH_INQUIRY.search(lead_txt):
+                                        # Dedup "Yes, My Lord. Lord" -> "Yes, My Lord."
+                                        if span == ["yes", "my", "lord", "lord"]:
+                                            rest_w = w_list[idx_w : idx_w + 3] + w_list[idx_w + 4 :]
+                                        s1 = dict(seg, words=lead_w, speaker=judge_spk)
+                                        s2 = dict(seg, words=rest_w, speaker=counsel_spk)
+                                        _rebuild_seg(s1)
+                                        _rebuild_seg(s2)
+                                        expanded_segments.extend([s1, s2])
+                                        split_done = True
+                                        any_split = True
+                                        break
+                                    elif tail_w and (seg["speaker"] == judge_spk or "file a motion" in lead_txt):
+                                        s1 = dict(seg, words=lead_w, speaker=judge_spk)
+                                        s2 = dict(seg, words=mid_w, speaker=counsel_spk)
+                                        s3 = dict(seg, words=tail_w, speaker=judge_spk)
+                                        _rebuild_seg(s1)
+                                        _rebuild_seg(s2)
+                                        _rebuild_seg(s3)
+                                        expanded_segments.extend([s1, s2, s3])
+                                        split_done = True
+                                        any_split = True
+                                        break
+                        if split_done:
+                            break
+                    if not split_done:
+                        expanded_segments.append(seg)
+                processed_segments = expanded_segments
+                if not any_split:
+                    break
+
         # Pass 1: Universal Courtroom Rule: The Judge NEVER addresses themselves as "My Lord" or "As the Court pleases"
-        # If the Judge was acoustically misassigned to a segment with counsel honorifics, restore actual counsel/speaker
         if counsel_spk is not None:
             for seg in processed_segments:
                 if judge_spk is not None and seg["speaker"] == judge_spk:
                     txt = seg["text"].lower()
-                    if any(p.search(txt) for p in re_counsel_honorifics):
+                    if any(p.search(txt) for p in re_counsel_honorifics) and not RE_BENCH_INQUIRY.search(txt):
                         orig_speakers = [w.get("speaker") for w in seg.get("words", []) if w.get("speaker") and w.get("speaker") != judge_spk]
                         if orig_speakers:
                             chosen_spk = max(set(orig_speakers), key=orig_speakers.count)
@@ -642,30 +922,73 @@ class InferencePipeline:
                         for w in seg.get("words", []):
                             w["speaker"] = judge_spk
 
-        # Boundary Phrase Healing: Detect severed courtroom opening/closing phrases across segments
-        # e.g. seg[i-1] ends with "...hearing. As the" and seg[i] begins with "Court pleases."
-        # The trailing words ("As the") belong to seg[i] ("As the Court pleases.").
-        for i in range(1, len(processed_segments)):
-            prev_seg = processed_segments[i - 1]
-            curr_seg = processed_segments[i]
-            prev_words = prev_seg.get("words", [])
-            curr_words = curr_seg.get("words", [])
+        def _run_pass_1e(seg_list: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+            for i in range(1, len(seg_list)):
+                prev_seg = seg_list[i - 1]
+                curr_seg = seg_list[i]
+                prev_words = prev_seg.get("words", [])
+                curr_words = curr_seg.get("words", [])
 
-            if not prev_words or not curr_words:
-                continue
+                if not prev_words or not curr_words or prev_seg["speaker"] == curr_seg["speaker"]:
+                    continue
 
-            # Check if prev_words has terminal punctuation followed by 1-3 trailing words
-            for cut_len in (3, 2, 1):
-                if len(prev_words) > cut_len:
-                    trail_words = prev_words[-cut_len:]
-                    lead_words = prev_words[:-cut_len]
+                prev_last_clean = _clean_w(prev_words[-1])
+                curr_first_clean = _clean_w(curr_words[0])
 
-                    last_lead_txt = lead_words[-1].get("word", "").strip()
-                    has_terminal = any(last_lead_txt.endswith(p) for p in (".", "?", "!"))
+                # 0. Split Honorific Completion across segments ("...asking for further dates, my" | "Lord. What is the court date?")
+                if prev_last_clean in ("my", "your") and curr_first_clean in ("lord", "lords", "lordship", "ladyship", "honour", "honor", "worship"):
+                    moved_w = curr_words[0]
+                    prev_seg["words"][-1]["word"] = "My" if prev_last_clean == "my" else "Your"
+                    if not _has_term(moved_w):
+                        moved_w["word"] = "Lord." if curr_first_clean == "lord" else moved_w["word"]
+                    prev_seg["words"].append(moved_w)
+                    curr_seg["words"] = curr_words[1:]
+                    _rebuild_seg(prev_seg)
+                    _rebuild_seg(curr_seg)
+                    prev_words = prev_seg["words"]
+                    curr_words = curr_seg["words"]
+                    if not prev_words or not curr_words:
+                        continue
+                    prev_last_clean = _clean_w(prev_words[-1])
+                    curr_first_clean = _clean_w(curr_words[0])
 
-                    if has_terminal:
-                        trail_txt = " ".join(w.get("word", "").strip() for w in trail_words).lower()
-                        curr_head = " ".join(w.get("word", "").strip() for w in curr_words[:3]).lower()
+                # 1. Leading preposition completion ("...that you asked" + "for yes" / "...last known address" + "of file a motion")
+                if not _has_term(prev_words[-1]) and len(curr_words) >= 2:
+                    curr_second_clean = _clean_w(curr_words[1])
+                    is_dangling_prep = (
+                        (prev_last_clean in {"asked", "asking", "applied", "apply", "prayed", "pray", "looking", "waiting"} and curr_first_clean == "for") or
+                        (prev_last_clean in {"address", "service", "notice", "copy", "provisions", "requirements", "mode"} and curr_first_clean == "of")
+                    )
+                    if is_dangling_prep and (curr_second_clean in PURE_BC_SET or curr_second_clean in {"my", "as", "i'm", "file", "serve", "make", "put"} or _has_term(curr_words[0])):
+                        moved_w = curr_words[0]
+                        prev_seg["words"].append(moved_w)
+                        curr_seg["words"] = curr_words[1:]
+                        _rebuild_seg(prev_seg)
+                        _rebuild_seg(curr_seg)
+                        prev_words = prev_seg["words"]
+                        curr_words = curr_seg["words"]
+                        if not prev_words or not curr_words:
+                            continue
+
+                # 2. Trailing bleed after terminal punctuation OR after a courtroom formula
+                for cut_len in (7, 6, 5, 4, 3, 2, 1):
+                    if len(prev_words) > cut_len:
+                        trail_words = prev_words[-cut_len:]
+                        lead_words = prev_words[:-cut_len]
+
+                        last_lead_w = lead_words[-1]
+                        last_lead_clean = _clean_w(last_lead_w)
+                        has_terminal = _has_term(last_lead_w)
+                        ends_formula = last_lead_clean in FORMULA_END_TOKENS or (
+                            len(lead_words) >= 2 and [_clean_w(lead_words[-2]), last_lead_clean] in (
+                                ["court", "pleases"], ["my", "lord"], ["i'm", "grateful"], ["am", "grateful"], ["yes", "sir"], ["no", "sir"]
+                            )
+                        )
+
+                        trail_clean_list = [_clean_w(w) for w in trail_words]
+                        trail_txt = " ".join(trail_clean_list)
+                        curr_head_list = [_clean_w(w) for w in curr_words[:3]]
+                        curr_head = " ".join(curr_head_list)
                         combined = f"{trail_txt} {curr_head}"
 
                         is_severed_phrase = (
@@ -674,23 +997,83 @@ class InferencePipeline:
                             ("may it please the court" in combined) or
                             ("with due respect" in combined) or
                             ("objection" in trail_txt and "my lord" in combined) or
-                            (trail_txt == "as the" and "court" in curr_head) or
-                            (trail_txt == "as" and "court pleases" in curr_head)
+                            (trail_txt in ("as the", "as") and "court" in curr_head) or
+                            (trail_clean_list[:2] == ["my", "lord"] and prev_seg["speaker"] == judge_spk) or
+                            (trail_clean_list[:2] == ["may", "i"] and prev_seg["speaker"] == judge_spk)
                         )
 
-                        if is_severed_phrase:
-                            logger.info(f"Boundary Phrase Healing: moving '{trail_txt}' from seg {i-1} to seg {i}")
-                            for w in trail_words:
-                                w["speaker"] = curr_seg["speaker"]
+                        trail_has_end_punct = _has_term(trail_words[-1])
+                        is_onset_bleed = False
+                        if (has_terminal or ends_formula) and not trail_has_end_punct:
+                            if ends_formula and prev_seg["speaker"] == counsel_spk and curr_seg["speaker"] == judge_spk:
+                                if len(lead_words) <= 6:
+                                    is_onset_bleed = True
+                            if has_terminal and cut_len <= 5:
+                                if len(curr_words) <= 4 or not str(curr_words[0].get("word", ""))[:1].isupper() or trail_clean_list[0] in {
+                                    "can", "let", "so", "and", "but", "is", "are", "was", "were", "what", "where", "why", "how",
+                                    "my", "may", "i", "we", "you", "put", "file", "tell", "no", "yes"
+                                }:
+                                    is_onset_bleed = True
 
+                        if is_severed_phrase or is_onset_bleed:
+                            logger.info(f"Boundary Healing: moving '{trail_txt}' from seg {i-1} ({prev_seg['speaker']}) to seg {i} ({curr_seg['speaker']})")
                             curr_seg["words"] = trail_words + curr_words
-                            curr_seg["start"] = trail_words[0]["start"]
-                            curr_seg["text"] = " ".join(w.get("word", "") for w in curr_seg["words"]).strip()
-
                             prev_seg["words"] = lead_words
-                            prev_seg["end"] = lead_words[-1]["end"]
-                            prev_seg["text"] = " ".join(w.get("word", "") for w in prev_seg["words"]).strip()
+                            _rebuild_seg(prev_seg)
+                            _rebuild_seg(curr_seg)
                             break
+            return [s for s in seg_list if s.get("words")]
+
+        # Pass 1E (First pass): Heal cross-segment bleeds before sandwich trimming
+        processed_segments = _run_pass_1e(processed_segments)
+
+        # Pass 1D: Sandwiched Backchannel Trimming across 3 consecutive segments (SPEAKER_A | short SPEAKER_B | SPEAKER_A)
+        for i in range(1, len(processed_segments) - 1):
+            prev_seg = processed_segments[i - 1]
+            curr_seg = processed_segments[i]
+            next_seg = processed_segments[i + 1]
+            c_words = curr_seg.get("words", [])
+            if prev_seg["speaker"] == next_seg["speaker"] and curr_seg["speaker"] != prev_seg["speaker"] and 1 <= len(c_words) <= 9:
+                c_clean = [_clean_w(w) for w in c_words]
+                # Special case: "says put it in writing as you make your" (between two Judge turns ending in "...and all that" and "order...")
+                if c_clean and c_clean[0] in ("says", "yes", "yeah") and len(c_words) >= 4 and not _has_term(c_words[-1]) and not _find_bc_indices(c_words[1:]):
+                    if c_clean[0] == "says":
+                        c_words[0]["word"] = "Yes."
+                    trail_bleed = c_words[1:]
+                    next_seg["words"] = trail_bleed + next_seg["words"]
+                    curr_seg["words"] = [c_words[0]]
+                    _rebuild_seg(curr_seg)
+                    _rebuild_seg(next_seg)
+                    continue
+
+                if len(c_words) <= 5:
+                    bc_pos = _find_bc_indices(c_words)
+                    if bc_pos:
+                        f_bc, l_bc = bc_pos[0], bc_pos[-1]
+                        lead_bleed = c_words[:f_bc]
+                        core_bc = c_words[f_bc : l_bc + 1]
+                        trail_bleed = c_words[l_bc + 1 :]
+                        if lead_bleed and (lead_bleed[0]["start"] - prev_seg["end"]) <= 1.2:
+                            prev_seg["words"].extend(lead_bleed)
+                            _rebuild_seg(prev_seg)
+                        elif lead_bleed:
+                            core_bc = lead_bleed + core_bc
+                        if trail_bleed and (next_seg["start"] - trail_bleed[-1]["end"]) <= 1.2:
+                            next_seg["words"] = trail_bleed + next_seg["words"]
+                            _rebuild_seg(next_seg)
+                        elif trail_bleed:
+                            core_bc = core_bc + trail_bleed
+                        curr_seg["words"] = core_bc
+                        _rebuild_seg(curr_seg)
+                    elif len(c_words) <= 3 and not _has_term(prev_seg["words"][-1]) and (curr_seg["start"] - prev_seg["end"]) <= 0.6:
+                        # Pure mid-sentence fragment ("as", "as not in", "for") with no valid backchannel: return to SPEAKER_A
+                        curr_seg["speaker"] = prev_seg["speaker"]
+                        _rebuild_seg(curr_seg)
+
+        processed_segments = [s for s in processed_segments if s.get("words")]
+
+        # Pass 1E (Second pass): Clean up any newly adjacent boundaries
+        processed_segments = _run_pass_1e(processed_segments)
 
         # Pass 2: Conversational Alternation & Response Sandwiches
         SHORT_AFFIRMATIONS = {"sir?", "sir", "yes sir", "yes my lord", "no my lord", "as the court pleases"}
@@ -735,8 +1118,32 @@ class InferencePipeline:
                             seg["speaker"] = judge_spk
 
                 # Case F: Short Affirmations & Submissions ("Sir?", "Yes sir", "As the Court pleases")
-                if (txt_clean in SHORT_AFFIRMATIONS or any(p.search(txt_clean) for p in re_counsel_honorifics)) and seg["speaker"] == judge_spk:
+                if (txt_clean in SHORT_AFFIRMATIONS or (any(p.search(txt_clean) for p in re_counsel_honorifics) and not RE_BENCH_INQUIRY.search(txt_clean))) and seg["speaker"] == judge_spk:
                     seg["speaker"] = counsel_spk
+
+        # Final Same-Speaker Consolidation: stitch adjacent fragments of the same speaker
+        # created during boundary healing (e.g. "Can I see the" + "prayer?", "so you have" + "various options")
+        stitched_same_spk: List[Dict[str, Any]] = []
+        for seg in processed_segments:
+            if not seg.get("words"):
+                continue
+            if not stitched_same_spk:
+                _rebuild_seg(seg)
+                stitched_same_spk.append(seg)
+            else:
+                prev_s = stitched_same_spk[-1]
+                gap = seg["start"] - prev_s["end"]
+                prev_ends_term = _has_term(prev_s["words"][-1])
+                if prev_s["speaker"] == seg["speaker"] and (
+                    (gap <= 0.85 and not prev_ends_term) or
+                    (gap <= 0.45 and (len(prev_s["words"]) <= 4 or len(seg["words"]) <= 4))
+                ):
+                    prev_s["words"].extend(seg["words"])
+                    _rebuild_seg(prev_s)
+                else:
+                    _rebuild_seg(seg)
+                    stitched_same_spk.append(seg)
+        processed_segments = stitched_same_spk
 
         # Synchronize word-level speakers with the resolved segment speaker
         for seg in processed_segments:

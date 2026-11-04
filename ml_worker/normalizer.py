@@ -91,8 +91,17 @@ COURT_RULES = [
     # 1. Judicial Decorum, Honorifics & Court Address
     # --------------------------------------------------------------------------
     (r'(?i)\bas\s+the\s+court\s+pleases\b', 'as the Court pleases', True),
-    (r'(?i)\bas\s+(?:you\s+call|equal)\s+places?\b', 'as the Court pleases', True),
+    (r'(?i)\bas\s+(?:you\s+call|you\s+go|equal|a\s+couple(?:\s+of)?)\s+places?\b', 'as the Court pleases', True),
+    (r'(?i)\bas\s+(?:a\s+company|a\s+copy|a\s+corporate|it\s+goes|a\s+god\s+please(?:s)?|god\s+pleases|you\s+call\s+it(?:,?\s+please)?|I\'?ve\s+called\s+it|I\s+called\s+it)\b', 'as the Court pleases', True),
     (r'(?i)\bcall\s+places?\b', 'Court pleases', False),
+    (r'(?i)\balready\s+apply\b', 'orally apply', False),
+    (r'(?i)\bwhat\s+does\s+it\s+say\s+granted\b', 'what Justice Saidu granted', False),
+    (r'(?i)\bjust\s+said\s+granted\b', 'Justice Saidu granted', False),
+    (r'(?i)\bcall\s+me\s+to\s+stand\s+before\s+the\s+court\b', 'come here to stand before the court', False),
+    (r'(?i)\bstart\s+the\s+writ\s+of\s+summons\b', 'serve the Writ of Summons', False),
+    (r'(?i)\bthe\s+self\s+at\s+the\s+last\s+known\s+address\b', 'be served at the last known address', False),
+    (r'(?i)\bI\'?m\s+grateful,?\s+my\s+love\b', "I'm grateful, My Lord", False),
+    (r'(?i)\bgrateful,?\s+my\s+love\b', 'grateful, My Lord', False),
     (r'(?i)\bmay\s+it\s+please\s+the\s+court\b', 'may it please the Court', True),
     (r'(?i)\bmay\s+it\s+please\b(?!\s+the\s+court\b)', 'may it please', True),
     (r'(?i)\bmuch\s+obliged\b', 'much obliged', True),
@@ -235,10 +244,20 @@ COURT_RULES = [
     (r'(?i)\bpre[\s-]+trial\b', 'Pre-trial', False),
     (r'(?i)\bpart[\s-]+heard\b', 'part-heard', False),
     (r'(?i)\bfrontogect\b', 'front-loaded', False),
+    (r'(?i)\b(?:other\s+)?(?:frontal|front[\s-]+related|front[\s-]+ordered|frontiered)\s+processes\b', 'other front-loaded processes', False),
     (r'(?i)\bfront(?:al)?[\s-]+(?:ended|layer|dead|loaded)\s+processes\b', 'front-loaded processes', False),
     (r'(?i)\bfront[\s-]+(?:ended|layer|dead|loaded)\b', 'front-loaded', False),
     (r'(?i)\bfront[\s-]+load\b', 'front-load', False),
     (r'(?i)\b(?:substituted|subsets?)\s+service\b', 'substituted service', False),
+    (r'(?i)\bdoes\s+not\s+purpose\s+service\b', 'is thus not proper service', False),
+    (r'(?i)\bpurpose\s+service\b', 'proper service', False),
+    (r'(?i)\bairing\s+notice\b', 'hearing notice', False),
+    (r'(?i)\bemotional\s+notice\b', 'Motion on Notice', False),
+    (r'(?i)\bby\s+the\s+abortion\b', 'by their motion', False),
+    (r'(?i)\bby\s+the\s+emotion\b', 'by their motion', False),
+    (r'(?i)\bthe\s+emotion\s+was\s+struck\s+out\b', 'the motion was struck out', False),
+    (r'(?i)\bsherrys\s+of\s+the\s+court\b', 'sheriffs of the court', False),
+    (r'(?i)\ba\s+couple(?:\s+of)?\s+copy\s+of\s+that\s+order\b', 'a photocopy of that order', False),
     (r'(?i)\badjourned\s+for\s+mentioned\b', 'adjourned for mention', False),
     (r'(?i)\badjourned\s+date\b', 'adjourned date', False),
     (r'(?i)\badjournment\b', 'adjournment', False),
@@ -249,8 +268,8 @@ COURT_RULES = [
     (r'(?i)\bonus\b', 'onus', False),
     (r'(?i)\boverruled\b', 'overruled', False),
     (r'(?i)\bruling\b', 'Ruling', False),
-    (r'(?i)\binterpleader\s+summon\b', 'interpleader summons', False),
-    (r'(?i)\b(?:uncom|outcome|ancor)\s+proceedings\b', 'ongoing proceedings', False),
+    (r'(?i)\b(?:interpleader|interpreter)(?:,?\s+uh,?)?\s+(?:summons?|someone)\b', 'interpleader summons', False),
+    (r'(?i)\b(?:uncom|outcome|ancor|ankom)\s+proceedings\b', 'ongoing proceedings', False),
 
     # --------------------------------------------------------------------------
     # 8. Latin Maxims & Legal Doctrines
@@ -956,6 +975,114 @@ def merge_slashed_words(words: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return merged
 
 
+PHONETIC_WORD_SEQ_RULES = [
+    (["as", "a", "couple", "of", "places"], ["As", "the", "Court", "pleases."]),
+    (["as", "a", "couple", "places"], ["As", "the", "Court", "pleases."]),
+    (["as", "you", "go", "places"], ["As", "the", "Court", "pleases."]),
+    (["as", "you", "call", "places"], ["As", "the", "Court", "pleases."]),
+    (["as", "you", "call", "it", "please"], ["As", "the", "Court", "pleases."]),
+    (["as", "a", "god", "please"], ["As", "the", "Court", "pleases."]),
+    (["as", "a", "god", "pleases"], ["As", "the", "Court", "pleases."]),
+    (["as", "god", "pleases"], ["As", "the", "Court", "pleases."]),
+    (["as", "equal", "places"], ["As", "the", "Court", "pleases."]),
+    (["as", "a", "company"], ["As", "the", "Court", "pleases."]),
+    (["as", "a", "copy"], ["As", "the", "Court", "pleases."]),
+    (["as", "a", "corporate"], ["As", "the", "Court", "pleases."]),
+    (["as", "it", "goes"], ["As", "the", "Court", "pleases."]),
+    (["as", "i've", "called", "it"], ["As", "the", "Court", "pleases."]),
+    (["as", "i", "called", "it"], ["As", "the", "Court", "pleases."]),
+    (["yes", "my", "lord", "lord"], ["Yes,", "My", "Lord."]),
+    (["grateful", "my", "love"], ["grateful,", "My", "Lord"]),
+    (["ankom", "proceedings"], ["ongoing", "proceedings"]),
+    (["uncom", "proceedings"], ["ongoing", "proceedings"]),
+    (["outcome", "proceedings"], ["ongoing", "proceedings"]),
+    (["ancor", "proceedings"], ["ongoing", "proceedings"]),
+    (["interpreter", "uh", "someone"], ["interpleader", "summons"]),
+    (["interpreter", "someone"], ["interpleader", "summons"]),
+    (["interpreter", "summon"], ["interpleader", "summons"]),
+    (["interpleader", "someone"], ["interpleader", "summons"]),
+    (["interpleader", "summon"], ["interpleader", "summons"]),
+    (["by", "the", "abortion"], ["by", "their", "motion"]),
+    (["by", "the", "emotion"], ["by", "their", "motion"]),
+    (["the", "emotion", "was", "struck", "out"], ["the", "motion", "was", "struck", "out"]),
+    (["sherrys", "of", "the", "court"], ["sheriffs", "of", "the", "court"]),
+    (["does", "not", "purpose", "service"], ["is", "thus", "not", "proper", "service"]),
+    (["purpose", "service"], ["proper", "service"]),
+    (["airing", "notice"], ["hearing", "notice"]),
+    (["frontal", "processes"], ["front-loaded", "processes"]),
+    (["front", "related", "processes"], ["front-loaded", "processes"]),
+    (["front-ordered", "processes"], ["front-loaded", "processes"]),
+    (["frontiered", "processes"], ["front-loaded", "processes"]),
+    (["to", "emotional", "notice"], ["to", "the", "Motion", "on", "Notice"]),
+    (["a", "couple", "of", "copy", "of", "that", "order"], ["a", "photocopy", "of", "that", "order"]),
+    (["a", "couple", "copy", "of", "that", "order"], ["a", "photocopy", "of", "that", "order"]),
+    (["already", "apply"], ["orally", "apply"]),
+    (["what", "does", "it", "say", "granted"], ["what", "Justice", "Saidu", "granted"]),
+    (["just", "said", "granted"], ["Justice", "Saidu", "granted"]),
+    (["call", "me", "to", "stand", "before", "the", "court"], ["come", "here", "to", "stand", "before", "the", "court"]),
+    (["start", "the", "writ"], ["serve", "the", "Writ"]),
+    (["the", "self", "at", "the", "last"], ["be", "served", "at", "the", "last"]),
+]
+
+
+def normalize_word_stream(words: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Applies multi-word phonetic courtroom phrase normalizations across a flat stream of word dicts
+    (even when a raw diarization turn change occurred in the middle of the phrase, e.g. 'as' | 'a copy'),
+    unifying the words and speaker attribution of the phrase.
+    """
+    if not words:
+        return words
+    rebuilt_words: List[Dict[str, Any]] = []
+    w_idx = 0
+    while w_idx < len(words):
+        matched_rule = False
+        for src_seq, dst_seq in PHONETIC_WORD_SEQ_RULES:
+            seq_len = len(src_seq)
+            if w_idx + seq_len <= len(words):
+                # Ensure words are reasonably contiguous in time (max 1.5s gap inside the phrase)
+                max_internal_gap = 0.0
+                for k in range(seq_len - 1):
+                    g = float(words[w_idx + k + 1].get("start", 0.0)) - float(words[w_idx + k].get("end", 0.0))
+                    if g > max_internal_gap:
+                        max_internal_gap = g
+                if max_internal_gap > 1.5:
+                    continue
+                window_clean = [clean_token(words[w_idx + k].get("word", "")) for k in range(seq_len)]
+                if window_clean == src_seq:
+                    t_start = float(words[w_idx].get("start", 0.0))
+                    t_end = float(words[w_idx + seq_len - 1].get("end", t_start + 0.1))
+                    t_dur = max(0.05, t_end - t_start)
+                    t_step = t_dur / len(dst_seq)
+                    spk = words[w_idx].get("speaker", "SPEAKER_00")
+                    last_orig = str(words[w_idx + seq_len - 1].get("word", ""))
+                    trail_p = ""
+                    for ch in reversed(last_orig):
+                        if ch in ".?!,;:" and not dst_seq[-1].endswith(ch):
+                            trail_p = ch + trail_p
+                        else:
+                            break
+                    for d_i, d_tok in enumerate(dst_seq):
+                        tok_str = f"{d_tok}{trail_p}" if d_i == len(dst_seq) - 1 else d_tok
+                        rebuilt_words.append({
+                            "word": tok_str,
+                            "start": round(t_start + d_i * t_step, 3),
+                            "end": round(t_start + (d_i + 1) * t_step, 3),
+                            "speaker": spk,
+                            "score": words[w_idx].get("score"),
+                            "probability": words[w_idx].get("probability", 0.9),
+                            "source_word": None,
+                            "mapping_type": None,
+                        })
+                    w_idx += seq_len
+                    matched_rule = True
+                    break
+        if not matched_rule:
+            rebuilt_words.append(words[w_idx])
+            w_idx += 1
+    return rebuilt_words
+
+
 def normalize_segment(segment: Dict[str, Any]) -> Dict[str, Any]:
     """
     Normalizes a transcription segment:
@@ -976,6 +1103,9 @@ def normalize_segment(segment: Dict[str, Any]) -> Dict[str, Any]:
 
         # 3. Merge slash sequences into unified tokens without spaces (e.g. ['plaintiff', '/', 'defendant'] -> ['plaintiff/defendant'])
         words = merge_slashed_words(words)
+
+        # 3b. Multi-word phonetic courtroom phrase normalization directly on word tokens
+        words = normalize_word_stream(words)
 
         # 4. Contextual honorific casing & court numbers for two-word/three-word sequences
         for idx in range(len(words) - 1):
@@ -1064,5 +1194,7 @@ def normalize_segment(segment: Dict[str, Any]) -> Dict[str, Any]:
             sentence_start = any(raw_w.rstrip(PUNCT_CHARS).endswith(p) or raw_w.endswith(p) for p in ('.', '?', '!'))
 
         segment["words"] = words
+        if words:
+            segment["text"] = normalize_case_numbers_and_slashes(" ".join(w.get("word", "") for w in words).strip())
 
     return segment

@@ -40,11 +40,47 @@ class MLWorker:
         self.worker_status = "idle"
         self.heartbeat_thread: Optional[threading.Thread] = None
 
+    def _terminate_duplicate_workers(self):
+        """
+        Ensures only a single ml_worker.worker process holds GPU VRAM unless ALLOW_MULTI_WORKER=true.
+        Prevents duplicate background workers from consuming 2x 8.7 GiB on a 20 GiB GPU and causing NeMo OOM.
+        """
+        if os.getenv("ALLOW_MULTI_WORKER", "false").lower() in ("true", "1", "yes"):
+            return
+        my_pid = os.getpid()
+        if sys.platform != "win32" and os.path.isdir("/proc"):
+            killed = []
+            for entry in os.listdir("/proc"):
+                if not entry.isdigit():
+                    continue
+                pid = int(entry)
+                if pid == my_pid:
+                    continue
+                try:
+                    with open(f"/proc/{pid}/cmdline", "rb") as f:
+                        cmd = f.read().decode("utf-8", errors="ignore").replace("\x00", " ")
+                    if "ml_worker.worker" in cmd or "ml_worker/worker.py" in cmd:
+                        logger.warning(f"Found existing ml_worker.worker process (PID {pid}: '{cmd.strip()}'). Terminating it to free GPU VRAM...")
+                        os.kill(pid, signal.SIGTERM)
+                        killed.append(pid)
+                except Exception:
+                    continue
+            if killed:
+                time.sleep(2.5)
+                for pid in killed:
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                    except Exception:
+                        pass
+
     def initialize_models(self):
         logger.info("==================================================")
-        logger.info(f"Initializing ML Worker: {self.config.WORKER_ID}")
+        logger.info(f"Initializing ML Worker: {self.config.WORKER_ID} (PID {os.getpid()})")
         logger.info("==================================================")
-        
+
+        # 0. Prevent duplicate worker processes from hogging GPU VRAM
+        self._terminate_duplicate_workers()
+
         # 1. Connect to PostgreSQL
         self.db.connect()
 

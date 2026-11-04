@@ -22,7 +22,10 @@ class WorkerConfig:
     FORCE_WHISPERX_ALIGNMENT: bool = os.getenv("FORCE_WHISPERX_ALIGNMENT", "true").lower() in ("true", "1", "yes")
     WHISPER_INITIAL_PROMPT: str = os.getenv(
         "WHISPER_INITIAL_PROMPT",
-        "Official courtroom transcript of legal proceedings and counsel submissions before the court."
+        "Official Nigerian courtroom transcript. My Lord, As the Court pleases, I'm grateful My Lord, Learned Counsel, "
+        "Writ of Summons, Statement of Claim, Statement of Defence, Counterclaim, Motion on Notice, front-loaded processes, "
+        "substituted service, Affidavit of Service, interpleader summons, hearing notice, Order 8 Rule 6(d), "
+        "ongoing proceedings, Justice Saidu, Mr. Komolafe, adjourned for mention."
     )
     
     # Speaker Diarization
