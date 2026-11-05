@@ -51,10 +51,10 @@ class WorkerConfig:
     
     # Worker Identifiers & Concurrency
     WORKER_ID: str = os.getenv("WORKER_ID", f"gpu-worker-{socket.gethostname()}-{uuid.uuid4().hex[:6]}")
-    WORKER_CONCURRENCY: int = 1
+    WORKER_CONCURRENCY: int = max(1, int(os.getenv("WORKER_CONCURRENCY", "2")))
     WHISPER_NUM_WORKERS: int = 1
     HEARTBEAT_INTERVAL: float = float(os.getenv("HEARTBEAT_INTERVAL", "5.0"))
-    POLL_INTERVAL: float = float(os.getenv("POLL_INTERVAL", "0.5"))
+    POLL_INTERVAL: float = float(os.getenv("POLL_INTERVAL", "0.25"))
     
     # Audio & Safety limits
     MAX_AUDIO_DURATION_SECONDS: int = int(os.getenv("MAX_AUDIO_DURATION_SECONDS", "14400"))  # 4 hours

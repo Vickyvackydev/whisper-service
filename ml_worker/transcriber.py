@@ -70,21 +70,23 @@ class Transcriber:
         target_language: Optional[str] = None,
         enable_translation: bool = False,
         mode: str = "fast",
-        progress_callback = None
+        progress_callback = None,
+        audio_data: Optional[Any] = None,
+        need_word_timestamps: bool = True
     ) -> Dict[str, Any]:
         if self.model is None:
             self.load_model()
 
         # Configure decoding based on transcription mode.
-        # Avoid 6-step temperature cascade on noisy courtroom silence which causes 6x-30x slowdowns,
-        # while preserving 5-beam search and [0.0, 0.2] fallback for full word recall and segment boundary accuracy.
+        # Avoid multi-step temperature cascade on noisy courtroom silence which causes 6x-30x slowdowns,
+        # while preserving beam search for full word recall and segment boundary accuracy.
         beam_size = 1
         temperature: Any = 0.0
         if mode == "accurate":
-            beam_size = 5
-            temperature = [0.0, 0.2]
-        elif mode == "balanced":
             beam_size = 3
+            temperature = 0.0
+        elif mode == "balanced":
+            beam_size = 2
             temperature = 0.0
 
         lang_arg = language.lower().strip() if (language and language.lower().strip() not in ("auto", "none")) else None
@@ -104,7 +106,7 @@ class Transcriber:
         logger.info(
             f"Running Whisper inference: task={task}, source_language={lang_arg}, "
             f"target_language={target_lang_arg or ('en' if task == 'translate' else lang_arg)}, "
-            f"beam_size={beam_size}, temperature={temperature}"
+            f"beam_size={beam_size}, temperature={temperature}, word_timestamps={need_word_timestamps}"
         )
 
         # Optimal VAD and decoding parameters for high accuracy & preserving courtroom speech
@@ -129,15 +131,16 @@ class Transcriber:
 
         raw_segments = None
         info = None
+        audio_input = audio_data if audio_data is not None else str(audio_path)
 
         try:
             segments_iter, info = self.model.transcribe(
-                str(audio_path),
+                audio_input,
                 language=lang_arg,
                 task=task,
                 beam_size=beam_size,
                 temperature=temperature,
-                word_timestamps=True,
+                word_timestamps=need_word_timestamps,
                 vad_filter=True,
                 vad_parameters=vad_params,
                 condition_on_previous_text=False,
@@ -162,12 +165,12 @@ class Transcriber:
                     pass
             self.load_model()
             segments_iter, info = self.model.transcribe(
-                str(audio_path),
+                audio_input,
                 language=lang_arg,
                 task=task,
-                beam_size=3,
+                beam_size=2,
                 temperature=0.0,
-                word_timestamps=True,
+                word_timestamps=need_word_timestamps,
                 vad_filter=True,
                 vad_parameters=vad_params,
                 condition_on_previous_text=False,

@@ -31,6 +31,7 @@ class InferencePipeline:
     def __init__(self, transcriber: Transcriber, diarizer: SpeakerDiarizer):
         self.transcriber = transcriber
         self.diarizer = diarizer
+        self._whisper_lock = threading.Lock()
         self._align_lock = threading.Lock()
         self._diarize_lock = threading.Lock()
         self._align_models: Dict[str, Tuple[Any, Any]] = {}
@@ -57,30 +58,50 @@ class InferencePipeline:
         language: Optional[str] = None,
         target_language: Optional[str] = None,
         transcription_mode: str = "fast",
-        progress_updater: Optional[Callable[[str, int], None]] = None
+        progress_updater: Optional[Callable[[str, int], None]] = None,
+        prefetched_wav: Optional[Tuple[Path, float]] = None
     ) -> Dict[str, Any]:
         start_time = time.time()
         raw_download_path: Optional[Path] = None
         wav_path: Optional[Path] = None
+        audio_arr: Optional[Any] = None
 
         try:
-            # 1. Downloading
-            if progress_updater:
-                progress_updater("downloading", 10)
-            logger.info(f"[{job_id}] Downloading audio from: {audio_url}")
-            raw_download_path = safe_download_audio(audio_url, WorkerConfig.SCRATCH_DIR)
+            if prefetched_wav is not None and prefetched_wav[0].exists():
+                wav_path, audio_duration = prefetched_wav
+                if progress_updater:
+                    progress_updater("preprocessing", 30)
+                logger.info(f"[{job_id}] Using pre-downloaded & normalized 16kHz WAV ({audio_duration:.2f}s): {wav_path}")
+            else:
+                # 1. Downloading
+                if progress_updater:
+                    progress_updater("downloading", 10)
+                logger.info(f"[{job_id}] Downloading audio from: {audio_url}")
+                raw_download_path = safe_download_audio(audio_url, WorkerConfig.SCRATCH_DIR)
 
-            # 2. Preprocessing / ffmpeg normalization
-            if progress_updater:
-                progress_updater("preprocessing", 25)
-            logger.info(f"[{job_id}] Normalizing audio to 16kHz mono WAV...")
-            wav_path, audio_duration = convert_to_wav_16k_mono(raw_download_path, WorkerConfig.SCRATCH_DIR)
+                # 2. Preprocessing / ffmpeg normalization
+                if progress_updater:
+                    progress_updater("preprocessing", 25)
+                logger.info(f"[{job_id}] Normalizing audio to 16kHz mono WAV...")
+                wav_path, audio_duration = convert_to_wav_16k_mono(raw_download_path, WorkerConfig.SCRATCH_DIR)
 
-            # Clean raw download immediately to save disk
-            cleanup_file(raw_download_path)
-            raw_download_path = None
+                # Clean raw download immediately to save disk
+                cleanup_file(raw_download_path)
+                raw_download_path = None
 
-            # 3. Whisper Transcription
+            # Load 16kHz mono float32 waveform into RAM once so Whisper, WhisperX, and NeMo all reuse it without extra disk reads or FFmpeg subprocesses
+            try:
+                import soundfile as sf
+                import numpy as np
+                data_np, sr = sf.read(str(wav_path), dtype="float32")
+                if len(data_np.shape) > 1:
+                    data_np = data_np.mean(axis=1)
+                audio_arr = np.ascontiguousarray(data_np, dtype=np.float32)
+            except Exception as load_err:
+                logger.debug(f"[{job_id}] In-memory WAV load note ({load_err}); stages will read from {wav_path}")
+                audio_arr = None
+
+            # 3. Whisper Transcription (guarded by _whisper_lock so Stage 1 can run concurrently while another job is in Stage 2 Alignment/Diarization)
             if progress_updater:
                 progress_updater("transcribing", 40)
             logger.info(f"[{job_id}] Running Whisper inference (mode={transcription_mode}, enable_translation={enable_translation}, lang={language}, target={target_language})...")
@@ -90,19 +111,19 @@ class InferencePipeline:
                     pct = 40 + int((current_sec / total_sec) * 35) # 40% to 75%
                     progress_updater("transcribing", min(75, pct))
 
-            whisper_result = self.transcriber.transcribe(
-                wav_path,
-                language=language,
-                target_language=target_language,
-                enable_translation=enable_translation,
-                mode=transcription_mode,
-                progress_callback=transcribe_progress_cb
-            )
-
-            # Purge CUDA cache immediately after Whisper inference to free memory for alignment & diarization
-            gc.collect()
-            if torch and torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            # Skip redundant CTranslate2 DTW word_timestamps pass when WhisperX Wav2Vec2 phoneme alignment will overwrite word timestamps
+            use_whisperx_align = getattr(WorkerConfig, "FORCE_WHISPERX_ALIGNMENT", True)
+            with self._whisper_lock:
+                whisper_result = self.transcriber.transcribe(
+                    wav_path,
+                    language=language,
+                    target_language=target_language,
+                    enable_translation=enable_translation,
+                    mode=transcription_mode,
+                    progress_callback=transcribe_progress_cb,
+                    audio_data=audio_arr,
+                    need_word_timestamps=not use_whisperx_align
+                )
 
             segments = whisper_result["segments"]
             num_speakers = 1
@@ -118,7 +139,7 @@ class InferencePipeline:
                         progress_updater("aligning", 78)
                     logger.info(f"[{job_id}] Running WhisperX Wav2Vec2 phoneme forced alignment (language={lang_code}, device={align_device})...")
                     import whisperx
-                    audio_arr = whisperx.load_audio(str(wav_path))
+                    align_audio = audio_arr if audio_arr is not None else whisperx.load_audio(str(wav_path))
                     with self._align_lock:
                         if align_device == "cuda" and torch and torch.cuda.is_available():
                             try:
@@ -130,24 +151,15 @@ class InferencePipeline:
                             segments,
                             align_model,
                             align_metadata,
-                            audio_arr,
+                            align_audio,
                             align_device,
                             return_char_alignments=False
                         )
-
-                    # Release audio buffer immediately (align_model stays cached in VRAM for instant reuse across 200+ jobs)
-                    del audio_arr
-                    gc.collect()
-                    if torch and align_device == "cuda":
-                        torch.cuda.empty_cache()
 
                     logger.info(f"[{job_id}] Phoneme forced alignment successful across {len(aligned_result.get('segments', []))} segments.")
                 except Exception as align_err:
                     logger.warning(f"[{job_id}] WhisperX phoneme alignment skipped or failed ({align_err}). Retaining Whisper timestamps.")
                     aligned_result = {"segments": segments}
-                    gc.collect()
-                    if torch and torch.cuda.is_available():
-                        torch.cuda.empty_cache()
 
             # Diarization & Word Midpoint Stitching
             total_align_segs = len(aligned_result.get("segments", []))
@@ -160,13 +172,12 @@ class InferencePipeline:
                     progress_updater("diarizing", 85)
                 logger.info(f"[{job_id}] Running {self.diarizer.backend.upper()} diarization on {wav_path}...")
                 with self._diarize_lock:
-                    diarize_df = self.diarizer.diarize_dataframe(wav_path)
+                    diarize_df = self.diarizer.diarize_dataframe(
+                        wav_path,
+                        audio_data=audio_arr,
+                        sample_rate=16000
+                    )
                 logger.info(f"[{job_id}] Diarization generated {len(diarize_df)} intervals.")
-
-                # Release diarization memory immediately
-                gc.collect()
-                if torch and torch.cuda.is_available():
-                    torch.cuda.empty_cache()
 
                 if len(diarize_df) > 0:
                     try:
@@ -243,12 +254,12 @@ class InferencePipeline:
             return formatted_result
 
         finally:
-            # Guarantee scratch file cleanup and release pipeline GPU tensors
+            # Guarantee scratch file cleanup and release pipeline audio buffer
             cleanup_file(raw_download_path)
             cleanup_file(wav_path)
+            if audio_arr is not None:
+                del audio_arr
             gc.collect()
-            if torch and torch.cuda.is_available():
-                torch.cuda.empty_cache()
 
     @staticmethod
     def _split_segment_runs(clean_words: List[Dict[str, Any]]) -> List[Tuple[str, List[Dict[str, Any]]]]:

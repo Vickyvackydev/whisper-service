@@ -111,10 +111,18 @@ class SpeakerDiarizer:
         self,
         audio_path: Path,
         min_speakers: Optional[int] = None,
-        max_speakers: Optional[int] = None
+        max_speakers: Optional[int] = None,
+        audio_data: Optional[np.ndarray] = None,
+        sample_rate: int = 16000
     ):
         import pandas as pd
-        turns = self.diarize(audio_path, min_speakers=min_speakers, max_speakers=max_speakers)
+        turns = self.diarize(
+            audio_path,
+            min_speakers=min_speakers,
+            max_speakers=max_speakers,
+            audio_data=audio_data,
+            sample_rate=sample_rate
+        )
         if not turns:
             return pd.DataFrame(columns=["start", "end", "speaker"])
         return pd.DataFrame(turns)
@@ -123,15 +131,29 @@ class SpeakerDiarizer:
         self,
         audio_path: Path,
         min_speakers: Optional[int] = None,
-        max_speakers: Optional[int] = None
+        max_speakers: Optional[int] = None,
+        audio_data: Optional[np.ndarray] = None,
+        sample_rate: int = 16000
     ) -> List[Dict[str, Any]]:
         """
         Runs diarization on audio and returns list of speaker intervals:
         [{ "start": 0.5, "end": 4.2, "speaker": "SPEAKER_00" }, ...]
         """
         if self.backend == "nemo" and self.nemo_model is not None:
-            return self._diarize_nemo(audio_path, min_speakers=min_speakers, max_speakers=max_speakers)
-        return self._diarize_pyannote(audio_path, min_speakers=min_speakers, max_speakers=max_speakers)
+            return self._diarize_nemo(
+                audio_path,
+                min_speakers=min_speakers,
+                max_speakers=max_speakers,
+                audio_data=audio_data,
+                sample_rate=sample_rate
+            )
+        return self._diarize_pyannote(
+            audio_path,
+            min_speakers=min_speakers,
+            max_speakers=max_speakers,
+            audio_data=audio_data,
+            sample_rate=sample_rate
+        )
 
     def _parse_nemo_preds(self, preds: Any, offset_sec: float = 0.0) -> List[Dict[str, Any]]:
         if isinstance(preds, tuple):
@@ -277,10 +299,6 @@ class SpeakerDiarizer:
                 tmp_chunk_path = Path(tmp_str)
                 sf.write(str(tmp_chunk_path), chunk_audio, sample_rate)
 
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-
                 with torch.inference_mode():
                     preds = self.nemo_model.diarize(audio=str(tmp_chunk_path), batch_size=1)
 
@@ -291,9 +309,6 @@ class SpeakerDiarizer:
                         tmp_chunk_path.unlink()
                     except Exception:
                         pass
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
 
             if chunk_turns:
                 # Extract centroids for speakers in this chunk
@@ -412,7 +427,9 @@ class SpeakerDiarizer:
         self,
         audio_path: Path,
         min_speakers: Optional[int] = None,
-        max_speakers: Optional[int] = None
+        max_speakers: Optional[int] = None,
+        audio_data: Optional[np.ndarray] = None,
+        sample_rate: int = 16000
     ) -> List[Dict[str, Any]]:
         """
         Runs NVIDIA NeMo Sortformer end-to-end speaker diarization.
@@ -427,15 +444,19 @@ class SpeakerDiarizer:
         if self.device == "cuda" and torch.cuda.is_available():
             try:
                 torch.cuda.set_device(0)
-                gc.collect()
-                torch.cuda.empty_cache()
             except Exception:
                 pass
 
-        data, sample_rate = sf.read(str(audio_path), dtype="float32")
-        if len(data.shape) > 1:
-            data = data.mean(axis=1)
-        data = np.ascontiguousarray(data, dtype=np.float32)
+        if audio_data is not None and len(audio_data) > 0:
+            data = audio_data
+            if len(data.shape) > 1:
+                data = data.mean(axis=1)
+            data = np.ascontiguousarray(data, dtype=np.float32)
+        else:
+            data, sample_rate = sf.read(str(audio_path), dtype="float32")
+            if len(data.shape) > 1:
+                data = data.mean(axis=1)
+            data = np.ascontiguousarray(data, dtype=np.float32)
         duration_sec = len(data) / float(sample_rate) if sample_rate > 0 else 0.0
 
         free_vram_gb = 99.0
@@ -456,9 +477,6 @@ class SpeakerDiarizer:
             try:
                 with torch.inference_mode():
                     preds = self.nemo_model.diarize(audio=str(audio_path), batch_size=1)
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
                 turns = self._parse_nemo_preds(preds, offset_sec=0.0)
             except (torch.cuda.OutOfMemoryError, RuntimeError, Exception) as e:
                 err_msg = str(e)
@@ -506,10 +524,8 @@ class SpeakerDiarizer:
         except Exception as consol_e:
             logger.debug(f"NeMo post-consolidation note ({consol_e}), using raw turns")
         finally:
-            del data
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            if audio_data is None:
+                del data
 
         unique_detected = len(set(t["speaker"] for t in turns))
         logger.info(f"NVIDIA NeMo diarization successful: detected {len(turns)} turns across {unique_detected} distinct speakers.")
@@ -519,7 +535,9 @@ class SpeakerDiarizer:
         self,
         audio_path: Path,
         min_speakers: Optional[int] = None,
-        max_speakers: Optional[int] = None
+        max_speakers: Optional[int] = None,
+        audio_data: Optional[np.ndarray] = None,
+        sample_rate: int = 16000
     ) -> List[Dict[str, Any]]:
         if not self.is_loaded or self.pipeline is None:
             logger.warning("Diarization pipeline not loaded.")
@@ -533,7 +551,10 @@ class SpeakerDiarizer:
                 except Exception:
                     pass
             import soundfile as sf
-            data, sample_rate = sf.read(str(audio_path), dtype="float32")
+            if audio_data is not None and len(audio_data) > 0:
+                data = audio_data
+            else:
+                data, sample_rate = sf.read(str(audio_path), dtype="float32")
             if len(data.shape) > 1:
                 data = data.mean(axis=1)
 
@@ -1059,3 +1080,4 @@ class SpeakerDiarizer:
         unique_speakers = len(set(s["speaker"] for s in refined_segments))
         logger.info(f"Assigned {unique_speakers} unique speakers across {len(refined_segments)} refined segments.")
         return refined_segments, unique_speakers
+

@@ -251,7 +251,8 @@ class Database:
         model_loaded: Optional[str],
         diarization_loaded: bool,
         status: str,
-        current_job_id: Optional[str]
+        current_job_id: Optional[str],
+        active_job_ids: Optional[list] = None
     ):
         conn = self.get_conn()
         try:
@@ -279,17 +280,18 @@ class Database:
                     status, current_job_id
                 ))
 
-                # Refresh worker_heartbeat_at ONLY on the specific current_job_id being processed by this worker,
+                # Refresh worker_heartbeat_at on all active_job_ids being processed by this worker,
                 # and automatically recover any orphaned 'processing' jobs left over from a previous run of this worker_id.
-                if current_job_id:
+                live_ids = list(active_job_ids) if active_job_ids else ([current_job_id] if current_job_id else [])
+                if live_ids:
                     cur.execute(
                         """
                         UPDATE transcription_jobs
                         SET worker_heartbeat_at = NOW(),
                             updated_at = NOW()
-                        WHERE id = %s AND status = 'processing';
+                        WHERE id = ANY(%s::uuid[]) AND status = 'processing';
                         """,
-                        (current_job_id,)
+                        (live_ids,)
                     )
                     cur.execute(
                         """
@@ -300,9 +302,9 @@ class Database:
                             worker_id = NULL,
                             worker_heartbeat_at = NULL,
                             updated_at = NOW()
-                        WHERE worker_id = %s AND status = 'processing' AND id != %s;
+                        WHERE worker_id = %s AND status = 'processing' AND NOT (id = ANY(%s::uuid[]));
                         """,
-                        (worker_id, current_job_id)
+                        (worker_id, live_ids)
                     )
                 else:
                     cur.execute(

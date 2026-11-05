@@ -75,7 +75,7 @@ def safe_download_audio(audio_url: str, output_dir: Path) -> Path:
 def convert_to_wav_16k_mono(input_path: Path, output_dir: Path) -> Tuple[Path, float]:
     """
     Transcodes any audio input to 16kHz 16-bit mono PCM WAV.
-    Uses ffmpeg if available, otherwise falls back to pure Python soundfile + numpy.
+    Uses ffmpeg if available, otherwise falls back to PyAV or pure Python soundfile + numpy.
     Returns (wav_path, duration_in_seconds).
     """
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -86,12 +86,13 @@ def convert_to_wav_16k_mono(input_path: Path, output_dir: Path) -> Tuple[Path, f
     import shutil
     import numpy as np
 
-    # 1. Try FFmpeg first if installed on system PATH
+    # 1. Try FFmpeg first if installed on system PATH (multi-threaded fast decode)
     ffmpeg_bin = shutil.which("ffmpeg")
     if ffmpeg_bin:
         cmd = [
             ffmpeg_bin,
             "-y",
+            "-threads", "0",
             "-loglevel", "error",
             "-i", str(input_path),
             "-vn",
@@ -107,7 +108,13 @@ def convert_to_wav_16k_mono(input_path: Path, output_dir: Path) -> Tuple[Path, f
                 info = sf.info(str(wav_path))
                 duration = float(info.duration)
                 if duration > 0:
+                    if duration > WorkerConfig.MAX_AUDIO_DURATION_SECONDS:
+                        raise AudioProcessingError(f"Audio duration ({duration:.1f}s) exceeds max limit ({WorkerConfig.MAX_AUDIO_DURATION_SECONDS}s)")
                     logger.info(f"Converted audio via FFmpeg: duration={duration:.2f}s, path={wav_path}")
+                    return wav_path, duration
+        except AudioProcessingError:
+            cleanup_file(wav_path)
+            raise
         except Exception as ffmpeg_err:
             logger.warning(f"FFmpeg attempt failed ({ffmpeg_err}). Using PyAV fallback...")
 
@@ -133,9 +140,14 @@ def convert_to_wav_16k_mono(input_path: Path, output_dir: Path) -> Tuple[Path, f
                 data = np.concatenate(pcm_chunks, axis=1).squeeze(0)
                 duration = float(len(data) / 16000.0)
                 if duration > 0:
+                    if duration > WorkerConfig.MAX_AUDIO_DURATION_SECONDS:
+                        raise AudioProcessingError(f"Audio duration ({duration:.1f}s) exceeds max limit ({WorkerConfig.MAX_AUDIO_DURATION_SECONDS}s)")
                     sf.write(str(wav_path), data.astype(np.float32), 16000, subtype="PCM_16")
                     logger.info(f"Converted audio via PyAV: duration={duration:.2f}s, path={wav_path}")
                     return wav_path, duration
+    except AudioProcessingError:
+        cleanup_file(wav_path)
+        raise
     except Exception as av_err:
         logger.warning(f"PyAV attempt failed ({av_err}). Falling back to pure-Python soundfile...")
 
