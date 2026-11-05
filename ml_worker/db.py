@@ -21,6 +21,34 @@ class Database:
             dsn=self.db_url
         )
         logger.info("PostgreSQL worker connection pool established.")
+        self._recover_duration_limited_jobs()
+
+    def _recover_duration_limited_jobs(self):
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE transcription_jobs
+                    SET status = 'queued',
+                        stage = 'queued',
+                        progress = 0,
+                        worker_id = NULL,
+                        worker_heartbeat_at = NULL,
+                        error_message = NULL,
+                        error_details = NULL,
+                        updated_at = NOW()
+                    WHERE status = 'failed'
+                      AND created_at >= NOW() - INTERVAL '24 hours'
+                      AND error_message ILIKE '%exceeds max limit (14400s)%';
+                """)
+                if cur.rowcount > 0:
+                    logger.info(f"Auto-recovered {cur.rowcount} job(s) that previously hit the 4h (14400s) duration limit.")
+                conn.commit()
+        except Exception as e:
+            conn.rollback()
+            logger.debug(f"Could not run duration-limit job recovery: {e}")
+        finally:
+            self.put_conn(conn)
 
     def get_conn(self):
         if self.pool is None:

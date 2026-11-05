@@ -49,7 +49,7 @@ func LoadConfig() (*Config, error) {
 	}
 
 	authEnabled := getEnvAsBool("AUTH_ENABLED", true)
-	maxAudioBytes := getEnvAsInt64("MAX_AUDIO_SIZE_BYTES", 1024*1024*1024*2) // 2 GB
+	maxAudioBytes := getEnvAsInt64("MAX_AUDIO_SIZE_BYTES", 1024*1024*1024*5) // 5 GB
 	maxRetries := getEnvAsInt("MAX_RETRIES", 3)
 	webhookMaxAttempts := getEnvAsInt("WEBHOOK_MAX_ATTEMPTS", 5)
 
@@ -63,7 +63,7 @@ func LoadConfig() (*Config, error) {
 		APITokens:          tokens,
 		AuthEnabled:        authEnabled,
 		MaxAudioSizeBytes:  maxAudioBytes,
-		JobTimeout:         time.Duration(getEnvAsInt("JOB_TIMEOUT_SECONDS", 7200)) * time.Second,
+		JobTimeout:         time.Duration(getEnvAsInt("JOB_TIMEOUT_SECONDS", 14400)) * time.Second,
 		WatchdogInterval:   time.Duration(getEnvAsInt("WATCHDOG_INTERVAL_SECONDS", 15)) * time.Second,
 		StaleJobThreshold:  time.Duration(getEnvAsInt("STALE_JOB_THRESHOLD_SECONDS", 300)) * time.Second,
 		MaxRetries:         maxRetries,

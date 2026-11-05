@@ -56,9 +56,9 @@ class WorkerConfig:
     HEARTBEAT_INTERVAL: float = float(os.getenv("HEARTBEAT_INTERVAL", "5.0"))
     POLL_INTERVAL: float = float(os.getenv("POLL_INTERVAL", "0.25"))
     
-    # Audio & Safety limits
-    MAX_AUDIO_DURATION_SECONDS: int = int(os.getenv("MAX_AUDIO_DURATION_SECONDS", "14400"))  # 4 hours
-    MAX_AUDIO_DOWNLOAD_BYTES: int = int(os.getenv("MAX_AUDIO_DOWNLOAD_BYTES", str(1024 * 1024 * 1024 * 2)))  # 2 GB
+    # Audio & Safety limits (10 hours = 36000s minimum enforced even if legacy .env has 14400)
+    MAX_AUDIO_DURATION_SECONDS: int = max(36000, int(os.getenv("MAX_AUDIO_DURATION_SECONDS", "36000")))  # 10 hours
+    MAX_AUDIO_DOWNLOAD_BYTES: int = max(1024 * 1024 * 1024 * 5, int(os.getenv("MAX_AUDIO_DOWNLOAD_BYTES", str(1024 * 1024 * 1024 * 5))))  # 5 GB
     SCRATCH_DIR: Path = Path(os.getenv("SCRATCH_DIR", os.path.join(os.path.expanduser("~"), ".whisper_scratch")))
 
     # RunPod Auto-Stop Disabled by Default (0 = Never shut down GPU pod; court is always working)

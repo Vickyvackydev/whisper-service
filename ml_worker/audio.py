@@ -103,7 +103,7 @@ def convert_to_wav_16k_mono(input_path: Path, output_dir: Path) -> Tuple[Path, f
         ]
 
         try:
-            process = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+            process = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
             if process.returncode == 0 and wav_path.exists() and wav_path.stat().st_size > 0:
                 info = sf.info(str(wav_path))
                 duration = float(info.duration)
