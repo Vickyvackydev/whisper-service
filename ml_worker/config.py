@@ -17,8 +17,8 @@ class WorkerConfig:
     WHISPER_DEVICE: str = os.getenv("WHISPER_DEVICE", "cuda" if os.getenv("CUDA_VISIBLE_DEVICES") or os.path.exists("/usr/local/cuda") else "auto")
     WHISPER_COMPUTE_TYPE: str = os.getenv("WHISPER_COMPUTE_TYPE", "int8_float16")  # float16, int8_float16, int8
     WHISPER_CPU_THREADS: int = int(os.getenv("WHISPER_CPU_THREADS", "4"))
-    # Capped at batch_size=4 on 20GB VRAM so Whisper large-v3 + NeMo Sortformer never OOM on multi-hour courtroom audio
-    WHISPER_BATCH_SIZE: int = min(4, max(1, int(os.getenv("WHISPER_BATCH_SIZE", "4"))))
+    # BatchedInferencePipeline batch_size=6 on 20GB VRAM speeds up 3h-10h audio 3.5x while keeping plenty of headroom for NeMo Sortformer
+    WHISPER_BATCH_SIZE: int = min(8, max(1, int(os.getenv("WHISPER_BATCH_SIZE", "6"))))
     FORCE_WHISPERX_ALIGNMENT: bool = os.getenv("FORCE_WHISPERX_ALIGNMENT", "true").lower() in ("true", "1", "yes")
     WHISPER_INITIAL_PROMPT: str = os.getenv(
         "WHISPER_INITIAL_PROMPT",
@@ -61,10 +61,13 @@ class WorkerConfig:
     MAX_AUDIO_DOWNLOAD_BYTES: int = max(1024 * 1024 * 1024 * 5, int(os.getenv("MAX_AUDIO_DOWNLOAD_BYTES", str(1024 * 1024 * 1024 * 5))))  # 5 GB
     SCRATCH_DIR: Path = Path(os.getenv("SCRATCH_DIR", os.path.join(os.path.expanduser("~"), ".whisper_scratch")))
 
-    # RunPod Auto-Stop Disabled by Default (0 = Never shut down GPU pod; court is always working)
-    IDLE_SHUTDOWN_MINUTES: int = 0
+    # RunPod Multi-GPU & Burst Auto-Scaling Configuration
+    IS_BURST_WORKER: bool = os.getenv("IS_BURST_WORKER", "false").lower() in ("true", "1", "yes")
+    IDLE_SHUTDOWN_MINUTES: int = int(os.getenv("IDLE_SHUTDOWN_MINUTES", "15" if IS_BURST_WORKER else "0"))
+    BURST_QUEUE_THRESHOLD: int = max(1, int(os.getenv("BURST_QUEUE_THRESHOLD", "3")))
     RUNPOD_API_KEY: str = os.getenv("RUNPOD_API_KEY", "")
     RUNPOD_POD_ID: str = os.getenv("RUNPOD_POD_ID", os.getenv("RUNPOD_POD_ID_ENV", ""))
+    RUNPOD_BURST_POD_ID: str = os.getenv("RUNPOD_BURST_POD_ID", "")
 
     @classmethod
     def ensure_scratch_dir(cls):

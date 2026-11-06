@@ -339,6 +339,8 @@ func (h *Handler) GetResult(c echo.Context) error {
 			Data: models.SubmissionData{
 				TranscriptionID: job.ID.String(),
 				Status:          job.Status,
+				Stage:           job.Stage,
+				Progress:        job.Progress,
 			},
 		})
 	}

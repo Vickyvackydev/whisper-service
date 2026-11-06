@@ -1,4 +1,5 @@
 import gc
+import re
 import logging
 from pathlib import Path
 from typing import Optional, Dict, Any, List
@@ -16,11 +17,39 @@ logger = logging.getLogger("ml_worker.transcriber")
 class Transcriber:
     def __init__(self):
         self.model: Optional[WhisperModel] = None
+        self.batched_model: Optional[Any] = None
         self.model_name = WorkerConfig.WHISPER_MODEL
         self.device = WorkerConfig.WHISPER_DEVICE
         self.compute_type = WorkerConfig.WHISPER_COMPUTE_TYPE
         # Strictly 1 CTranslate2 worker thread to prevent parallel_for cudaErrorInvalidDevice
         self.num_workers = 1
+
+    @staticmethod
+    def _collapse_repeated_clauses(text: str) -> str:
+        """
+        Collapses exact intra-segment repeated sentences/clauses caused by Whisper decoder loops
+        on noisy audio (e.g. 'I would like to go through the process. I would like to go through the process.'
+        -> 'I would like to go through the process.').
+        """
+        cleaned = text.strip()
+        if not cleaned or len(cleaned) < 12:
+            return cleaned
+        # Split on sentence-ending punctuation while keeping delimiters
+        parts = re.split(r'(?<=[.!?])\s+', cleaned)
+        if len(parts) >= 2:
+            deduped = [parts[0]]
+            for p in parts[1:]:
+                if p.strip().lower() != deduped[-1].strip().lower():
+                    deduped.append(p)
+            cleaned = " ".join(deduped).strip()
+        # Also check exact half-string repetition without punctuation ('phrase phrase')
+        words = cleaned.split()
+        n = len(words)
+        if n >= 6 and n % 2 == 0:
+            half = n // 2
+            if [w.lower().strip(".,!?") for w in words[:half]] == [w.lower().strip(".,!?") for w in words[half:]]:
+                cleaned = " ".join(words[:half])
+        return cleaned
 
     def load_model(self):
         logger.info(
@@ -59,6 +88,16 @@ class Transcriber:
             num_workers=self.num_workers,
             download_root=str(WorkerConfig.SCRATCH_DIR / "models" / "whisper")
         )
+
+        if BatchedInferencePipeline is not None and actual_device == "cuda":
+            try:
+                self.batched_model = BatchedInferencePipeline(model=self.model)
+                logger.info(f"Initialized BatchedInferencePipeline (batch_size={WorkerConfig.WHISPER_BATCH_SIZE}) for high-speed multi-hour GPU transcription.")
+            except Exception as bp_err:
+                logger.warning(f"Could not initialize BatchedInferencePipeline ({bp_err}); using standard WhisperModel.")
+                self.batched_model = None
+        else:
+            self.batched_model = None
 
         self.device = actual_device
         logger.info(f"Whisper model loaded successfully on {actual_device}:{device_index} (num_workers={self.num_workers}).")
@@ -110,8 +149,9 @@ class Transcriber:
         )
 
         # Optimal VAD and decoding parameters for high accuracy & preserving courtroom speech
+        # threshold=0.30 captures quiet remarks ("Yes, My Lord") while filtering out empty courtroom recess hum/paper rustling
         vad_params = dict(
-            threshold=0.20,                # High sensitivity: captures quick remarks & courtroom interjections
+            threshold=0.30,
             min_speech_duration_ms=100,    # Catch rapid interjections (e.g. 100ms+)
             min_silence_duration_ms=250,   # Isolate rapid micro-pauses between speaker interchanges
             speech_pad_ms=300              # Pad 300ms to preserve leading/trailing word boundaries
@@ -132,22 +172,47 @@ class Transcriber:
         raw_segments = None
         info = None
         audio_input = audio_data if audio_data is not None else str(audio_path)
+        est_duration = (len(audio_data) / 16000.0) if (audio_data is not None and hasattr(audio_data, "__len__")) else 0.0
+        use_batched = (self.batched_model is not None) and (est_duration >= 900.0)  # Use GPU batching for 15m - 10h recordings
 
         try:
-            segments_iter, info = self.model.transcribe(
-                audio_input,
-                language=lang_arg,
-                task=task,
-                beam_size=beam_size,
-                temperature=temperature,
-                word_timestamps=need_word_timestamps,
-                vad_filter=True,
-                vad_parameters=vad_params,
-                condition_on_previous_text=False,
-                no_speech_threshold=0.6,
-                compression_ratio_threshold=2.4,
-                initial_prompt=prompt
-            )
+            if use_batched:
+                logger.info(
+                    f"Using BatchedInferencePipeline (batch_size={WorkerConfig.WHISPER_BATCH_SIZE}) "
+                    f"for long audio ({est_duration / 60.0:.1f} mins)..."
+                )
+                segments_iter, info = self.batched_model.transcribe(
+                    audio_input,
+                    language=lang_arg,
+                    task=task,
+                    beam_size=max(2, beam_size - 1) if est_duration >= 5400.0 else beam_size,
+                    temperature=temperature,
+                    word_timestamps=need_word_timestamps,
+                    vad_filter=True,
+                    vad_parameters=vad_params,
+                    condition_on_previous_text=False,
+                    repetition_penalty=1.15,
+                    no_speech_threshold=0.6,
+                    compression_ratio_threshold=2.4,
+                    initial_prompt=prompt,
+                    batch_size=WorkerConfig.WHISPER_BATCH_SIZE,
+                )
+            else:
+                segments_iter, info = self.model.transcribe(
+                    audio_input,
+                    language=lang_arg,
+                    task=task,
+                    beam_size=beam_size,
+                    temperature=temperature,
+                    word_timestamps=need_word_timestamps,
+                    vad_filter=True,
+                    vad_parameters=vad_params,
+                    condition_on_previous_text=False,
+                    repetition_penalty=1.15,
+                    no_speech_threshold=0.6,
+                    compression_ratio_threshold=2.4,
+                    initial_prompt=prompt
+                )
             temp_segments = []
             for seg in segments_iter:
                 temp_segments.append(seg)
@@ -155,7 +220,7 @@ class Transcriber:
                     progress_callback(seg.end, info.duration)
             raw_segments = temp_segments
         except Exception as unbatched_err:
-            logger.warning(f"Standard transcribe encountered error ({unbatched_err}); reloading WhisperModel and retrying...")
+            logger.warning(f"Whisper transcribe encountered error ({unbatched_err}); reloading WhisperModel and retrying...")
             gc.collect()
             if torch and torch.cuda.is_available():
                 try:
@@ -174,6 +239,7 @@ class Transcriber:
                 vad_filter=True,
                 vad_parameters=vad_params,
                 condition_on_previous_text=False,
+                repetition_penalty=1.15,
                 no_speech_threshold=0.6,
                 compression_ratio_threshold=2.4,
                 initial_prompt=prompt
@@ -192,9 +258,29 @@ class Transcriber:
         segments_list = []
         full_text_parts = []
         total_words = 0
+        prev_norm_key = None
+        consecutive_dup_count = 0
+        dropped_hallucinations = 0
 
         for seg in raw_segments:
-            text = seg.text.strip()
+            text = self._collapse_repeated_clauses(seg.text.strip())
+            if not text:
+                continue
+
+            # Detect consecutive hallucinated recess loops (e.g. "Can you read?" repeated 24x on courtroom background noise)
+            norm_key = re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
+            no_speech_prob = getattr(seg, "no_speech_prob", 0.0) or 0.0
+            avg_logprob = getattr(seg, "avg_logprob", 0.0) or 0.0
+
+            if norm_key and norm_key == prev_norm_key:
+                consecutive_dup_count += 1
+                # Drop repeated identical segments when repeated >= 2 times in a row (or immediately if low confidence / high no_speech_prob)
+                if consecutive_dup_count >= 2 or no_speech_prob > 0.45 or avg_logprob < -0.75:
+                    dropped_hallucinations += 1
+                    continue
+            else:
+                prev_norm_key = norm_key
+                consecutive_dup_count = 0
 
             words_data = []
             if seg.words:
@@ -224,7 +310,12 @@ class Transcriber:
             seg_dict = normalize_segment(seg_dict)
             if seg_dict["text"]:
                 full_text_parts.append(seg_dict["text"])
+                if not words_data:
+                    total_words += len(seg_dict["text"].split())
             segments_list.append(seg_dict)
+
+        if dropped_hallucinations > 0:
+            logger.info(f"Filtered {dropped_hallucinations} consecutive hallucinated/repeated recess segments prior to alignment.")
 
         full_text = " ".join(full_text_parts)
 

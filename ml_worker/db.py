@@ -73,11 +73,12 @@ class Database:
     def dequeue_job(self, worker_id: str, prefer_newest: bool = False) -> Optional[Dict[str, Any]]:
         """
         Atomically leases the next queued transcription job using FOR UPDATE SKIP LOCKED.
-        When prefer_newest=True (Express Fast-Lane slot), leases the most recently submitted job
-        so live courtroom users never wait behind a large bulk backlog.
+        - Slot #1 (prefer_newest=False, FIFO Lane): orders by created_at ASC so older/long 4h-10h jobs never starve.
+        - Slot #2 (prefer_newest=True, Express Lane): orders by COALESCE(retry_count, 0) ASC, created_at DESC
+          so fresh single courtroom uploads start immediately without waiting behind bulk uploads or 5h recordings.
         """
         conn = self.get_conn()
-        order_dir = "DESC" if prefer_newest else "ASC"
+        order_clause = "COALESCE(retry_count, 0) ASC, created_at DESC" if prefer_newest else "created_at ASC"
         try:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 query = f"""
@@ -92,7 +93,7 @@ class Database:
                         SELECT id
                         FROM transcription_jobs
                         WHERE status = 'queued'
-                        ORDER BY created_at {order_dir}
+                        ORDER BY {order_clause}
                         LIMIT 1
                         FOR UPDATE SKIP LOCKED
                     )
@@ -110,6 +111,29 @@ class Database:
             conn.rollback()
             logger.error(f"Error while dequeuing job: {e}")
             return None
+        finally:
+            self.put_conn(conn)
+
+    def get_queue_and_worker_counts(self) -> Tuple[int, int]:
+        """
+        Returns (queued_jobs_count, active_workers_count) for multi-GPU auto-burst scaling decisions.
+        """
+        conn = self.get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM transcription_jobs WHERE status = 'queued';")
+                queued_row = cur.fetchone()
+                queued_count = int(queued_row[0]) if queued_row else 0
+
+                cur.execute("SELECT COUNT(*) FROM worker_heartbeats WHERE last_heartbeat_at >= NOW() - INTERVAL '45 seconds';")
+                worker_row = cur.fetchone()
+                active_workers = int(worker_row[0]) if worker_row else 1
+                conn.commit()
+                return queued_count, active_workers
+        except Exception as e:
+            conn.rollback()
+            logger.debug(f"Could not query queue/worker counts: {e}")
+            return 0, 1
         finally:
             self.put_conn(conn)
 

@@ -281,34 +281,97 @@ class SpeakerDiarizer:
         global_turns: List[Dict[str, Any]] = []
         global_centroids: Dict[str, np.ndarray] = {}
 
+        # Build chunk descriptors up front so we can skip silent courtroom recess windows
+        # and run NeMo Sortformer in multi-chunk GPU batches (batch_size=4) on 3h-10h recordings
+        chunk_specs: List[Tuple[int, float, float, int, int]] = []
         chunk_idx = 0
         start_sec = 0.0
         while start_sec < total_sec:
             end_sec = min(total_sec, start_sec + chunk_sec)
             if total_sec - end_sec < overlap_sec + 15.0:
                 end_sec = total_sec
-
             start_samp = int(start_sec * sample_rate)
             end_samp = int(end_sec * sample_rate)
-            chunk_audio = audio_data[start_samp:end_samp]
+            chunk_specs.append((chunk_idx, start_sec, end_sec, start_samp, end_samp))
+            if end_sec >= total_sec:
+                break
+            start_sec += step_sec
+            chunk_idx += 1
 
-            tmp_chunk_path = None
+        nemo_batch_size = 4
+        if self.device == "cuda" and torch.cuda.is_available():
             try:
-                fd, tmp_str = tempfile.mkstemp(suffix=f"_nemo_chunk{chunk_idx}.wav")
-                os.close(fd)
-                tmp_chunk_path = Path(tmp_str)
-                sf.write(str(tmp_chunk_path), chunk_audio, sample_rate)
+                free_b, _ = torch.cuda.mem_get_info(0)
+                free_gb = free_b / (1024 ** 3)
+                if free_gb < 4.5:
+                    nemo_batch_size = 1
+                elif free_gb < 7.0:
+                    nemo_batch_size = 2
+            except Exception:
+                nemo_batch_size = 2
 
-                with torch.inference_mode():
-                    preds = self.nemo_model.diarize(audio=str(tmp_chunk_path), batch_size=1)
+        chunk_turns_by_idx: Dict[int, List[Dict[str, Any]]] = {}
+        active_specs = []
+        skipped_silent = 0
+        for spec in chunk_specs:
+            c_idx, s_sec, e_sec, s_samp, e_samp = spec
+            c_audio = audio_data[s_samp:e_samp]
+            if len(c_audio) == 0:
+                chunk_turns_by_idx[c_idx] = []
+                continue
+            rms = float(np.sqrt(np.mean(c_audio ** 2)))
+            if rms < 1.5e-4:
+                chunk_turns_by_idx[c_idx] = []
+                skipped_silent += 1
+                continue
+            active_specs.append(spec)
 
-                chunk_turns = self._parse_nemo_preds(preds, offset_sec=start_sec)
-            finally:
-                if tmp_chunk_path and tmp_chunk_path.exists():
+        if skipped_silent > 0:
+            logger.info(f"Skipped {skipped_silent} silent recess chunk(s) during NeMo diarization.")
+
+        for b_start in range(0, len(active_specs), nemo_batch_size):
+            batch_slice = active_specs[b_start : b_start + nemo_batch_size]
+            tmp_paths: List[Path] = []
+            try:
+                for (c_idx, s_sec, e_sec, s_samp, e_samp) in batch_slice:
+                    fd, tmp_str = tempfile.mkstemp(suffix=f"_nemo_chunk{c_idx}.wav")
+                    os.close(fd)
+                    p = Path(tmp_str)
+                    sf.write(str(p), audio_data[s_samp:e_samp], sample_rate)
+                    tmp_paths.append(p)
+
+                batch_preds = None
+                if len(tmp_paths) > 1:
                     try:
-                        tmp_chunk_path.unlink()
-                    except Exception:
-                        pass
+                        with torch.inference_mode():
+                            batch_preds = self.nemo_model.diarize(
+                                audio=[str(p) for p in tmp_paths],
+                                batch_size=len(tmp_paths)
+                            )
+                        if isinstance(batch_preds, tuple):
+                            batch_preds = batch_preds[0]
+                    except Exception as batch_err:
+                        logger.debug(f"Multi-chunk NeMo batch fallback to single-chunk ({batch_err})")
+                        batch_preds = None
+
+                if isinstance(batch_preds, list) and len(batch_preds) == len(batch_slice):
+                    for idx_in_b, (c_idx, s_sec, _, _, _) in enumerate(batch_slice):
+                        chunk_turns_by_idx[c_idx] = self._parse_nemo_preds(batch_preds[idx_in_b], offset_sec=s_sec)
+                else:
+                    for idx_in_b, (c_idx, s_sec, _, _, _) in enumerate(batch_slice):
+                        with torch.inference_mode():
+                            single_pred = self.nemo_model.diarize(audio=str(tmp_paths[idx_in_b]), batch_size=1)
+                        chunk_turns_by_idx[c_idx] = self._parse_nemo_preds(single_pred, offset_sec=s_sec)
+            finally:
+                for p in tmp_paths:
+                    if p and p.exists():
+                        try:
+                            p.unlink()
+                        except Exception:
+                            pass
+
+        for (chunk_idx, start_sec, end_sec, start_samp, end_samp) in chunk_specs:
+            chunk_turns = chunk_turns_by_idx.get(chunk_idx, [])
 
             if chunk_turns:
                 # Extract centroids for speakers in this chunk
@@ -415,11 +478,6 @@ class SpeakerDiarizer:
                                 "end": lt["end"],
                                 "speaker": mapped_spk
                             })
-
-            if end_sec >= total_sec:
-                break
-            start_sec += step_sec
-            chunk_idx += 1
 
         return global_turns
 

@@ -162,9 +162,32 @@ class InferencePipeline:
                     aligned_result = {"segments": segments}
 
             # Diarization & Word Midpoint Stitching
-            total_align_segs = len(aligned_result.get("segments", []))
-            failed_align_segs = sum(1 for s in aligned_result.get("segments", []) if not s.get("words"))
-            logger.info(f"[{job_id}] [DIAGNOSTIC] Alignment status: {total_align_segs - failed_align_segs}/{total_align_segs} segments have word-level timestamps ({failed_align_segs} failed alignment).")
+            # Pre-populate proportional word timestamps for any segment where WhisperX Wav2Vec2 alignment logged
+            # 'backtrack failed, resorting to original' BEFORE calling whisperx.assign_word_speakers() so every
+            # fallback segment still receives full word-level speaker diarization!
+            align_segs = aligned_result.get("segments", [])
+            total_align_segs = len(align_segs)
+            failed_align_segs = 0
+            for s in align_segs:
+                if not s.get("words"):
+                    failed_align_segs += 1
+                    raw_txt = str(s.get("text", "")).strip()
+                    if raw_txt:
+                        toks = raw_txt.split()
+                        s_start = round(float(s.get("start", 0.0)), 3)
+                        s_end = round(float(s.get("end", s_start + 0.1)), 3)
+                        dur = max(0.1, s_end - s_start)
+                        step = dur / max(1, len(toks))
+                        s["words"] = [
+                            {
+                                "word": tok,
+                                "start": round(s_start + idx * step, 3),
+                                "end": round(s_start + (idx + 1) * step, 3),
+                                "score": None,
+                            }
+                            for idx, tok in enumerate(toks)
+                        ]
+            logger.info(f"[{job_id}] [DIAGNOSTIC] Alignment status: {total_align_segs - failed_align_segs}/{total_align_segs} segments aligned via Wav2Vec2 ({failed_align_segs} synthesized pre-diarization fallback words).")
 
             logger.info(f"[{job_id}] Diarization check: requested={enable_diarization}, model_loaded={self.diarizer.is_loaded}")
             if self.diarizer.is_loaded and enable_diarization:

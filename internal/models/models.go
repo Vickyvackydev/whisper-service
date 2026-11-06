@@ -97,6 +97,8 @@ type APIError struct {
 type SubmissionData struct {
 	TranscriptionID string `json:"transcription_id"`
 	Status          string `json:"status"`
+	Stage           string `json:"stage,omitempty"`
+	Progress        int    `json:"progress"`
 }
 
 type StatusData struct {

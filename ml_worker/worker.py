@@ -42,6 +42,8 @@ class MLWorker:
         self._job_counter = 0
         self.worker_status = "idle"
         self.heartbeat_thread: Optional[threading.Thread] = None
+        self._last_active_timestamp = time.time()
+        self._last_burst_wake_timestamp = 0.0
 
     def _terminate_duplicate_workers(self):
         """
@@ -128,6 +130,35 @@ class MLWorker:
 
         return gpu_available, gpu_name, gpu_total_mb, gpu_used_mb
 
+    def _resume_runpod_pod(self, pod_id: str):
+        api_key = getattr(self.config, "RUNPOD_API_KEY", "")
+        if not api_key or not pod_id:
+            return
+        try:
+            import requests
+            url = f"https://api.runpod.io/graphql?api_key={api_key}"
+            query = f'mutation {{ podResume(input: {{ podId: "{pod_id}", gpuCount: 1 }}) {{ id desiredStatus }} }}'
+            resp = requests.post(url, json={"query": query}, timeout=12)
+            if resp.status_code == 200:
+                logger.info(f"[Auto-Burst GPU] Triggered RunPod wake-up (podResume) for secondary GPU pod {pod_id}: {resp.text}")
+            else:
+                logger.warning(f"[Auto-Burst GPU] RunPod wake-up HTTP {resp.status_code}: {resp.text}")
+        except Exception as e:
+            logger.warning(f"[Auto-Burst GPU] Failed to wake secondary pod {pod_id}: {e}")
+
+    def _stop_runpod_pod(self, pod_id: str):
+        api_key = getattr(self.config, "RUNPOD_API_KEY", "")
+        if not api_key or not pod_id:
+            return
+        try:
+            import requests
+            url = f"https://api.runpod.io/graphql?api_key={api_key}"
+            query = f'mutation {{ podStop(input: {{ podId: "{pod_id}" }}) {{ id desiredStatus }} }}'
+            resp = requests.post(url, json={"query": query}, timeout=12)
+            logger.info(f"[Auto-Burst GPU] Triggered RunPod auto-stop (podStop) for idle burst pod {pod_id}: {resp.text}")
+        except Exception as e:
+            logger.warning(f"[Auto-Burst GPU] Failed to auto-stop burst pod {pod_id}: {e}")
+
     def heartbeat_loop(self):
         logger.info("Heartbeat telemetry loop started.")
         while self.is_running:
@@ -137,6 +168,9 @@ class MLWorker:
                     active_list = list(self.active_job_ids)
                     cur_id = self.current_job_id or (active_list[0] if active_list else None)
                     status = "busy" if active_list else "idle"
+                    if active_list:
+                        self._last_active_timestamp = time.time()
+
                 self.db.send_worker_heartbeat(
                     worker_id=self.config.WORKER_ID,
                     gpu_available=gpu_avail,
@@ -149,18 +183,59 @@ class MLWorker:
                     current_job_id=cur_id,
                     active_job_ids=active_list
                 )
+
+                # Multi-GPU Auto-Burst Wake-Up & Idle Auto-Stop check
+                burst_pod_id = getattr(self.config, "RUNPOD_BURST_POD_ID", "").strip()
+                is_burst_worker = getattr(self.config, "IS_BURST_WORKER", False)
+                idle_shutdown_mins = int(getattr(self.config, "IDLE_SHUTDOWN_MINUTES", 0))
+
+                if burst_pod_id or (is_burst_worker and idle_shutdown_mins > 0):
+                    queued_count, active_workers = self.db.get_queue_and_worker_counts()
+                    now_ts = time.time()
+
+                    # 1. Primary Worker: Wake secondary burst GPU pod when queue builds up
+                    threshold = int(getattr(self.config, "BURST_QUEUE_THRESHOLD", 3))
+                    if (
+                        burst_pod_id
+                        and not is_burst_worker
+                        and queued_count >= threshold
+                        and active_workers < 2
+                        and (now_ts - self._last_burst_wake_timestamp) >= 120.0
+                    ):
+                        self._last_burst_wake_timestamp = now_ts
+                        logger.info(
+                            f"[Auto-Burst GPU] Queue depth is {queued_count} (>= {threshold}) with {active_workers} active worker(s). "
+                            f"Waking secondary GPU pod {burst_pod_id}..."
+                        )
+                        self._resume_runpod_pod(burst_pod_id)
+
+                    # 2. Secondary Burst Worker: Auto-stop after IDLE_SHUTDOWN_MINUTES of empty queue
+                    if is_burst_worker and idle_shutdown_mins > 0:
+                        if queued_count > 0 or active_list:
+                            self._last_active_timestamp = now_ts
+                        elif (now_ts - self._last_active_timestamp) >= (idle_shutdown_mins * 60):
+                            own_pod_id = getattr(self.config, "RUNPOD_POD_ID", "").strip()
+                            if own_pod_id:
+                                logger.info(
+                                    f"[Auto-Burst GPU] Secondary burst worker {self.config.WORKER_ID} idle for "
+                                    f"{idle_shutdown_mins}m with 0 queued jobs. Stopping pod {own_pod_id}..."
+                                )
+                                self._stop_runpod_pod(own_pod_id)
+                                self._last_active_timestamp = now_ts
             except Exception as e:
                 logger.debug(f"Heartbeat loop error: {e}")
             
             time.sleep(self.config.HEARTBEAT_INTERVAL)
 
     def _worker_slot_loop(self, slot_id: int):
-        logger.info(f"Worker slot #{slot_id} active and polling PostgreSQL queue...")
+        lane_name = "Express Fast-Lane (Newest First)" if slot_id >= 2 else "FIFO Backlog Lane (Oldest First)"
+        logger.info(f"Worker slot #{slot_id} [{lane_name}] active and polling PostgreSQL queue...")
         while self.is_running:
             job_id: Optional[str] = None
             try:
-                with self._state_lock:
-                    prefer_newest = (self._job_counter % 3 == 2)
+                # Slot #1 drains FIFO backlog (so 3h-10h recordings and older bulk jobs never starve)
+                # Slot #2+ acts as dedicated Express Lane (so new single courtroom uploads start immediately)
+                prefer_newest = (slot_id >= 2)
                 job = self.db.dequeue_job(self.config.WORKER_ID, prefer_newest=prefer_newest)
                 if not job:
                     time.sleep(self.config.POLL_INTERVAL)
