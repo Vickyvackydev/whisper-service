@@ -18,3 +18,4 @@ nohup python3 -m ml_worker.worker > worker.log 2>&1 &
 sleep 1
 echo "Worker started! Tailing worker.log (Press Ctrl+C to exit log view; worker will stay running):"
 tail -f worker.log
+
