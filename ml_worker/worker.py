@@ -44,6 +44,7 @@ class MLWorker:
         self.heartbeat_thread: Optional[threading.Thread] = None
         self._last_active_timestamp = time.time()
         self._last_burst_wake_timestamp = 0.0
+        self._dynamic_burst_pod_id: Optional[str] = None
 
     def _terminate_duplicate_workers(self):
         """
@@ -130,21 +131,139 @@ class MLWorker:
 
         return gpu_available, gpu_name, gpu_total_mb, gpu_used_mb
 
+    def _is_within_court_hours(self) -> bool:
+        """
+        Returns True if BURST_KEEP_ALIVE_COURT_HOURS is enabled and current time in WAT (UTC+1)
+        is Monday-Friday between COURT_START_HOUR_WAT (8 AM) and COURT_END_HOUR_WAT (5 PM).
+        Prevents the secondary burst GPU from stopping mid-day and losing its physical host GPU to another renter.
+        """
+        if not getattr(self.config, "BURST_KEEP_ALIVE_COURT_HOURS", True):
+            return False
+        import datetime
+        wat_tz = datetime.timezone(datetime.timedelta(hours=1))
+        now_wat = datetime.datetime.now(wat_tz)
+        if now_wat.weekday() >= 5:  # Saturday (5) or Sunday (6)
+            return False
+        start_hr = int(getattr(self.config, "COURT_START_HOUR_WAT", 8))
+        end_hr = int(getattr(self.config, "COURT_END_HOUR_WAT", 17))
+        return start_hr <= now_wat.hour < end_hr
+
+    def _deploy_fallback_burst_pod(self) -> Optional[str]:
+        """
+        If the stopped burst pod's physical host GPU was rented by someone else overnight,
+        automatically deploys a new On-Demand GPU Pod on any available host in RunPod.
+        """
+        api_key = getattr(self.config, "RUNPOD_API_KEY", "").strip()
+        if not api_key or not getattr(self.config, "BURST_AUTO_PROVISION_FALLBACK", True):
+            return None
+
+        import requests
+        url = f"https://api.runpod.io/graphql?api_key={api_key}"
+        candidate_gpus = [
+            "NVIDIA RTX 4000 Ada Generation",
+            "NVIDIA RTX A4500",
+            "NVIDIA RTX A5000",
+            "NVIDIA L4",
+            "NVIDIA GeForce RTX 3090",
+        ]
+        image_name = getattr(self.config, "RUNPOD_IMAGE_NAME", "runpod/pytorch:2.2.0-py3.10-cuda12.1.1-devel-ubuntu22.04")
+        net_vol_id = getattr(self.config, "RUNPOD_NETWORK_VOLUME_ID", "").strip()
+
+        startup_cmd = (
+            "bash -c 'if [ ! -d /workspace/whisper-service ]; then "
+            "git clone https://github.com/Vickyvackydev/whisper-service.git /workspace/whisper-service; "
+            "fi && cd /workspace/whisper-service && git pull origin main && "
+            "pip install -q -r requirements.txt && python3 -m ml_worker.worker'"
+        )
+
+        env_items = [
+            {"key": "DATABASE_URL", "value": self.config.DATABASE_URL},
+            {"key": "WORKER_ID", "value": "gpu-worker-runpod-burst-auto"},
+            {"key": "WHISPER_MODEL", "value": self.config.WHISPER_MODEL},
+            {"key": "WHISPER_DEVICE", "value": "cuda"},
+            {"key": "WHISPER_COMPUTE_TYPE", "value": self.config.WHISPER_COMPUTE_TYPE},
+            {"key": "DIARIZATION_BACKEND", "value": self.config.DIARIZATION_BACKEND},
+            {"key": "HF_TOKEN", "value": self.config.HF_TOKEN},
+            {"key": "IS_BURST_WORKER", "value": "true"},
+            {"key": "IDLE_SHUTDOWN_MINUTES", "value": "15"},
+            {"key": "RUNPOD_API_KEY", "value": api_key},
+        ]
+
+        mutation = """
+        mutation($input: PodFindAndDeployOnDemandInput!) {
+            podFindAndDeployOnDemand(input: $input) {
+                id
+                name
+                desiredStatus
+            }
+        }
+        """
+
+        for gpu_type in candidate_gpus:
+            try:
+                pod_input = {
+                    "cloudType": "ALL",
+                    "gpuCount": 1,
+                    "volumeInGb": 40,
+                    "containerDiskInGb": 30,
+                    "minVcpuCount": 4,
+                    "minMemoryInGb": 16,
+                    "gpuTypeId": gpu_type,
+                    "name": "whisper-burst-worker-auto",
+                    "imageName": image_name,
+                    "dockerArgs": startup_cmd,
+                    "volumeMountPath": "/workspace",
+                    "env": env_items,
+                }
+                if net_vol_id:
+                    pod_input["networkVolumeId"] = net_vol_id
+
+                resp = requests.post(url, json={"query": mutation, "variables": {"input": pod_input}}, timeout=15)
+                if resp.status_code == 200:
+                    payload = resp.json()
+                    deployed = (payload.get("data") or {}).get("podFindAndDeployOnDemand")
+                    if deployed and deployed.get("id"):
+                        new_id = deployed["id"]
+                        logger.info(
+                            f"[Auto-Burst GPU] Successfully provisioned new fallback burst GPU pod {new_id} "
+                            f"on free host ({gpu_type})!"
+                        )
+                        self._dynamic_burst_pod_id = new_id
+                        return new_id
+            except Exception as deploy_err:
+                logger.debug(f"[Auto-Burst GPU] Could not provision fallback GPU {gpu_type}: {deploy_err}")
+        return None
+
     def _resume_runpod_pod(self, pod_id: str):
         api_key = getattr(self.config, "RUNPOD_API_KEY", "")
-        if not api_key or not pod_id:
+        target_pod = self._dynamic_burst_pod_id or pod_id
+        if not api_key or not target_pod:
             return
         try:
             import requests
             url = f"https://api.runpod.io/graphql?api_key={api_key}"
-            query = f'mutation {{ podResume(input: {{ podId: "{pod_id}", gpuCount: 1 }}) {{ id desiredStatus }} }}'
+            query = f'mutation {{ podResume(input: {{ podId: "{target_pod}", gpuCount: 1 }}) {{ id desiredStatus }} }}'
             resp = requests.post(url, json={"query": query}, timeout=12)
             if resp.status_code == 200:
-                logger.info(f"[Auto-Burst GPU] Triggered RunPod wake-up (podResume) for secondary GPU pod {pod_id}: {resp.text}")
+                body = {}
+                try:
+                    body = resp.json()
+                except Exception:
+                    pass
+                errors = body.get("errors")
+                resumed = (body.get("data") or {}).get("podResume")
+                if resumed and not errors:
+                    logger.info(f"[Auto-Burst GPU] Triggered RunPod wake-up (podResume) for secondary GPU pod {target_pod}: {resp.text}")
+                    return
+                logger.warning(
+                    f"[Auto-Burst GPU] Secondary pod {target_pod} could not resume (host GPU may be occupied: {errors}). "
+                    f"Attempting automatic new-host failover..."
+                )
+                self._deploy_fallback_burst_pod()
             else:
                 logger.warning(f"[Auto-Burst GPU] RunPod wake-up HTTP {resp.status_code}: {resp.text}")
         except Exception as e:
-            logger.warning(f"[Auto-Burst GPU] Failed to wake secondary pod {pod_id}: {e}")
+            logger.warning(f"[Auto-Burst GPU] Failed to wake secondary pod {target_pod}: {e}")
 
     def _stop_runpod_pod(self, pod_id: str):
         api_key = getattr(self.config, "RUNPOD_API_KEY", "")
@@ -184,7 +303,7 @@ class MLWorker:
                     active_job_ids=active_list
                 )
 
-                # Multi-GPU Auto-Burst Wake-Up & Idle Auto-Stop check
+                # Multi-GPU Auto-Burst Wake-Up & Court-Hours Protected Auto-Stop check
                 burst_pod_id = getattr(self.config, "RUNPOD_BURST_POD_ID", "").strip()
                 is_burst_worker = getattr(self.config, "IS_BURST_WORKER", False)
                 idle_shutdown_mins = int(getattr(self.config, "IDLE_SHUTDOWN_MINUTES", 0))
@@ -193,7 +312,7 @@ class MLWorker:
                     queued_count, active_workers = self.db.get_queue_and_worker_counts()
                     now_ts = time.time()
 
-                    # 1. Primary Worker: Wake secondary burst GPU pod when queue builds up
+                    # 1. Primary Worker: Wake secondary burst GPU pod when queue builds up (or at start of court rush)
                     threshold = int(getattr(self.config, "BURST_QUEUE_THRESHOLD", 3))
                     if (
                         burst_pod_id
@@ -209,16 +328,17 @@ class MLWorker:
                         )
                         self._resume_runpod_pod(burst_pod_id)
 
-                    # 2. Secondary Burst Worker: Auto-stop after IDLE_SHUTDOWN_MINUTES of empty queue
+                    # 2. Secondary Burst Worker: Stay locked during active court hours (8 AM - 5 PM WAT Mon-Fri)
+                    #    so nobody can snatch the GPU mid-day; auto-stop after court hours when idle for IDLE_SHUTDOWN_MINUTES.
                     if is_burst_worker and idle_shutdown_mins > 0:
-                        if queued_count > 0 or active_list:
+                        if queued_count > 0 or active_list or self._is_within_court_hours():
                             self._last_active_timestamp = now_ts
                         elif (now_ts - self._last_active_timestamp) >= (idle_shutdown_mins * 60):
                             own_pod_id = getattr(self.config, "RUNPOD_POD_ID", "").strip()
                             if own_pod_id:
                                 logger.info(
-                                    f"[Auto-Burst GPU] Secondary burst worker {self.config.WORKER_ID} idle for "
-                                    f"{idle_shutdown_mins}m with 0 queued jobs. Stopping pod {own_pod_id}..."
+                                    f"[Auto-Burst GPU] Outside court hours and secondary burst worker {self.config.WORKER_ID} "
+                                    f"has been idle for {idle_shutdown_mins}m with 0 queued jobs. Stopping pod {own_pod_id}..."
                                 )
                                 self._stop_runpod_pod(own_pod_id)
                                 self._last_active_timestamp = now_ts
