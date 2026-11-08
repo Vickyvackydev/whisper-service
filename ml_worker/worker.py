@@ -173,7 +173,7 @@ class MLWorker:
             "bash -c 'if [ ! -d /workspace/whisper-service ]; then "
             "git clone https://github.com/Vickyvackydev/whisper-service.git /workspace/whisper-service; "
             "fi && cd /workspace/whisper-service && git pull origin main && "
-            "pip install -q -r requirements.txt && python3 -m ml_worker.worker'"
+            "pip install -q -r ml_worker/requirements.txt && python3 -m ml_worker.worker'"
         )
 
         env_items = [
