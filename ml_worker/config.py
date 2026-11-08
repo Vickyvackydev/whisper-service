@@ -29,8 +29,18 @@ class WorkerConfig:
     )
     
     # Speaker Diarization
+    DIARIZATION_BACKEND: str = os.getenv("DIARIZATION_BACKEND", "nemo").lower()  # "nemo" or "pyannote"
+
     @classmethod
     def get_hf_token(cls) -> str:
+        # Both faster-whisper-large-v3 and nvidia/diar_sortformer_4spk-v1 are public models.
+        # If DIARIZATION_BACKEND is nemo, strip any expired HF_TOKEN from the environment
+        # so huggingface_hub never throws 401 'User Access Token is expired' on public models!
+        if os.getenv("DIARIZATION_BACKEND", "nemo").lower() == "nemo":
+            os.environ.pop("HF_TOKEN", None)
+            os.environ.pop("HUGGINGFACE_TOKEN", None)
+            os.environ.pop("HUGGINGFACE_HUB_TOKEN", None)
+            return ""
         token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN") or ""
         if not token:
             hf_cache = Path.home() / ".cache" / "huggingface" / "token"
@@ -39,7 +49,6 @@ class WorkerConfig:
         return token
 
     HF_TOKEN: str = get_hf_token.__func__(None)
-    DIARIZATION_BACKEND: str = os.getenv("DIARIZATION_BACKEND", "nemo").lower()  # "nemo" or "pyannote"
     NEMO_DIARIZATION_MODEL: str = os.getenv("NEMO_DIARIZATION_MODEL", "nvidia/diar_sortformer_4spk-v1")
     DIARIZATION_MODEL: str = os.getenv("DIARIZATION_MODEL", "pyannote/speaker-diarization-3.1")
     DIARIZATION_THRESHOLD: Optional[float] = float(os.getenv("DIARIZATION_THRESHOLD", "0.63"))
