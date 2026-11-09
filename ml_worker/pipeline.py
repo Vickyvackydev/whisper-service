@@ -111,8 +111,8 @@ class InferencePipeline:
                     pct = 40 + int((current_sec / total_sec) * 35) # 40% to 75%
                     progress_updater("transcribing", min(75, pct))
 
-            # Skip redundant CTranslate2 DTW word_timestamps pass when WhisperX Wav2Vec2 phoneme alignment will overwrite word timestamps
-            use_whisperx_align = getattr(WorkerConfig, "FORCE_WHISPERX_ALIGNMENT", True)
+            # Always enable CTranslate2 DTW word_timestamps=True in Whisper so sliding-window seek pointers
+            # track exact word boundaries and never skip verses, choruses, or courtroom clauses
             with self._whisper_lock:
                 whisper_result = self.transcriber.transcribe(
                     wav_path,
@@ -122,7 +122,7 @@ class InferencePipeline:
                     mode=transcription_mode,
                     progress_callback=transcribe_progress_cb,
                     audio_data=audio_arr,
-                    need_word_timestamps=not use_whisperx_align
+                    need_word_timestamps=True
                 )
 
             segments = whisper_result["segments"]
@@ -131,6 +131,13 @@ class InferencePipeline:
             # 4. Stage 3 & 4: WhisperX Phoneme Forced Alignment + Speaker Diarization Stitching
             align_device = "cuda" if (torch and torch.cuda.is_available() and WorkerConfig.WHISPER_DEVICE != "cpu") else "cpu"
             aligned_result = {"segments": segments}
+
+            # Cache Whisper's native CTranslate2 DTW word timestamps before WhisperX Wav2Vec2 alignment
+            # so if Wav2Vec2 fails to backtrack on any noisy/musical segment, we restore exact DTW word timestamps!
+            orig_dtw_words_by_start = {
+                round(float(s.get("start", 0.0)), 2): [dict(w) for w in s.get("words", [])]
+                for s in segments if s.get("words")
+            }
 
             if segments and len(segments) > 0:
                 lang_code = whisper_result.get("language") or "en"
@@ -162,32 +169,36 @@ class InferencePipeline:
                     aligned_result = {"segments": segments}
 
             # Diarization & Word Midpoint Stitching
-            # Pre-populate proportional word timestamps for any segment where WhisperX Wav2Vec2 alignment logged
-            # 'backtrack failed, resorting to original' BEFORE calling whisperx.assign_word_speakers() so every
-            # fallback segment still receives full word-level speaker diarization!
+            # Restore Whisper DTW word timestamps (or synthesize proportional fallback) for any segment where
+            # WhisperX Wav2Vec2 alignment logged 'backtrack failed, resorting to original' BEFORE calling
+            # whisperx.assign_word_speakers() so every segment receives full word-level speaker diarization!
             align_segs = aligned_result.get("segments", [])
             total_align_segs = len(align_segs)
             failed_align_segs = 0
             for s in align_segs:
                 if not s.get("words"):
                     failed_align_segs += 1
-                    raw_txt = str(s.get("text", "")).strip()
-                    if raw_txt:
-                        toks = raw_txt.split()
-                        s_start = round(float(s.get("start", 0.0)), 3)
-                        s_end = round(float(s.get("end", s_start + 0.1)), 3)
-                        dur = max(0.1, s_end - s_start)
-                        step = dur / max(1, len(toks))
-                        s["words"] = [
-                            {
-                                "word": tok,
-                                "start": round(s_start + idx * step, 3),
-                                "end": round(s_start + (idx + 1) * step, 3),
-                                "score": None,
-                            }
-                            for idx, tok in enumerate(toks)
-                        ]
-            logger.info(f"[{job_id}] [DIAGNOSTIC] Alignment status: {total_align_segs - failed_align_segs}/{total_align_segs} segments aligned via Wav2Vec2 ({failed_align_segs} synthesized pre-diarization fallback words).")
+                    st_key = round(float(s.get("start", 0.0)), 2)
+                    if st_key in orig_dtw_words_by_start and orig_dtw_words_by_start[st_key]:
+                        s["words"] = orig_dtw_words_by_start[st_key]
+                    else:
+                        raw_txt = str(s.get("text", "")).strip()
+                        if raw_txt:
+                            toks = raw_txt.split()
+                            s_start = round(float(s.get("start", 0.0)), 3)
+                            s_end = round(float(s.get("end", s_start + 0.1)), 3)
+                            dur = max(0.1, s_end - s_start)
+                            step = dur / max(1, len(toks))
+                            s["words"] = [
+                                {
+                                    "word": tok,
+                                    "start": round(s_start + idx * step, 3),
+                                    "end": round(s_start + (idx + 1) * step, 3),
+                                    "score": None,
+                                }
+                                for idx, tok in enumerate(toks)
+                            ]
+            logger.info(f"[{job_id}] [DIAGNOSTIC] Alignment status: {total_align_segs - failed_align_segs}/{total_align_segs} segments aligned via Wav2Vec2 ({failed_align_segs} restored from Whisper DTW/fallback).")
 
             logger.info(f"[{job_id}] Diarization check: requested={enable_diarization}, model_loaded={self.diarizer.is_loaded}")
             if self.diarizer.is_loaded and enable_diarization:
@@ -464,7 +475,10 @@ class InferencePipeline:
                     prev_spk = runs[i - 1]["speaker"]
                     for w in r["words"]:
                         w["speaker"] = prev_spk
-                    new_runs[-1]["words"].extend(r["words"])
+                    if new_runs:
+                        new_runs[-1]["words"].extend(r["words"])
+                    else:
+                        runs[i + 1]["words"] = r["words"] + runs[i + 1]["words"]
                     changed = True
                     i += 1
                     continue
@@ -1330,11 +1344,17 @@ class InferencePipeline:
                         ):
                             continue
                         sim_val = float(np.dot(seg_spk_centroids[s_maj], seg_spk_centroids[s_min]))
-                        merge_thresh = 0.54 if uses_neural else 0.78
+                        # In courtroom audio, two distinct speakers on the same room mic have sim ~ 0.50-0.68,
+                        # whereas duplicate chunk clusters of the same person have sim >= 0.82.
+                        # In non-courtroom audio (e.g. solo vocalist music track over beat drops), sim >= 0.50 merges the artist.
+                        if is_courtroom_context:
+                            merge_thresh = 0.82 if uses_neural else 0.88
+                        else:
+                            merge_thresh = 0.50 if uses_neural else 0.76
                         if sim_val >= merge_thresh:
                             logger.info(
                                 f"[PIPELINE VOICEPRINT MERGE] Merging duplicate speaker bank {s_min} -> {s_maj} "
-                                f"(voiceprint_sim={sim_val:.3f})"
+                                f"(voiceprint_sim={sim_val:.3f}, courtroom={is_courtroom_context})"
                             )
                             seg_cluster_merge[s_min] = s_maj
                             break
@@ -1348,7 +1368,7 @@ class InferencePipeline:
                         for w in s_obj.get("words", []):
                             w["speaker"] = cur
 
-            # 2. Smooth Sandwiched Turns (SPEAKER_A -> SPEAKER_B -> SPEAKER_A) & Short Non-Legal Flips
+            # 2. Smooth Sandwiched Turns (SPEAKER_A -> SPEAKER_B -> SPEAKER_A) & Non-Courtroom Short Flips
             for _smooth_pass in range(2):
                 changed_any = False
                 for idx_s in range(len(processed_segments)):
@@ -1358,27 +1378,30 @@ class InferencePipeline:
                     seg_dur = float(seg["end"]) - float(seg["start"])
                     seg_w_cnt = len(seg.get("words", []))
                     has_bc = bool(_find_bc_indices(seg.get("words", [])))
+                    ends_q = seg.get("text", "").strip().endswith("?")
 
                     # Case A: Sandwiched segment between the same speaker (SPEAKER_A | seg | SPEAKER_A)
                     if idx_s > 0 and idx_s < len(processed_segments) - 1:
                         prev_spk = processed_segments[idx_s - 1]["speaker"]
                         next_spk = processed_segments[idx_s + 1]["speaker"]
-                        if prev_spk == next_spk and seg["speaker"] != prev_spk:
-                            if not has_bc and (seg_dur <= 2.2 or seg_w_cnt <= 5):
-                                # Check voiceprint if available: only keep as different speaker if strongly closer to curr speaker
-                                keep_diff = False
-                                if idx_s in seg_embeddings_cache and prev_spk in seg_spk_centroids and seg["speaker"] in seg_spk_centroids:
-                                    sim_prev = float(np.dot(seg_embeddings_cache[idx_s], seg_spk_centroids[prev_spk]))
-                                    sim_curr = float(np.dot(seg_embeddings_cache[idx_s], seg_spk_centroids[seg["speaker"]]))
-                                    if sim_curr - sim_prev >= 0.14 and seg_dur >= 1.2:
-                                        keep_diff = True
-                                if not keep_diff:
+                        if prev_spk == next_spk and seg["speaker"] != prev_spk and not has_bc:
+                            if is_courtroom_context:
+                                # In courtroom proceedings, only absorb unpunctuated mid-sentence micro-fragments (<= 3 words, <= 1.1s)
+                                # that are NOT questions ("So the order?", "Can I see the...")
+                                prev_ends_punct = _has_term(processed_segments[idx_s - 1]["words"][-1]) if processed_segments[idx_s - 1].get("words") else True
+                                if (not ends_q) and (not prev_ends_punct) and seg_w_cnt <= 3 and seg_dur <= 1.1:
+                                    seg["speaker"] = prev_spk
+                                    changed_any = True
+                                    continue
+                            else:
+                                # Non-courtroom (e.g. music / solo media): absorb <= 5 words / <= 2.2s sandwich
+                                if seg_dur <= 2.2 or seg_w_cnt <= 5:
                                     seg["speaker"] = prev_spk
                                     changed_any = True
                                     continue
 
-                    # Case B: Short isolated speaker flip (< 1.6s or <= 4 words) without backchannel/role marker
-                    if idx_s > 0 and not has_bc and (seg_dur < 1.6 or seg_w_cnt <= 4):
+                    # Case B: Short isolated speaker flip in non-courtroom audio (e.g. "Check.", "I wonder why...")
+                    if (not is_courtroom_context) and idx_s > 0 and not has_bc and (seg_dur < 1.8 or seg_w_cnt <= 5):
                         prev_spk = processed_segments[idx_s - 1]["speaker"]
                         if seg["speaker"] != prev_spk:
                             if idx_s in seg_embeddings_cache and prev_spk in seg_spk_centroids and seg["speaker"] in seg_spk_centroids:
@@ -1387,7 +1410,7 @@ class InferencePipeline:
                                 if sim_prev >= sim_curr - 0.05:
                                     seg["speaker"] = prev_spk
                                     changed_any = True
-                            elif seg_dur < 1.0 and seg_w_cnt <= 2:
+                            else:
                                 seg["speaker"] = prev_spk
                                 changed_any = True
                 if not changed_any:

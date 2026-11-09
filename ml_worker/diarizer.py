@@ -1029,20 +1029,22 @@ class SpeakerDiarizer:
 
             should_merge = False
             if uses_neural_emb:
-                # Rule 1: Direct TitaNet-Large 192-D Neural Voiceprint Match (same human speaker across volume/pitch/beat changes)
-                if best_c_sim >= 0.56 or (best_c_sim >= 0.50 and best_top_sim >= 0.62):
+                # Calibrated on live RunPod courtroom telemetry:
+                # - Distinct speakers in the same courtroom have centroid_sim ~ 0.45 - 0.68 (e.g. 0.568)
+                # - Identical speaker split across chunks/turns has centroid_sim >= 0.80 (e.g. 0.930)
+                if best_c_sim >= 0.80 and best_top_sim >= 0.72:
                     should_merge = True
-                # Rule 2: Minor/short cluster (< 3.5s or < 6% of speech) with moderate voiceprint match
-                elif (dur_min < 3.5 or (frac_min < 0.06 and dur_min < 8.0)) and (best_c_sim >= 0.40 or best_top_sim >= 0.48):
+                # Minor fragmented cluster (< 4.0s and < 5% of total speech) with strong voiceprint match
+                elif dur_min < 4.0 and frac_min < 0.05 and best_c_sim >= 0.70 and best_top_sim >= 0.68:
                     should_merge = True
-                # Rule 3: Short fragmented bursts (median turn < 2.5s) in a 2-speaker split with matching voiceprint
-                elif median_turn_dur < 2.5 and best_c_sim >= 0.45 and best_top_sim >= 0.54:
+                # Ultra-short micro-glitch (< 1.2s total across entire recording)
+                elif dur_min < 1.2 and frac_min < 0.02 and best_c_sim >= 0.58:
                     should_merge = True
             else:
                 # Cepstral fallback thresholds
-                if best_c_sim >= 0.80 or (best_c_sim >= 0.74 and best_top_sim >= 0.82):
+                if best_c_sim >= 0.88 and best_top_sim >= 0.82:
                     should_merge = True
-                elif (dur_min < 3.0 or frac_min < 0.05) and best_c_sim >= 0.65:
+                elif dur_min < 2.5 and frac_min < 0.04 and best_c_sim >= 0.78:
                     should_merge = True
 
             if should_merge:

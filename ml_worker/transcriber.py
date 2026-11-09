@@ -2,9 +2,7 @@ import gc
 import re
 import logging
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Optional, Dict, Any, List
-import numpy as np
 from faster_whisper import WhisperModel
 try:
     from faster_whisper import BatchedInferencePipeline
@@ -33,214 +31,6 @@ class Transcriber:
         self.compute_type = WorkerConfig.WHISPER_COMPUTE_TYPE
         # Strictly 1 CTranslate2 worker thread to prevent parallel_for cudaErrorInvalidDevice
         self.num_workers = 1
-
-    @staticmethod
-    def _has_active_vocal_energy(audio_slice: np.ndarray, sample_rate: int = 16000) -> bool:
-        """
-        Determines whether an untranscribed audio window contains active human vocal/singing
-        energy (250 Hz - 3800 Hz) with syllable modulation, versus flat courtroom recess hum or silence.
-        """
-        if audio_slice is None or len(audio_slice) < sample_rate * 2:
-            return False
-        rms = float(np.sqrt(np.mean(audio_slice ** 2)))
-        if rms < 0.006:
-            return False
-
-        frame_len = sample_rate // 2  # 0.5s frames
-        n_frames = len(audio_slice) // frame_len
-        if n_frames < 4:
-            return rms >= 0.012
-
-        frames = audio_slice[: n_frames * frame_len].reshape(n_frames, frame_len)
-        frame_rms = np.sqrt(np.mean(frames ** 2, axis=1))
-        p90 = float(np.percentile(frame_rms, 90))
-        p15 = float(np.percentile(frame_rms, 15))
-        if p90 < 0.012:
-            return False
-
-        # Steady fan/AC hum has flat envelope; speech and music vocals have dynamic modulation or strong energy
-        modulation_ratio = p90 / max(1e-5, p15)
-        if modulation_ratio < 1.35 and rms < 0.025:
-            return False
-
-        # Check mid-frequency vocal band energy (250 Hz - 3800 Hz) on active frames
-        active_idx = np.argsort(frame_rms)[-min(8, n_frames):]
-        active_frames = frames[active_idx]
-        spec = np.abs(np.fft.rfft(active_frames, axis=1)) ** 2
-        freqs = np.fft.rfftfreq(frame_len, d=1.0 / sample_rate)
-        total_power = float(np.sum(spec))
-        if total_power <= 1e-9:
-            return False
-        vocal_mask = (freqs >= 250.0) & (freqs <= 3800.0)
-        vocal_power = float(np.sum(spec[:, vocal_mask]))
-        vocal_ratio = vocal_power / total_power
-        return vocal_ratio >= 0.12 or p90 >= 0.035
-
-    def _recover_skipped_audio_regions(
-        self,
-        raw_segments: List[Any],
-        audio_data: np.ndarray,
-        duration: float,
-        lang_arg: Optional[str],
-        task: str,
-        beam_size: int,
-        need_word_timestamps: bool,
-        prompt: Optional[str],
-        sample_rate: int = 16000,
-    ) -> List[Any]:
-        """
-        Inspects transcribed segments against the waveform.
-        1. If the recording has 0 courtroom markers and Silero VAD / courtroom prompt suppressed > 45% of
-           an active vocal recording (or censored lyrics with '***'), re-decodes cleanly without courtroom prompt bias.
-        2. For any remaining untranscribed gaps >= 5.5s that contain active vocal energy (e.g., singing over
-           heavy drums/bass or a soft-spoken witness filtered out by Silero VAD), decodes those windows with
-           vad_filter=False and merges recovered segments chronologically.
-        """
-        if audio_data is None or len(audio_data) < sample_rate * 4 or duration <= 4.0:
-            return raw_segments
-
-        covered_dur = sum(max(0.0, float(s.end) - float(s.start)) for s in raw_segments)
-        coverage_ratio = covered_dur / max(1.0, duration)
-        combined_initial_text = " ".join(getattr(s, "text", "") for s in raw_segments)
-        is_courtroom = bool(COURTROOM_MARKER_RE.search(combined_initial_text))
-        has_asterisk_censorship = "*" in combined_initial_text
-
-        HALLUCINATION_PHRASES = (
-            "thank you for watching",
-            "thanks for watching",
-            "subtitles by",
-            "amara.org",
-            "please subscribe",
-            "translated by",
-        )
-
-        # Case A: Non-courtroom audio (e.g. music / song / general media) where courtroom prompt or VAD
-        # either censored words with '***' or dropped > 45% of active vocal audio on a file <= 15 mins
-        if (not is_courtroom) and duration <= 900.0 and (has_asterisk_censorship or coverage_ratio < 0.55):
-            if self._has_active_vocal_energy(audio_data, sample_rate):
-                logger.info(
-                    f"Non-courtroom vocal audio detected with low VAD coverage ({coverage_ratio*100:.1f}%) "
-                    f"or prompt censorship (asterisks={has_asterisk_censorship}). "
-                    f"Running full-coverage unprompted pass (vad_filter=False)..."
-                )
-                try:
-                    rec_iter, _ = self.model.transcribe(
-                        audio_data,
-                        language=lang_arg,
-                        task=task,
-                        beam_size=max(2, beam_size),
-                        temperature=0.0,
-                        word_timestamps=need_word_timestamps,
-                        vad_filter=False,
-                        condition_on_previous_text=False,
-                        repetition_penalty=1.15,
-                        no_speech_threshold=0.90,
-                        log_prob_threshold=-1.35,
-                        compression_ratio_threshold=2.4,
-                        initial_prompt=None,
-                    )
-                    full_rec = [s for s in rec_iter if getattr(s, "text", "").strip()]
-                    rec_dur = sum(max(0.0, float(s.end) - float(s.start)) for s in full_rec)
-                    if len(full_rec) >= len(raw_segments) or rec_dur > covered_dur * 1.15 or (has_asterisk_censorship and "*" not in " ".join(s.text for s in full_rec)):
-                        raw_segments = full_rec
-                        logger.info(f"Full-coverage unprompted pass recovered {len(raw_segments)} segments ({rec_dur:.1f}s / {duration:.1f}s).")
-                except Exception as rec_err:
-                    logger.warning(f"Full-coverage unprompted recovery note: {rec_err}")
-
-        # Case B: Targeted Gap Recovery for any remaining untranscribed vocal windows >= 5.5s
-        sorted_segs = sorted(raw_segments, key=lambda s: float(s.start))
-        gaps = []
-        cursor = 0.0
-        for s in sorted_segs:
-            st = float(s.start)
-            et = float(s.end)
-            if st - cursor >= 5.5:
-                gaps.append((cursor, st))
-            cursor = max(cursor, et)
-        if duration - cursor >= 5.5:
-            gaps.append((cursor, duration))
-
-        if not gaps:
-            return sorted_segs
-
-        recovered_any = False
-        all_segments = list(sorted_segs)
-        # Only cap gap recovery count so multi-hour silent recesses don't trigger excess work
-        checked_gaps = 0
-        for (g_start, g_end) in gaps:
-            if checked_gaps >= 24:
-                break
-            s_idx = max(0, int(g_start * sample_rate))
-            e_idx = min(len(audio_data), int(g_end * sample_rate))
-            gap_audio = audio_data[s_idx:e_idx]
-            if not self._has_active_vocal_energy(gap_audio, sample_rate):
-                continue
-
-            checked_gaps += 1
-            gap_dur = g_end - g_start
-            logger.info(f"Recovering skipped active vocal region [{g_start:.1f}s -> {g_end:.1f}s] ({gap_dur:.1f}s) with vad_filter=False...")
-            try:
-                gap_iter, _ = self.model.transcribe(
-                    gap_audio,
-                    language=lang_arg,
-                    task=task,
-                    beam_size=max(2, beam_size),
-                    temperature=0.0,
-                    word_timestamps=need_word_timestamps,
-                    vad_filter=False,
-                    condition_on_previous_text=False,
-                    repetition_penalty=1.18,
-                    no_speech_threshold=0.92,
-                    log_prob_threshold=-1.35,
-                    compression_ratio_threshold=2.4,
-                    initial_prompt=prompt if is_courtroom else None,
-                )
-                for gseg in gap_iter:
-                    gtxt = self._collapse_repeated_clauses(getattr(gseg, "text", "").strip())
-                    if not gtxt:
-                        continue
-                    gtxt_low = gtxt.lower()
-                    if any(hp in gtxt_low for hp in HALLUCINATION_PHRASES):
-                        continue
-                    avg_lp = getattr(gseg, "avg_logprob", 0.0) or 0.0
-                    nsp = getattr(gseg, "no_speech_prob", 0.0) or 0.0
-                    if avg_lp < -1.30 and nsp > 0.85:
-                        continue
-
-                    new_start = round(float(gseg.start) + g_start, 3)
-                    new_end = round(min(g_end, float(gseg.end) + g_start), 3)
-                    if new_end <= new_start:
-                        continue
-
-                    new_words = []
-                    if getattr(gseg, "words", None):
-                        for gw in gseg.words:
-                            new_words.append(
-                                SimpleNamespace(
-                                    word=gw.word,
-                                    start=round(float(gw.start) + g_start, 3),
-                                    end=round(min(g_end, float(gw.end) + g_start), 3),
-                                    probability=getattr(gw, "probability", None),
-                                )
-                            )
-                    all_segments.append(
-                        SimpleNamespace(
-                            start=new_start,
-                            end=new_end,
-                            text=gtxt,
-                            words=new_words,
-                            no_speech_prob=nsp,
-                            avg_logprob=avg_lp,
-                        )
-                    )
-                    recovered_any = True
-            except Exception as gap_err:
-                logger.debug(f"Gap recovery note for [{g_start:.1f}s -> {g_end:.1f}s]: {gap_err}")
-
-        if recovered_any:
-            all_segments.sort(key=lambda s: float(s.start))
-            logger.info(f"Audio completeness recovery finished: total segments now {len(all_segments)} (was {len(sorted_segs)}).")
-        return all_segments
 
     @staticmethod
     def _collapse_repeated_clauses(text: str) -> str:
@@ -310,7 +100,7 @@ class Transcriber:
         if BatchedInferencePipeline is not None and actual_device == "cuda":
             try:
                 self.batched_model = BatchedInferencePipeline(model=self.model)
-                logger.info(f"Initialized BatchedInferencePipeline (batch_size={WorkerConfig.WHISPER_BATCH_SIZE}) for high-speed multi-hour GPU transcription.")
+                logger.info(f"Initialized BatchedInferencePipeline (batch_size={WorkerConfig.WHISPER_BATCH_SIZE}) for ultra-long GPU transcription.")
             except Exception as bp_err:
                 logger.warning(f"Could not initialize BatchedInferencePipeline ({bp_err}); using standard WhisperModel.")
                 self.batched_model = None
@@ -334,16 +124,15 @@ class Transcriber:
         if self.model is None:
             self.load_model()
 
-        # Configure decoding based on transcription mode.
-        # Avoid multi-step temperature cascade on noisy courtroom silence which causes 6x-30x slowdowns,
-        # while preserving beam search for full word recall and segment boundary accuracy.
+        # Restore e0844ce high-accuracy decoding configuration:
+        # 5-beam search and [0.0, 0.2] fallback temperature for full word recall and segment boundary accuracy.
         beam_size = 1
         temperature: Any = 0.0
         if mode == "accurate":
-            beam_size = 3
-            temperature = 0.0
+            beam_size = 5
+            temperature = [0.0, 0.2]
         elif mode == "balanced":
-            beam_size = 2
+            beam_size = 3
             temperature = 0.0
 
         lang_arg = language.lower().strip() if (language and language.lower().strip() not in ("auto", "none")) else None
@@ -363,14 +152,12 @@ class Transcriber:
         logger.info(
             f"Running Whisper inference: task={task}, source_language={lang_arg}, "
             f"target_language={target_lang_arg or ('en' if task == 'translate' else lang_arg)}, "
-            f"beam_size={beam_size}, temperature={temperature}, word_timestamps={need_word_timestamps}"
+            f"beam_size={beam_size}, temperature={temperature}, word_timestamps=True"
         )
 
-        # Optimal VAD and decoding parameters for high accuracy & preserving courtroom speech + music/low-SNR vocals
-        # threshold=0.18 captures quiet remarks ("Yes, My Lord"), distant witnesses, and vocals over music
-        # while post-decoding repetition filters eliminate empty courtroom recess hallucinations
+        # Optimal VAD and decoding parameters from e0844ce for full word recall & preserving courtroom speech
         vad_params = dict(
-            threshold=0.18,
+            threshold=0.20,                # High sensitivity: captures quick remarks, courtroom interjections & vocals
             min_speech_duration_ms=100,    # Catch rapid interjections (e.g. 100ms+)
             min_silence_duration_ms=250,   # Isolate rapid micro-pauses between speaker interchanges
             speech_pad_ms=300              # Pad 300ms to preserve leading/trailing word boundaries
@@ -392,26 +179,27 @@ class Transcriber:
         info = None
         audio_input = audio_data if audio_data is not None else str(audio_path)
         est_duration = (len(audio_data) / 16000.0) if (audio_data is not None and hasattr(audio_data, "__len__")) else 0.0
-        use_batched = (self.batched_model is not None) and (est_duration >= 900.0)  # Use GPU batching for 15m - 10h recordings
+        # Use standard unbatched model.transcribe with word_timestamps=True for all normal recordings (< 45 mins)
+        # so DTW seek tracking and [0.0, 0.2] temperature fallback preserve 100% of words.
+        use_batched = (self.batched_model is not None) and (est_duration >= 2700.0)
 
         try:
             if use_batched:
                 logger.info(
                     f"Using BatchedInferencePipeline (batch_size={WorkerConfig.WHISPER_BATCH_SIZE}) "
-                    f"for long audio ({est_duration / 60.0:.1f} mins)..."
+                    f"for ultra-long audio ({est_duration / 60.0:.1f} mins)..."
                 )
                 segments_iter, info = self.batched_model.transcribe(
                     audio_input,
                     language=lang_arg,
                     task=task,
-                    beam_size=max(2, beam_size - 1) if est_duration >= 5400.0 else beam_size,
+                    beam_size=3,
                     temperature=temperature,
-                    word_timestamps=need_word_timestamps,
+                    word_timestamps=True,
                     vad_filter=True,
                     vad_parameters=vad_params,
                     condition_on_previous_text=False,
-                    repetition_penalty=1.15,
-                    no_speech_threshold=0.75,
+                    no_speech_threshold=0.6,
                     compression_ratio_threshold=2.4,
                     initial_prompt=prompt,
                     batch_size=WorkerConfig.WHISPER_BATCH_SIZE,
@@ -423,12 +211,11 @@ class Transcriber:
                     task=task,
                     beam_size=beam_size,
                     temperature=temperature,
-                    word_timestamps=need_word_timestamps,
+                    word_timestamps=True,
                     vad_filter=True,
                     vad_parameters=vad_params,
                     condition_on_previous_text=False,
-                    repetition_penalty=1.15,
-                    no_speech_threshold=0.75,
+                    no_speech_threshold=0.6,
                     compression_ratio_threshold=2.4,
                     initial_prompt=prompt
                 )
@@ -452,14 +239,13 @@ class Transcriber:
                 audio_input,
                 language=lang_arg,
                 task=task,
-                beam_size=2,
+                beam_size=3,
                 temperature=0.0,
-                word_timestamps=need_word_timestamps,
+                word_timestamps=True,
                 vad_filter=True,
                 vad_parameters=vad_params,
                 condition_on_previous_text=False,
-                repetition_penalty=1.15,
-                no_speech_threshold=0.75,
+                no_speech_threshold=0.6,
                 compression_ratio_threshold=2.4,
                 initial_prompt=prompt
             )
@@ -474,28 +260,40 @@ class Transcriber:
         language_probability = info.language_probability
         duration = info.duration
 
-        # Recover any vocal/music/speech regions skipped by Silero VAD or suppressed by courtroom prompt
-        try:
-            waveform_for_recovery = audio_data
-            if waveform_for_recovery is None and audio_path and Path(audio_path).exists():
-                import soundfile as sf
-                w_np, _ = sf.read(str(audio_path), dtype="float32")
-                if len(w_np.shape) > 1:
-                    w_np = w_np.mean(axis=1)
-                waveform_for_recovery = np.ascontiguousarray(w_np, dtype=np.float32)
-            if waveform_for_recovery is not None:
-                raw_segments = self._recover_skipped_audio_regions(
-                    raw_segments=raw_segments,
-                    audio_data=waveform_for_recovery,
-                    duration=duration,
-                    lang_arg=lang_arg or detected_language,
-                    task=task,
-                    beam_size=beam_size,
-                    need_word_timestamps=need_word_timestamps,
-                    prompt=prompt,
+        # If non-courtroom audio (0 legal terms, <= 10 mins) had words censored with '***' or suppressed
+        # by the courtroom initial_prompt, re-run with initial_prompt=None and the same e0844ce settings
+        if prompt is not None and raw_segments is not None and duration <= 600.0:
+            combined_txt = " ".join(getattr(s, "text", "") for s in raw_segments)
+            is_court = bool(COURTROOM_MARKER_RE.search(combined_txt))
+            covered_sec = sum(max(0.0, float(s.end) - float(s.start)) for s in raw_segments)
+            if (not is_court) and ("*" in combined_txt or covered_sec < 0.35 * duration):
+                logger.info(
+                    f"Non-courtroom audio detected (covered={covered_sec:.1f}s/{duration:.1f}s, asterisks={'*' in combined_txt}); "
+                    f"re-running Whisper without courtroom initial_prompt..."
                 )
-        except Exception as rec_outer_err:
-            logger.debug(f"Audio completeness recovery skipped: {rec_outer_err}")
+                try:
+                    retry_vad = dict(vad_params, threshold=0.12)
+                    retry_iter, _ = self.model.transcribe(
+                        audio_input,
+                        language=lang_arg,
+                        task=task,
+                        beam_size=beam_size,
+                        temperature=temperature,
+                        word_timestamps=True,
+                        vad_filter=True,
+                        vad_parameters=retry_vad,
+                        condition_on_previous_text=False,
+                        no_speech_threshold=0.80,
+                        compression_ratio_threshold=2.4,
+                        initial_prompt=None
+                    )
+                    retry_segs = [s for s in retry_iter if getattr(s, "text", "").strip()]
+                    retry_cov = sum(max(0.0, float(s.end) - float(s.start)) for s in retry_segs)
+                    if retry_cov >= covered_sec * 0.90 and len(retry_segs) > 0:
+                        raw_segments = retry_segs
+                        logger.info(f"Unprompted pass produced {len(raw_segments)} segments ({retry_cov:.1f}s/{duration:.1f}s).")
+                except Exception as retry_err:
+                    logger.debug(f"Unprompted pass note: {retry_err}")
 
         segments_list = []
         full_text_parts = []
