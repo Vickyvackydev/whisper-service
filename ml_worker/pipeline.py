@@ -214,7 +214,46 @@ class InferencePipeline:
                             logger.info(f"[{job_id}] [DIAGNOSTIC 1: Raw {self.diarizer.backend.upper()} intervals (first 35s)]:\n{diar_intervals}")
 
                         import whisperx
-                        stitched = whisperx.assign_word_speakers(diarize_df, aligned_result, fill_nearest=True)
+                        # First assign only directly overlapping diarization turns (fill_nearest=False)
+                        # so words in micro-pauses are not hijacked by distant background noise turns
+                        stitched = whisperx.assign_word_speakers(diarize_df, aligned_result, fill_nearest=False)
+                        last_seen_spk = None
+                        for s in stitched.get("segments", []):
+                            s_words = s.get("words", [])
+                            assigned_in_seg = [w.get("speaker") for w in s_words if w.get("speaker")]
+                            if assigned_in_seg:
+                                # Fill unassigned words inside this segment from the nearest assigned word in the SAME segment
+                                for idx_w, w in enumerate(s_words):
+                                    if not w.get("speaker"):
+                                        chosen = None
+                                        for dist in range(1, len(s_words) + 1):
+                                            if idx_w - dist >= 0 and s_words[idx_w - dist].get("speaker"):
+                                                chosen = s_words[idx_w - dist]["speaker"]
+                                                break
+                                            if idx_w + dist < len(s_words) and s_words[idx_w + dist].get("speaker"):
+                                                chosen = s_words[idx_w + dist]["speaker"]
+                                                break
+                                        w["speaker"] = chosen or assigned_in_seg[0]
+                                s["speaker"] = max(set(assigned_in_seg), key=assigned_in_seg.count)
+                                last_seen_spk = s["speaker"]
+                            else:
+                                # Entire segment fell in a diarization gap: find nearest diarization interval within 1.5s or inherit previous speaker
+                                s_mid = 0.5 * (float(s.get("start", 0.0)) + float(s.get("end", 0.0)))
+                                best_near_spk = last_seen_spk
+                                best_near_dist = 1.5
+                                if hasattr(diarize_df, "iterrows"):
+                                    for _, drow in diarize_df.iterrows():
+                                        dst = float(drow.get("start", 0.0))
+                                        det = float(drow.get("end", 0.0))
+                                        d_dist = max(0.0, dst - s_mid, s_mid - det)
+                                        if d_dist < best_near_dist:
+                                            best_near_dist = d_dist
+                                            best_near_spk = str(drow.get("speaker", "SPEAKER_00"))
+                                fallback_spk = best_near_spk or "SPEAKER_00"
+                                s["speaker"] = fallback_spk
+                                for w in s_words:
+                                    w["speaker"] = fallback_spk
+                                last_seen_spk = fallback_spk
 
                         # 2. Dump raw word speakers directly after whisperx.assign_word_speakers
                         raw_early_words = []
@@ -224,7 +263,11 @@ class InferencePipeline:
                                     raw_early_words.append(f"{w.get('word', '')}[{w.get('speaker', 'NONE')}]")
                         logger.info(f"[{job_id}] [DIAGNOSTIC 2: Raw Word Speakers from WhisperX (first 35s)]:\n" + " ".join(raw_early_words[:80]))
 
-                        segments, num_speakers = self.reconstruct_speaker_turns(stitched)
+                        segments, num_speakers = self.reconstruct_speaker_turns(
+                            stitched,
+                            audio_data=audio_arr,
+                            sample_rate=16000
+                        )
 
                         # 3. Dump final reconstructed turns for first 35 seconds
                         final_early_turns = []
@@ -383,7 +426,7 @@ class InferencePipeline:
 
         STANDALONE_AFFIRMATIONS = {"yes", "no", "yeah", "nope", "sure", "correct", "sir", "true"}
 
-        # 2. Smooth single-word acoustic jitter (< 0.35s)
+        # 2. Smooth acoustic jitter & mid-sentence non-backchannel speaker flickers
         changed = True
         while changed and len(runs) > 1:
             changed = False
@@ -394,33 +437,41 @@ class InferencePipeline:
                 r_dur = r["words"][-1]["end"] - r["words"][0]["start"]
                 r_len = len(r["words"])
                 first_w_txt = r["words"][0]["word"].lower().strip(".,!?;:\"' ")
+                has_bc = bool(_find_bc_span(r["words"]))
 
                 # Intentional short response / affirmation
-                is_valid_standalone = False
+                is_valid_standalone = has_bc
                 if r_len == 1 and first_w_txt in STANDALONE_AFFIRMATIONS:
                     is_valid_standalone = True
 
                 # Preceded by a natural pause or closing punctuation
+                ends_prev_clause = False
+                gap_before = 0.0
                 if i > 0:
                     prev_last_w = runs[i-1]["words"][-1]
-                    gap = r["words"][0]["start"] - prev_last_w["end"]
-                    ends_clause = any(prev_last_w["word"].endswith(p) for p in (".", "?", "!"))
-                    if ends_clause or gap >= 0.30:
-                        is_valid_standalone = True
+                    gap_before = r["words"][0]["start"] - prev_last_w["end"]
+                    ends_prev_clause = any(prev_last_w["word"].endswith(p) for p in (".", "?", "!"))
 
-                # If 1-word island and NOT an intentional standalone, absorb as jitter
-                if r_len == 1 and r_dur < 0.35 and not is_valid_standalone:
-                    if i > 0 and i < len(runs) - 1 and runs[i-1]["speaker"] == runs[i+1]["speaker"]:
-                        # Middle jitter: absorb into surrounding speaker
-                        prev_spk = runs[i-1]["speaker"]
-                        for w in r["words"]:
-                            w["speaker"] = prev_spk
-                        new_runs[-1]["words"].extend(r["words"])
-                        changed = True
-                        i += 1
-                        continue
-                    elif i == 0 and len(runs) > 1:
-                        # Leading jitter
+                # Case A: Sandwiched run inside a single Whisper utterance (SPEAKER_A -> SPEAKER_B -> SPEAKER_A)
+                # If not a courtroom backchannel/affirmation and < 1.6s (or <= 4 words without pause/punctuation), absorb into SPEAKER_A
+                if (
+                    i > 0
+                    and i < len(runs) - 1
+                    and runs[i - 1]["speaker"] == runs[i + 1]["speaker"]
+                    and not is_valid_standalone
+                    and (r_dur < 1.6 or (r_len <= 4 and not ends_prev_clause and gap_before < 0.35))
+                ):
+                    prev_spk = runs[i - 1]["speaker"]
+                    for w in r["words"]:
+                        w["speaker"] = prev_spk
+                    new_runs[-1]["words"].extend(r["words"])
+                    changed = True
+                    i += 1
+                    continue
+
+                # Case B: Short 1-2 word edge jitter at start or end of a single Whisper utterance
+                if not is_valid_standalone and ((r_len == 1 and r_dur < 0.55) or (r_len <= 2 and r_dur < 0.45 and not ends_prev_clause)):
+                    if i == 0 and len(runs) > 1:
                         next_spk = runs[1]["speaker"]
                         for w in r["words"]:
                             w["speaker"] = next_spk
@@ -429,7 +480,6 @@ class InferencePipeline:
                         i += 1
                         continue
                     elif i == len(runs) - 1 and len(new_runs) > 0:
-                        # Trailing jitter
                         prev_spk = new_runs[-1]["speaker"]
                         for w in r["words"]:
                             w["speaker"] = prev_spk
@@ -452,7 +502,12 @@ class InferencePipeline:
 
         return [(r["speaker"], r["words"]) for r in runs]
 
-    def reconstruct_speaker_turns(self, stitched_result: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], int]:
+    def reconstruct_speaker_turns(
+        self,
+        stitched_result: Dict[str, Any],
+        audio_data: Optional[Any] = None,
+        sample_rate: int = 16000
+    ) -> Tuple[List[Dict[str, Any]], int]:
         """
         Takes WhisperX stitched word-level speaker assignments and builds
         clean, conversational speaker turns while strictly preserving Whisper's
@@ -706,7 +761,16 @@ class InferencePipeline:
         speaker_word_counts: Dict[str, int] = {}
         speaker_seg_counts: Dict[str, int] = {}
 
+        RE_LEGAL_VOCAB_GATE = re.compile(
+            r"\b(?:my\s+lord|your\s+lordship|your\s+honou?r|court\s+pleases|learned\s+counsel|"
+            r"learned\s+silk|statement\s+of\s+claim|statement\s+of\s+defence|motion\s+on\s+notice|"
+            r"affidavit|exhibit|cross[\s-]?examination|claimant|defendant|plaintiff|respondent|"
+            r"applicant|petitioner|adjourn(?:ed)?|ruling|judg(?:e)?ment|counsel|magistrate|tribunal)\b",
+            re.IGNORECASE,
+        )
+
         total_audio_speech = 0.0
+        legal_vocab_hits = 0
         for seg in processed_segments:
             spk = seg["speaker"]
             dur = max(0.05, seg["end"] - seg["start"])
@@ -720,36 +784,57 @@ class InferencePipeline:
                 speaker_counsel_votes[spk] = speaker_counsel_votes.get(spk, 0) + 1
             if any(p.search(txt) for p in re_judge_authority) or RE_JUDGE_DIRECTIVES.search(txt):
                 speaker_judge_votes[spk] = speaker_judge_votes.get(spk, 0) + 1
+            if RE_LEGAL_VOCAB_GATE.search(txt):
+                legal_vocab_hits += 1
 
-        # Identify Primary Counsel (most honorifics addressed to bench)
+        total_role_votes = sum(speaker_counsel_votes.values()) + sum(speaker_judge_votes.values())
+        is_courtroom_context = (total_role_votes >= 1) or (legal_vocab_hits >= 2)
+
         counsel_spk = None
-        counsel_candidates = [s for s in speaker_counsel_votes if speaker_counsel_votes[s] > 0]
-        if counsel_candidates:
-            counsel_spk = max(counsel_candidates, key=lambda s: speaker_counsel_votes[s])
-        else:
-            counsel_spk = processed_segments[0]["speaker"]
-
-        # Identify Primary Judge (The Bench)
         judge_spk = None
-        judge_candidates = [s for s in speaker_judge_votes if speaker_judge_votes[s] > 0 and s != counsel_spk]
-        if judge_candidates:
-            judge_spk = max(judge_candidates, key=lambda s: speaker_judge_votes[s])
-        else:
-            # Score non-counsel speakers: lower honorific density + higher total duration = most likely Judge
-            other_speakers = [s for s in speaker_total_dur if s != counsel_spk and speaker_total_dur[s] >= 1.0]
-            if other_speakers:
-                def judge_score(s: str) -> float:
-                    c_votes = speaker_counsel_votes.get(s, 0)
-                    dur = speaker_total_dur.get(s, 1.0)
-                    return dur / (1.0 + (c_votes * 5.0))
-                judge_spk = max(other_speakers, key=judge_score)
+        all_counsel_spks = set()
 
-        logger.info(f"Courtroom Role Discovery: Counsel={counsel_spk} (votes={speaker_counsel_votes}), Judge={judge_spk} (votes={speaker_judge_votes})")
+        if is_courtroom_context:
+            # Identify Primary Counsel (most honorifics addressed to bench)
+            counsel_candidates = [s for s in speaker_counsel_votes if speaker_counsel_votes[s] > 0]
+            if counsel_candidates:
+                counsel_spk = max(counsel_candidates, key=lambda s: speaker_counsel_votes[s])
+                all_counsel_spks = set(counsel_candidates)
+            else:
+                counsel_spk = processed_segments[0]["speaker"]
+                all_counsel_spks = {counsel_spk}
+
+            # Identify Primary Judge (The Bench)
+            judge_candidates = [s for s in speaker_judge_votes if speaker_judge_votes[s] > 0 and s != counsel_spk]
+            if judge_candidates:
+                judge_spk = max(judge_candidates, key=lambda s: speaker_judge_votes[s])
+            else:
+                # Score non-counsel speakers: lower honorific density + higher total duration = most likely Judge
+                other_speakers = [s for s in speaker_total_dur if s != counsel_spk and speaker_total_dur[s] >= 1.0]
+                if other_speakers:
+                    def judge_score(s: str) -> float:
+                        c_votes = speaker_counsel_votes.get(s, 0)
+                        dur = speaker_total_dur.get(s, 1.0)
+                        return dur / (1.0 + (c_votes * 5.0))
+                    judge_spk = max(other_speakers, key=judge_score)
+            if judge_spk in all_counsel_spks and len(all_counsel_spks) > 1:
+                all_counsel_spks.discard(judge_spk)
+
+            logger.info(
+                f"Courtroom Role Discovery: Counsel={counsel_spk} (all_counsels={sorted(all_counsel_spks)}, votes={speaker_counsel_votes}), "
+                f"Judge={judge_spk} (votes={speaker_judge_votes})"
+            )
+        else:
+            logger.info(
+                f"Courtroom Role Discovery skipped (non-courtroom audio detected: role_votes={total_role_votes}, "
+                f"legal_vocab_hits={legal_vocab_hits}); preserving pure neural voiceprint diarization."
+            )
 
         # Micro-cluster pruning: only prune true acoustic glitches/clicks (< 0.8s, <= 1 word, isolated turn)
         # Legitimate 2nd / 3rd participants (e.g. Father, Registrar, 2nd Counsel, Witness) are strictly preserved!
         cluster_remap: Dict[str, str] = {}
         target_max_speakers = getattr(WorkerConfig, "MAX_SPEAKERS", None)
+        dominant_overall_spk = max(speaker_total_dur, key=speaker_total_dur.get) if speaker_total_dur else "SPEAKER_00"
 
         for spk, dur in speaker_total_dur.items():
             if spk in (counsel_spk, judge_spk):
@@ -758,17 +843,20 @@ class InferencePipeline:
             seg_cnt = speaker_seg_counts.get(spk, 0)
 
             is_micro_phantom = (dur < 0.8 and word_cnt <= 1 and seg_cnt <= 1)
-            is_enforced_2spk = (target_max_speakers == 2 and len(speaker_total_dur) > 2)
+            is_enforced_2spk = (is_courtroom_context and target_max_speakers == 2 and len(speaker_total_dur) > 2)
 
             if is_micro_phantom or is_enforced_2spk:
-                c_votes = speaker_counsel_votes.get(spk, 0)
-                j_votes = speaker_judge_votes.get(spk, 0)
-                if c_votes > j_votes:
-                    cluster_remap[spk] = counsel_spk
-                elif j_votes > c_votes and judge_spk is not None:
-                    cluster_remap[spk] = judge_spk
-                elif judge_spk is not None and spk != counsel_spk:
-                    cluster_remap[spk] = judge_spk
+                if is_courtroom_context:
+                    c_votes = speaker_counsel_votes.get(spk, 0)
+                    j_votes = speaker_judge_votes.get(spk, 0)
+                    if c_votes > j_votes and counsel_spk is not None:
+                        cluster_remap[spk] = counsel_spk
+                    elif j_votes > c_votes and judge_spk is not None:
+                        cluster_remap[spk] = judge_spk
+                    elif judge_spk is not None and spk != counsel_spk:
+                        cluster_remap[spk] = judge_spk
+                elif spk != dominant_overall_spk:
+                    cluster_remap[spk] = dominant_overall_spk
 
         if cluster_remap:
             for seg in processed_segments:
@@ -920,6 +1008,15 @@ class InferencePipeline:
                                         _rebuild_seg(s2)
                                         _rebuild_seg(s3)
                                         expanded_segments.extend([s1, s2, s3])
+                                        split_done = True
+                                        any_split = True
+                                        break
+                                    elif not tail_w and (seg["speaker"] == judge_spk or any(p.search(lead_txt) for p in re_judge_authority) or RE_JUDGE_DIRECTIVES.search(lead_txt)):
+                                        s1 = dict(seg, words=lead_w, speaker=judge_spk)
+                                        s2 = dict(seg, words=mid_w, speaker=counsel_spk)
+                                        _rebuild_seg(s1)
+                                        _rebuild_seg(s2)
+                                        expanded_segments.extend([s1, s2])
                                         split_done = True
                                         any_split = True
                                         break
@@ -1155,6 +1252,147 @@ class InferencePipeline:
                 if (txt_clean in SHORT_AFFIRMATIONS or (any(p.search(txt_clean) for p in re_counsel_honorifics) and not RE_BENCH_INQUIRY.search(txt_clean))) and seg["speaker"] == judge_spk:
                     seg["speaker"] = counsel_spk
 
+        # -------------------------------------------------------------------
+        # STAGE 2B: Neural Voiceprint Turn Verification & Continuity Smoothing
+        # Eliminates false speaker splits mid-monologue when a speaker's volume,
+        # pitch, or background noise shifts, while respecting verified legal roles.
+        # -------------------------------------------------------------------
+        if len(set(s["speaker"] for s in processed_segments)) > 1:
+            import numpy as np
+
+            def _has_explicit_legal_marker(seg_obj: Dict[str, Any]) -> bool:
+                if not is_courtroom_context:
+                    return False
+                t_low = seg_obj.get("text", "").lower().strip(".,!?;:\"' ")
+                if t_low in SHORT_AFFIRMATIONS or RE_SUBMISSION.search(t_low) or RE_CLARIFICATION.search(t_low):
+                    return True
+                if RE_BENCH_INQUIRY.search(t_low) or RE_JUDGE_DIRECTIVES.search(t_low) or RE_COUNSEL_ARGUMENT.search(t_low):
+                    return True
+                if any(p.search(t_low) for p in re_counsel_honorifics) or any(p.search(t_low) for p in re_judge_authority):
+                    return True
+                return False
+
+            # Build per-speaker neural voiceprint centroids across processed_segments
+            seg_spk_centroids: Dict[str, np.ndarray] = {}
+            seg_embeddings_cache: Dict[int, np.ndarray] = {}
+            if audio_data is not None and len(audio_data) > 0 and self.diarizer is not None:
+                spk_to_seg_indices: Dict[str, List[int]] = {}
+                for idx_s, s_obj in enumerate(processed_segments):
+                    spk_to_seg_indices.setdefault(s_obj["speaker"], []).append(idx_s)
+                    s_st = max(0, int(float(s_obj["start"]) * sample_rate))
+                    s_et = min(len(audio_data), int(float(s_obj["end"]) * sample_rate))
+                    if s_et - s_st >= int(0.32 * sample_rate):
+                        emb = self.diarizer._extract_audio_feature(audio_data[s_st:s_et], sample_rate)
+                        if emb is not None:
+                            seg_embeddings_cache[idx_s] = emb
+
+                for spk_k, idx_list in spk_to_seg_indices.items():
+                    # Sort by segment duration descending to build clean centroid from top 8 longest turns
+                    sorted_idx = sorted(
+                        idx_list,
+                        key=lambda ix: float(processed_segments[ix]["end"]) - float(processed_segments[ix]["start"]),
+                        reverse=True,
+                    )
+                    embs_k = [seg_embeddings_cache[ix] for ix in sorted_idx[:8] if ix in seg_embeddings_cache]
+                    if embs_k:
+                        avg_e = np.mean(embs_k, axis=0)
+                        nrm_e = float(np.linalg.norm(avg_e))
+                        if nrm_e > 1e-6:
+                            seg_spk_centroids[spk_k] = (avg_e / nrm_e).astype(np.float32)
+
+                # 1. Merge any remaining duplicate speaker clusters whose TitaNet voiceprints match
+                #    (unless they are the primary opposing Counsel vs Judge roles in a courtroom recording)
+                curr_spk_durs: Dict[str, float] = {}
+                for s_obj in processed_segments:
+                    sk = s_obj["speaker"]
+                    curr_spk_durs[sk] = curr_spk_durs.get(sk, 0.0) + max(0.05, float(s_obj["end"]) - float(s_obj["start"]))
+                ranked_seg_spks = sorted(curr_spk_durs.keys(), key=lambda x: curr_spk_durs[x], reverse=True)
+                uses_neural = getattr(self.diarizer, "speaker_emb_model", None) is not None
+
+                seg_cluster_merge: Dict[str, str] = {}
+                for i_min in range(1, len(ranked_seg_spks)):
+                    s_min = ranked_seg_spks[i_min]
+                    if s_min not in seg_spk_centroids:
+                        continue
+                    for i_maj in range(i_min):
+                        s_maj = ranked_seg_spks[i_maj]
+                        while s_maj in seg_cluster_merge:
+                            s_maj = seg_cluster_merge[s_maj]
+                        if s_maj not in seg_spk_centroids or s_maj == s_min:
+                            continue
+                        # Never merge Primary Judge and Primary Counsel together if both were identified by legal phrases
+                        if (
+                            is_courtroom_context
+                            and judge_spk is not None
+                            and counsel_spk is not None
+                            and {s_maj, s_min} == {judge_spk, counsel_spk}
+                            and total_role_votes >= 2
+                        ):
+                            continue
+                        sim_val = float(np.dot(seg_spk_centroids[s_maj], seg_spk_centroids[s_min]))
+                        merge_thresh = 0.54 if uses_neural else 0.78
+                        if sim_val >= merge_thresh:
+                            logger.info(
+                                f"[PIPELINE VOICEPRINT MERGE] Merging duplicate speaker bank {s_min} -> {s_maj} "
+                                f"(voiceprint_sim={sim_val:.3f})"
+                            )
+                            seg_cluster_merge[s_min] = s_maj
+                            break
+
+                if seg_cluster_merge:
+                    for s_obj in processed_segments:
+                        cur = s_obj["speaker"]
+                        while cur in seg_cluster_merge:
+                            cur = seg_cluster_merge[cur]
+                        s_obj["speaker"] = cur
+                        for w in s_obj.get("words", []):
+                            w["speaker"] = cur
+
+            # 2. Smooth Sandwiched Turns (SPEAKER_A -> SPEAKER_B -> SPEAKER_A) & Short Non-Legal Flips
+            for _smooth_pass in range(2):
+                changed_any = False
+                for idx_s in range(len(processed_segments)):
+                    seg = processed_segments[idx_s]
+                    if _has_explicit_legal_marker(seg):
+                        continue
+                    seg_dur = float(seg["end"]) - float(seg["start"])
+                    seg_w_cnt = len(seg.get("words", []))
+                    has_bc = bool(_find_bc_indices(seg.get("words", [])))
+
+                    # Case A: Sandwiched segment between the same speaker (SPEAKER_A | seg | SPEAKER_A)
+                    if idx_s > 0 and idx_s < len(processed_segments) - 1:
+                        prev_spk = processed_segments[idx_s - 1]["speaker"]
+                        next_spk = processed_segments[idx_s + 1]["speaker"]
+                        if prev_spk == next_spk and seg["speaker"] != prev_spk:
+                            if not has_bc and (seg_dur <= 2.2 or seg_w_cnt <= 5):
+                                # Check voiceprint if available: only keep as different speaker if strongly closer to curr speaker
+                                keep_diff = False
+                                if idx_s in seg_embeddings_cache and prev_spk in seg_spk_centroids and seg["speaker"] in seg_spk_centroids:
+                                    sim_prev = float(np.dot(seg_embeddings_cache[idx_s], seg_spk_centroids[prev_spk]))
+                                    sim_curr = float(np.dot(seg_embeddings_cache[idx_s], seg_spk_centroids[seg["speaker"]]))
+                                    if sim_curr - sim_prev >= 0.14 and seg_dur >= 1.2:
+                                        keep_diff = True
+                                if not keep_diff:
+                                    seg["speaker"] = prev_spk
+                                    changed_any = True
+                                    continue
+
+                    # Case B: Short isolated speaker flip (< 1.6s or <= 4 words) without backchannel/role marker
+                    if idx_s > 0 and not has_bc and (seg_dur < 1.6 or seg_w_cnt <= 4):
+                        prev_spk = processed_segments[idx_s - 1]["speaker"]
+                        if seg["speaker"] != prev_spk:
+                            if idx_s in seg_embeddings_cache and prev_spk in seg_spk_centroids and seg["speaker"] in seg_spk_centroids:
+                                sim_prev = float(np.dot(seg_embeddings_cache[idx_s], seg_spk_centroids[prev_spk]))
+                                sim_curr = float(np.dot(seg_embeddings_cache[idx_s], seg_spk_centroids[seg["speaker"]]))
+                                if sim_prev >= sim_curr - 0.05:
+                                    seg["speaker"] = prev_spk
+                                    changed_any = True
+                            elif seg_dur < 1.0 and seg_w_cnt <= 2:
+                                seg["speaker"] = prev_spk
+                                changed_any = True
+                if not changed_any:
+                    break
+
         # Final Same-Speaker Consolidation: stitch adjacent fragments of the same speaker
         # created during boundary healing (e.g. "Can I see the" + "prayer?", "so you have" + "various options")
         stitched_same_spk: List[Dict[str, Any]] = []
@@ -1168,9 +1406,10 @@ class InferencePipeline:
                 prev_s = stitched_same_spk[-1]
                 gap = seg["start"] - prev_s["end"]
                 prev_ends_term = _has_term(prev_s["words"][-1])
+                combined_w_len = len(prev_s["words"]) + len(seg["words"])
                 if prev_s["speaker"] == seg["speaker"] and (
                     (gap <= 0.85 and not prev_ends_term) or
-                    (gap <= 0.45 and (len(prev_s["words"]) <= 4 or len(seg["words"]) <= 4))
+                    (gap <= 0.65 and (len(prev_s["words"]) <= 5 or len(seg["words"]) <= 5) and combined_w_len <= 32)
                 ):
                     prev_s["words"].extend(seg["words"])
                     _rebuild_seg(prev_s)

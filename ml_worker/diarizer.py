@@ -7,27 +7,73 @@ from ml_worker.config import WorkerConfig
 
 logger = logging.getLogger("ml_worker.diarizer")
 
+
+def _patch_lightning_for_nemo():
+    """
+    Ensures NeMo 3.0+ imports cleanly even when pytorch-lightning >= 2.5 removes NeptuneLogger.
+    """
+    for mod_name in ("pytorch_lightning.loggers", "lightning.pytorch.loggers"):
+        try:
+            import importlib
+            mod = importlib.import_module(mod_name)
+            if not hasattr(mod, "NeptuneLogger"):
+                class _DummyNeptuneLogger:
+                    def __init__(self, *args, **kwargs):
+                        pass
+                setattr(mod, "NeptuneLogger", _DummyNeptuneLogger)
+        except Exception:
+            pass
+
+
 class SpeakerDiarizer:
     def __init__(self):
         self.backend = getattr(WorkerConfig, "DIARIZATION_BACKEND", "nemo").lower()
         self.nemo_model = None
+        self.speaker_emb_model = None
         self.pipeline = None
         self.is_loaded = False
         self.nemo_model_name = getattr(WorkerConfig, "NEMO_DIARIZATION_MODEL", "nvidia/diar_sortformer_4spk-v1")
+        self.speaker_emb_model_name = getattr(
+            WorkerConfig, "NEMO_SPEAKER_EMBEDDING_MODEL", "nvidia/speakerverification_en_titanet_large"
+        )
         self.pyannote_model_name = getattr(WorkerConfig, "DIARIZATION_MODEL", "pyannote/speaker-diarization-3.1")
         self.hf_token = WorkerConfig.HF_TOKEN
         self.device = "cuda" if (torch.cuda.is_available() and WorkerConfig.WHISPER_DEVICE != "cpu") else "cpu"
         self.device_obj = torch.device(self.device)
 
+    def _load_speaker_embedding_model(self):
+        if self.speaker_emb_model is not None:
+            return
+        try:
+            _patch_lightning_for_nemo()
+            from nemo.collections.asr.models import EncDecSpeakerLabelModel
+
+            logger.info(
+                f"Loading NVIDIA NeMo TitaNet-Large Speaker Verification model: "
+                f"{self.speaker_emb_model_name} on {self.device}..."
+            )
+            self.speaker_emb_model = EncDecSpeakerLabelModel.from_pretrained(self.speaker_emb_model_name)
+            self.speaker_emb_model.to(self.device_obj)
+            self.speaker_emb_model.eval()
+            logger.info(f"NVIDIA NeMo TitaNet-Large 192-D voiceprint model loaded successfully on {self.device}.")
+        except Exception as emb_err:
+            logger.warning(
+                f"Note loading NeMo TitaNet speaker embedding model '{self.speaker_emb_model_name}' ({emb_err}); "
+                f"using cepstral voiceprint fallback."
+            )
+            self.speaker_emb_model = None
+
     def load_model(self):
         if self.backend == "nemo":
             try:
+                _patch_lightning_for_nemo()
                 logger.info(f"Loading NVIDIA NeMo Diarization model: {self.nemo_model_name} on {self.device}...")
                 from nemo.collections.asr.models import SortformerEncLabelModel
 
                 self.nemo_model = SortformerEncLabelModel.from_pretrained(self.nemo_model_name)
                 self.nemo_model.to(self.device_obj)
                 self.nemo_model.eval()
+                self._load_speaker_embedding_model()
                 self.is_loaded = True
                 logger.info(f"NVIDIA NeMo Sortformer Diarization model loaded successfully on {self.device}.")
                 return
@@ -39,6 +85,7 @@ class SpeakerDiarizer:
                 self.backend = "pyannote"
 
         self._load_pyannote()
+        self._load_speaker_embedding_model()
 
     def _load_pyannote(self):
         if not self.hf_token:
@@ -409,14 +456,20 @@ class SpeakerDiarizer:
                     spk_map: Dict[str, str] = {}
                     used_global = set()
 
-                    for lspk in local_speakers:
+                    # Sort local speakers by chunk speech duration descending so primary speakers claim global IDs first
+                    local_dur_map = {
+                        s: sum(max(0.0, t["end"] - t["start"]) for t in chunk_turns if t["speaker"] == s)
+                        for s in local_speakers
+                    }
+                    ordered_local_spks = sorted(local_speakers, key=lambda s: local_dur_map.get(s, 0.0), reverse=True)
+
+                    for lspk in ordered_local_spks:
                         best_gspk = None
                         best_score = -1.0
+                        best_ac_sim = -1.0
 
                         all_global_spks = sorted(set(t["speaker"] for t in global_turns))
                         for gspk in all_global_spks:
-                            if gspk in used_global:
-                                continue
                             ov_dur = 0.0
                             total_l_ov = 0.0
                             for lt in curr_overlap_turns:
@@ -435,21 +488,29 @@ class SpeakerDiarizer:
                             if lspk in chunk_centroids and gspk in global_centroids:
                                 ac_sim = float(np.dot(chunk_centroids[lspk], global_centroids[gspk]))
 
-                            combined = (ov_ratio * 0.65) + (ac_sim * 0.35) if total_l_ov > 0.2 else ac_sim
+                            # If gspk is already used in this chunk, only allow another local cluster to merge into it
+                            # if the TitaNet voiceprint similarity is unmistakably the same person (>= 0.62)
+                            if gspk in used_global and ac_sim < 0.62:
+                                continue
+
+                            combined = (ov_ratio * 0.55) + (ac_sim * 0.45) if total_l_ov > 0.2 else ac_sim
                             if combined > best_score:
                                 best_score = combined
+                                best_ac_sim = ac_sim
                                 best_gspk = gspk
 
-                        if best_gspk is not None and best_score >= 0.45:
+                        match_thresh = 0.42 if self.speaker_emb_model is not None else 0.45
+                        if best_gspk is not None and (best_score >= match_thresh or best_ac_sim >= 0.56):
                             spk_map[lspk] = best_gspk
                             used_global.add(best_gspk)
                             if lspk in chunk_centroids and best_gspk in global_centroids:
-                                blended = 0.7 * global_centroids[best_gspk] + 0.3 * chunk_centroids[lspk]
+                                blended = 0.75 * global_centroids[best_gspk] + 0.25 * chunk_centroids[lspk]
                                 nrm = np.linalg.norm(blended)
                                 if nrm > 1e-6:
                                     global_centroids[best_gspk] = blended / nrm
                         else:
-                            new_id = f"SPEAKER_{len(set(t['speaker'] for t in global_turns)) + len(spk_map):02d}"
+                            existing_ids = set(t["speaker"] for t in global_turns) | set(spk_map.values())
+                            new_id = f"SPEAKER_{len(existing_ids):02d}"
                             spk_map[lspk] = new_id
                             if lspk in chunk_centroids:
                                 global_centroids[new_id] = chunk_centroids[lspk]
@@ -710,49 +771,94 @@ class SpeakerDiarizer:
 
     def _extract_audio_feature(self, waveform_1d: np.ndarray, sample_rate: int = 16000) -> Optional[np.ndarray]:
         """
-        Computes normalized log-filterbank acoustic feature vector for a segment.
-        Provides robust voice comparison across different speech chunks.
+        Extracts an L2-normalized speaker voiceprint vector for a speech segment:
+        1. Primary: NVIDIA NeMo TitaNet-Large 192-D neural speaker verification embedding (invariant to volume, pitch shift, and background music/noise).
+        2. Secondary: Pyannote neural speaker embedding (if Pyannote backend is loaded).
+        3. Fallback: Cepstral Mean-Normalized (CMN) MFCC + harmonic voiceprint (channel/volume invariant).
         """
-        if len(waveform_1d) < int(sample_rate * 0.3):
-            return None
-        win_len = int(sample_rate * 0.025)
-        hop_len = int(sample_rate * 0.010)
-        if len(waveform_1d) <= win_len:
+        if waveform_1d is None or len(waveform_1d) < int(sample_rate * 0.28):
             return None
 
-        # Try Pyannote embedding if pipeline loaded and has _embedding
+        # Focus on the highest-energy 6.0s window if segment is very long, and peak-normalize amplitude
+        max_samples = int(sample_rate * 6.0)
+        wav = np.asarray(waveform_1d, dtype=np.float32)
+        if len(wav) > max_samples:
+            mid = len(wav) // 2
+            half = max_samples // 2
+            wav = wav[max(0, mid - half) : min(len(wav), mid + half)]
+
+        peak = float(np.max(np.abs(wav)))
+        if peak < 1e-4:
+            return None
+        wav_norm = wav / peak
+
+        # 1. Primary: NVIDIA NeMo TitaNet-Large 192-D Neural Speaker Verification Embedding
+        if self.speaker_emb_model is not None:
+            try:
+                # Pad short clips (< 0.6s) slightly by tiling so TitaNet's pooling layer has sufficient frames
+                min_titanet_samples = int(sample_rate * 0.65)
+                wav_in = wav_norm
+                if len(wav_in) < min_titanet_samples:
+                    reps = (min_titanet_samples // len(wav_in)) + 1
+                    wav_in = np.tile(wav_in, reps)[:min_titanet_samples]
+
+                t_in = torch.from_numpy(np.ascontiguousarray(wav_in, dtype=np.float32)).unsqueeze(0).to(self.device_obj)
+                t_len = torch.tensor([len(wav_in)], dtype=torch.long, device=self.device_obj)
+                with torch.inference_mode():
+                    out = self.speaker_emb_model.forward(input_signal=t_in, input_signal_length=t_len)
+                emb_tensor = out[1] if (isinstance(out, (tuple, list)) and len(out) >= 2) else out
+                emb_np = emb_tensor.squeeze().detach().cpu().numpy().astype(np.float32)
+                norm = float(np.linalg.norm(emb_np))
+                if norm > 1e-6:
+                    return (emb_np / norm).astype(np.float32)
+            except Exception as titanet_err:
+                logger.debug(f"TitaNet embedding extraction note ({titanet_err}), falling back")
+
+        # 2. Secondary: Pyannote embedding if pipeline loaded and has _embedding
         if self.pipeline is not None and hasattr(self.pipeline, "_embedding"):
             try:
                 emb_model = getattr(self.pipeline, "_embedding")
                 if callable(emb_model):
-                    t_in = torch.from_numpy(waveform_1d).unsqueeze(0).unsqueeze(0).to(self.device_obj)
+                    t_in = torch.from_numpy(wav_norm).unsqueeze(0).unsqueeze(0).to(self.device_obj)
                     with torch.no_grad():
                         out = emb_model(t_in)
                     out_np = out.squeeze().detach().cpu().numpy().astype(np.float32)
-                    norm = np.linalg.norm(out_np)
+                    norm = float(np.linalg.norm(out_np))
                     if norm > 1e-6:
-                        return out_np / norm
+                        return (out_np / norm).astype(np.float32)
             except Exception as emb_e:
-                logger.debug(f"Direct Pyannote embedding extraction note ({emb_e}), using acoustic filterbanks")
+                logger.debug(f"Direct Pyannote embedding extraction note ({emb_e}), using cepstral voiceprint")
 
-        # Fallback / Universal: 24-band geometric filterbank across 100Hz - 6500Hz
+        # 3. Fallback: Cepstral Mean-Normalized (CMN) Mel-Cepstral Voiceprint (36-D)
+        # Subtracting across-time mean log-spectrum removes static background beat/channel coloration
+        win_len = int(sample_rate * 0.025)
+        hop_len = int(sample_rate * 0.010)
+        if len(wav_norm) <= win_len:
+            return None
         try:
             n_fft = 512
             window = np.hanning(win_len)
-            num_frames = (len(waveform_1d) - win_len) // hop_len
+            num_frames = (len(wav_norm) - win_len) // hop_len
             if num_frames <= 0:
                 return None
 
-            indices = np.linspace(0, num_frames - 1, min(num_frames, 150), dtype=int)
-            frames = np.stack([waveform_1d[idx * hop_len : idx * hop_len + win_len] * window for idx in indices])
-            mags = np.abs(np.fft.rfft(frames, n=n_fft))
+            indices = np.linspace(0, num_frames - 1, min(num_frames, 180), dtype=int)
+            frames = np.stack([wav_norm[idx * hop_len : idx * hop_len + win_len] * window for idx in indices])
+            frame_energy = np.mean(frames ** 2, axis=1)
+            # Keep voiced frames (top 70% energy) to exclude pauses/drums between words
+            if len(frames) >= 6:
+                e_thresh = np.percentile(frame_energy, 30)
+                voiced = frames[frame_energy >= e_thresh]
+                if len(voiced) >= 3:
+                    frames = voiced
 
-            n_bands = 24
+            mags = np.abs(np.fft.rfft(frames, n=n_fft))
+            n_bands = 32
             bin_freqs = np.linspace(0, sample_rate / 2, mags.shape[1])
-            band_edges = np.geomspace(100, min(sample_rate / 2, 6500), n_bands + 2)
+            band_edges = np.geomspace(120, min(sample_rate / 2, 6800), n_bands + 2)
             filterbank = np.zeros((n_bands, mags.shape[1]), dtype=np.float32)
             for b in range(n_bands):
-                left, center, right = band_edges[b], band_edges[b+1], band_edges[b+2]
+                left, center, right = band_edges[b], band_edges[b + 1], band_edges[b + 2]
                 filterbank[b] = np.maximum(0, np.minimum(
                     (bin_freqs - left) / max(1e-6, center - left),
                     (right - bin_freqs) / max(1e-6, right - center)
@@ -760,10 +866,17 @@ class SpeakerDiarizer:
 
             band_energies = np.dot(mags, filterbank.T)
             log_energies = np.log(np.maximum(1e-6, band_energies))
-            avg_feat = log_energies.mean(axis=0)
-            norm = np.linalg.norm(avg_feat)
+            # DCT-II to decorrelate vocal tract formants (MFCCs c_1..c_19) from overall loudness (c_0)
+            k_idx = np.arange(1, 20)[:, None]
+            n_idx = np.arange(n_bands)[None, :]
+            dct_basis = np.cos(np.pi * k_idx * (2 * n_idx + 1) / (2.0 * n_bands)).astype(np.float32)
+            mfcc = np.dot(log_energies, dct_basis.T)
+            mfcc_mean = mfcc.mean(axis=0)
+            mfcc_std = mfcc.std(axis=0)
+            feat = np.concatenate([mfcc_mean, mfcc_std * 0.5]).astype(np.float32)
+            norm = float(np.linalg.norm(feat))
             if norm > 1e-6:
-                return (avg_feat / norm).astype(np.float32)
+                return (feat / norm).astype(np.float32)
         except Exception as feat_err:
             logger.debug(f"Acoustic feature calculation note: {feat_err}")
 
@@ -779,12 +892,11 @@ class SpeakerDiarizer:
     ) -> List[Dict[str, Any]]:
         """
         Consolidates fragmented speaker clusters using:
-        1. Acoustic Embedding Centroid Matching (pairwise cosine similarity >= 0.72)
-        2. Conversational Dynamics & Monologue Analysis (detects non-alternating sequential blocks)
-        3. Dominant Speaker Dominance Check (>= 85% speech time)
-        4. Tiny Fragment Pruning (micro-noise / clicks)
-        5. Micro-pause turn stitching (<= 0.40s)
-        6. Consistent Chronological Speaker Normalization (SPEAKER_00, SPEAKER_01...)
+        1. Neural Voiceprint Matching (NVIDIA NeMo TitaNet-Large 192-D cosine similarity & top-turn matching)
+        2. Simultaneous Cross-Talk vs Sequential Turn Dynamics
+        3. Minor / Micro-Fragment Absorption (prevents pitch/beat/pause splits like 'Check.' or mid-monologue shifts)
+        4. Micro-pause turn stitching (<= 0.55s when no other speaker intervenes)
+        5. Consistent Chronological Speaker Normalization (SPEAKER_00, SPEAKER_01...)
         """
         if not turns:
             return turns
@@ -804,48 +916,75 @@ class SpeakerDiarizer:
         dominant = max(speaker_durations, key=lambda s: speaker_durations[s])
         sorted_turns = sorted(turns, key=lambda t: t["start"])
 
-        # ── Conversational Dynamics: Count runs and conversational returns ───
-        speaker_runs: Dict[str, int] = {}
-        prev_spk = None
-        seen_speakers = set()
-        return_speaker_count = 0
-
-        for t in sorted_turns:
-            spk = t["speaker"]
-            if spk != prev_spk:
-                speaker_runs[spk] = speaker_runs.get(spk, 0) + 1
-                if spk in seen_speakers:
-                    return_speaker_count += 1
-                seen_speakers.add(spk)
-                prev_spk = spk
-
-        total_audio_dur = (sorted_turns[-1]["end"] - sorted_turns[0]["start"]) if sorted_turns else 0.0
-
-        # ── Acoustic Speaker Centroid Extraction ─────────────────────────────
+        # ── Extract Neural Voiceprint Centroids & Per-Turn Embeddings ────────
         speaker_centroids: Dict[str, np.ndarray] = {}
+        speaker_turn_embs: Dict[str, List[np.ndarray]] = {}
         if audio_data is not None and len(audio_data) > 0:
             for spk in speaker_durations:
-                spk_turns = [t for t in sorted_turns if t["speaker"] == spk and (t["end"] - t["start"]) >= 0.5]
+                # Prioritize longest turns (>= 0.45s) for cleanest voiceprint extraction
+                spk_turns = sorted(
+                    [t for t in sorted_turns if t["speaker"] == spk and (t["end"] - t["start"]) >= 0.45],
+                    key=lambda x: (x["end"] - x["start"]),
+                    reverse=True,
+                )
                 if not spk_turns:
-                    spk_turns = [t for t in sorted_turns if t["speaker"] == spk]
+                    spk_turns = sorted(
+                        [t for t in sorted_turns if t["speaker"] == spk],
+                        key=lambda x: (x["end"] - x["start"]),
+                        reverse=True,
+                    )
 
                 feats = []
-                for st in spk_turns[:5]:
+                for st in spk_turns[:10]:
                     start_s = max(0, int(st["start"] * sample_rate))
                     end_s = min(len(audio_data), int(st["end"] * sample_rate))
-                    if end_s - start_s >= int(0.3 * sample_rate):
+                    if end_s - start_s >= int(0.28 * sample_rate):
                         feat = self._extract_audio_feature(audio_data[start_s:end_s], sample_rate)
                         if feat is not None:
                             feats.append(feat)
                 if feats:
+                    speaker_turn_embs[spk] = feats
                     avg_feat = np.mean(feats, axis=0)
-                    norm = np.linalg.norm(avg_feat)
+                    norm = float(np.linalg.norm(avg_feat))
                     if norm > 1e-6:
-                        speaker_centroids[spk] = avg_feat / norm
+                        speaker_centroids[spk] = (avg_feat / norm).astype(np.float32)
 
-        # ── Build Merge Mapping ──────────────────────────────────────────────
+        def _simultaneous_overlap_ratio(spk_a: str, spk_b: str) -> float:
+            turns_a = [t for t in sorted_turns if t["speaker"] == spk_a]
+            turns_b = [t for t in sorted_turns if t["speaker"] == spk_b]
+            dur_b = max(0.01, speaker_durations.get(spk_b, 0.01))
+            ov = 0.0
+            for tb in turns_b:
+                for ta in turns_a:
+                    if ta["end"] <= tb["start"]:
+                        continue
+                    if ta["start"] >= tb["end"]:
+                        break
+                    o = min(ta["end"], tb["end"]) - max(ta["start"], tb["start"])
+                    if o > 0.10:
+                        ov += o
+            return ov / dur_b
+
+        def _pair_voiceprint_similarity(spk_a: str, spk_b: str) -> Tuple[float, float]:
+            c_sim = -1.0
+            if spk_a in speaker_centroids and spk_b in speaker_centroids:
+                c_sim = float(np.dot(speaker_centroids[spk_a], speaker_centroids[spk_b]))
+            embs_a = speaker_turn_embs.get(spk_a, [])
+            embs_b = speaker_turn_embs.get(spk_b, [])
+            if not embs_a or not embs_b:
+                return c_sim, c_sim
+            sims = [float(np.dot(ea, eb)) for ea in embs_a for eb in embs_b]
+            sims.sort(reverse=True)
+            top_k = sims[: min(3, len(sims))]
+            top_sim = float(np.mean(top_k))
+            return c_sim, top_sim
+
+        # ── Build Voiceprint & Fragment Merge Mapping ────────────────────────
         to_merge: Dict[str, str] = {}
         ranked_speakers = sorted(speaker_durations.keys(), key=lambda s: speaker_durations[s], reverse=True)
+        uses_neural_emb = (self.speaker_emb_model is not None) or (
+            self.pipeline is not None and hasattr(self.pipeline, "_embedding")
+        )
 
         def get_root_target(s: str) -> str:
             curr = s
@@ -855,8 +994,63 @@ class SpeakerDiarizer:
                 curr = to_merge[curr]
             return curr
 
-        # Note: Monologue over-merging was removed to strictly preserve distinct speakers 
-        # (e.g. Judge, Registrar, Petitioner Counsel, Respondent Counsel) during short court appearances.
+        for idx_min in range(1, len(ranked_speakers)):
+            spk_min = ranked_speakers[idx_min]
+            if spk_min in to_merge:
+                continue
+            dur_min = speaker_durations.get(spk_min, 0.0)
+            frac_min = dur_min / max(0.1, total_speech)
+            min_turns = [t for t in sorted_turns if t["speaker"] == spk_min]
+            median_turn_dur = float(np.median([t["end"] - t["start"] for t in min_turns])) if min_turns else 0.0
+
+            best_target = None
+            best_c_sim = -1.0
+            best_top_sim = -1.0
+
+            for idx_maj in range(idx_min):
+                cand_maj = get_root_target(ranked_speakers[idx_maj])
+                if cand_maj == spk_min:
+                    continue
+                ov_ratio = _simultaneous_overlap_ratio(cand_maj, spk_min)
+                # If two speakers talk over each other simultaneously for > 22% of the minor speaker's time, keep separate
+                if ov_ratio > 0.22:
+                    continue
+                c_sim, top_sim = _pair_voiceprint_similarity(cand_maj, spk_min)
+                if c_sim > best_c_sim:
+                    best_c_sim = c_sim
+                    best_top_sim = top_sim
+                    best_target = cand_maj
+
+            if best_target is None:
+                # If spk_min had no valid audio feature (e.g. < 0.3s micro-clicks) and total duration < 2.0s, absorb into dominant
+                if spk_min not in speaker_centroids and dur_min < 2.0:
+                    to_merge[spk_min] = get_root_target(dominant)
+                continue
+
+            should_merge = False
+            if uses_neural_emb:
+                # Rule 1: Direct TitaNet-Large 192-D Neural Voiceprint Match (same human speaker across volume/pitch/beat changes)
+                if best_c_sim >= 0.56 or (best_c_sim >= 0.50 and best_top_sim >= 0.62):
+                    should_merge = True
+                # Rule 2: Minor/short cluster (< 3.5s or < 6% of speech) with moderate voiceprint match
+                elif (dur_min < 3.5 or (frac_min < 0.06 and dur_min < 8.0)) and (best_c_sim >= 0.40 or best_top_sim >= 0.48):
+                    should_merge = True
+                # Rule 3: Short fragmented bursts (median turn < 2.5s) in a 2-speaker split with matching voiceprint
+                elif median_turn_dur < 2.5 and best_c_sim >= 0.45 and best_top_sim >= 0.54:
+                    should_merge = True
+            else:
+                # Cepstral fallback thresholds
+                if best_c_sim >= 0.80 or (best_c_sim >= 0.74 and best_top_sim >= 0.82):
+                    should_merge = True
+                elif (dur_min < 3.0 or frac_min < 0.05) and best_c_sim >= 0.65:
+                    should_merge = True
+
+            if should_merge:
+                logger.info(
+                    f"[VOICEPRINT MERGE] Consolidating {spk_min} ({dur_min:.1f}s) -> {best_target} "
+                    f"(centroid_sim={best_c_sim:.3f}, top_turn_sim={best_top_sim:.3f})"
+                )
+                to_merge[spk_min] = best_target
 
         # 5. Apply Merges
         merged_turns = []
@@ -869,7 +1063,7 @@ class SpeakerDiarizer:
                 "speaker": final_spk
             })
 
-        # 6. Micro-Pause Turn Stitching (same speaker with pause <= 0.40s)
+        # 6. Micro-Pause Turn Stitching (same speaker with pause <= 0.55s)
         stitched_turns = []
         for t in merged_turns:
             if not stitched_turns:
@@ -877,7 +1071,7 @@ class SpeakerDiarizer:
             else:
                 last = stitched_turns[-1]
                 gap = t["start"] - last["end"]
-                if last["speaker"] == t["speaker"] and gap <= 0.40:
+                if last["speaker"] == t["speaker"] and gap <= 0.55:
                     last["end"] = max(last["end"], t["end"])
                 else:
                     stitched_turns.append(dict(t))
