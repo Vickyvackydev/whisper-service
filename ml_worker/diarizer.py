@@ -40,6 +40,7 @@ class SpeakerDiarizer:
         self.hf_token = WorkerConfig.HF_TOKEN
         self.device = "cuda" if (torch.cuda.is_available() and WorkerConfig.WHISPER_DEVICE != "cpu") else "cpu"
         self.device_obj = torch.device(self.device)
+        self.last_speaker_centroids: Dict[str, List[float]] = {}
 
     def _load_speaker_embedding_model(self):
         if self.speaker_emb_model is not None:
@@ -1090,6 +1091,14 @@ class SpeakerDiarizer:
         for t in stitched_turns:
             t["speaker"] = remap.get(t["speaker"], t["speaker"])
 
+        # Preserve 192-D NeMo TitaNet speaker voiceprint centroids for recurring speaker recognition
+        remapped_centroids: Dict[str, List[float]] = {}
+        for orig_spk, new_spk in remap.items():
+            if orig_spk in speaker_centroids:
+                vec = speaker_centroids[orig_spk]
+                remapped_centroids[new_spk] = [round(float(x), 5) for x in vec.tolist()]
+        self.last_speaker_centroids = remapped_centroids
+
         logger.info(f"[CONSOLIDATION] {n_speakers} raw speakers → {len(ordered)} consolidated speakers.")
         return stitched_turns
 
@@ -1280,6 +1289,14 @@ class SpeakerDiarizer:
             if w.get("speaker") in chrono_map:
                 w["speaker"] = chrono_map[w["speaker"]]
 
+        # Re-align 192-D TitaNet centroids with chronological speaker IDs (SPEAKER_00, SPEAKER_01...)
+        if getattr(self, "last_speaker_centroids", None):
+            updated_centroids: Dict[str, List[float]] = {}
+            for old_spk, final_spk in chrono_map.items():
+                if old_spk in self.last_speaker_centroids:
+                    updated_centroids[final_spk] = self.last_speaker_centroids[old_spk]
+            self.last_speaker_centroids = updated_centroids
+
         # 8. Reconstruct segments: Group consecutive words by speaker and natural sentence/pause boundaries
         refined_segments = []
         curr_speaker = None
@@ -1330,6 +1347,15 @@ class SpeakerDiarizer:
                 "speaker": curr_speaker,
                 "words": curr_words
             })
+
+        # Attach 192-D NeMo TitaNet voiceprint centroid to the first segment of each speaker
+        centroids = getattr(self, "last_speaker_centroids", {}) or {}
+        emitted_emb_speakers = set()
+        for seg in refined_segments:
+            spk = seg.get("speaker")
+            if spk and spk in centroids and spk not in emitted_emb_speakers:
+                seg["speaker_embedding"] = centroids[spk]
+                emitted_emb_speakers.add(spk)
 
         unique_speakers = len(set(s["speaker"] for s in refined_segments))
         logger.info(f"Assigned {unique_speakers} unique speakers across {len(refined_segments)} refined segments.")
