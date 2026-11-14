@@ -525,7 +525,23 @@ class InferencePipeline:
             r"\b(?:does\s+not|doesn'?t)\s+talk\s+about\b",
             r"\bit\s+identifies\s+the\s+processes\b",
             r"\bgranted\s+as\s+prayed\b",
-            r"\bmotion\s+(?:is\s+)?granted\b"
+            r"\bmotion\s+(?:is\s+)?granted\b",
+            r"\bfile\s+a\s+motion\b",
+            r"\bput\s+it\s+in(?:to)?\s+writing\b",
+            r"\bmake\s+your\s+order\b",
+            r"\b(?:this\s+|the\s+)?(?:suit|matter|case)\s+is\s+adjourned\b",
+            r"\badjourned\s+to\s+the\b",
+            r"\bwe\s+shall\s+go\s+for\s+a\s+short\s+break\b",
+            r"\byou\s+have\s+only\s+\d+\s+minutes\b",
+            r"\bcontinue\s+with\s+the\s+cross[\s-]?examination\b",
+            r"\badmitted\s+and\s+marked\s+as\b",
+            r"\bthe\s+objection\s+is\s+noted\b",
+            r"\bthe\s+question\s+calls\s+for\s+speculation\b",
+            r"\bconfine\s+yourself\s+to\b",
+            r"\byou\s+have\s+asked\s+that\s+question\s+already\b",
+            r"\bavoid\s+repetition\b",
+            r"\bwitness\s+is\s+discharged\b",
+            r"\bphotograph\s+of\s+the\s+bailiff\b"
         ]
         re_judge_authority = [re.compile(p, re.IGNORECASE) for p in JUDGE_AUTHORITY_PATTERNS]
 
@@ -759,18 +775,28 @@ class InferencePipeline:
                 all_counsel_spks = {counsel_spk}
 
             # Identify Primary Judge (The Bench)
-            judge_candidates = [s for s in speaker_judge_votes if speaker_judge_votes[s] > 0 and s != counsel_spk]
+            # Only select a speaker as judge_spk if they have positive judicial authority votes and are not primarily a Counsel speaker
+            judge_candidates = [
+                s for s in speaker_judge_votes
+                if speaker_judge_votes[s] > 0
+                and s != counsel_spk
+                and speaker_judge_votes[s] >= speaker_counsel_votes.get(s, 0)
+            ]
             if judge_candidates:
-                judge_spk = max(judge_candidates, key=lambda s: speaker_judge_votes[s])
-            else:
-                # Score non-counsel speakers: lower honorific density + higher total duration = most likely Judge
-                other_speakers = [s for s in speaker_total_dur if s != counsel_spk and speaker_total_dur[s] >= 1.0]
+                judge_spk = max(judge_candidates, key=lambda s: (speaker_judge_votes[s], -speaker_counsel_votes.get(s, 0)))
+            elif len(speaker_total_dur) == 2:
+                # Strictly 2-speaker recording fallback: the non-counsel speaker with 0 counsel honorifics is the Bench
+                other_speakers = [
+                    s for s in speaker_total_dur
+                    if s != counsel_spk and speaker_total_dur[s] >= 1.0 and speaker_counsel_votes.get(s, 0) == 0
+                ]
                 if other_speakers:
-                    def judge_score(s: str) -> float:
-                        c_votes = speaker_counsel_votes.get(s, 0)
-                        dur = speaker_total_dur.get(s, 1.0)
-                        return dur / (1.0 + (c_votes * 5.0))
-                    judge_spk = max(other_speakers, key=judge_score)
+                    judge_spk = other_speakers[0]
+            else:
+                # Multi-speaker courtroom where the Judge's mic was merged with a Counsel cluster:
+                # use a dedicated virtual cluster for Bench rulings so other speakers (e.g. 2nd Counsel, Witness, Registrar) are never overwritten!
+                if sum(speaker_judge_votes.values()) > 0:
+                    judge_spk = "SPEAKER_COURT"
             if judge_spk in all_counsel_spks and len(all_counsel_spks) > 1:
                 all_counsel_spks.discard(judge_spk)
 
@@ -896,18 +922,21 @@ class InferencePipeline:
                     c_tokens = [_clean_w(w) for w in w_list]
                     split_done = False
 
-                    # Case 1C-1: Split at "Sir?" inside a multi-question Judge segment
-                    # e.g. "prayer? Sir? Can I see the order?"
+                    # Case 1C-1: Split at "Sir?" inside or at the end of a Judge segment
+                    # e.g. "prayer? Sir? Can I see the order?" or "...Can I see the prayer? Sir?"
                     if seg["speaker"] == judge_spk:
-                        for idx_w in range(1, len(c_tokens) - 1):
+                        for idx_w in range(1, len(c_tokens)):
                             if c_tokens[idx_w] == "sir" and _has_term(w_list[idx_w]) and _has_term(w_list[idx_w - 1]):
                                 s1 = dict(seg, words=w_list[:idx_w], speaker=judge_spk)
                                 s2 = dict(seg, words=[w_list[idx_w]], speaker=counsel_spk)
-                                s3 = dict(seg, words=w_list[idx_w + 1:], speaker=judge_spk)
                                 _rebuild_seg(s1)
                                 _rebuild_seg(s2)
-                                _rebuild_seg(s3)
-                                expanded_segments.extend([s1, s2, s3])
+                                if idx_w + 1 < len(w_list):
+                                    s3 = dict(seg, words=w_list[idx_w + 1:], speaker=judge_spk)
+                                    _rebuild_seg(s3)
+                                    expanded_segments.extend([s1, s2, s3])
+                                else:
+                                    expanded_segments.extend([s1, s2])
                                 split_done = True
                                 any_split = True
                                 break
@@ -983,10 +1012,18 @@ class InferencePipeline:
                     break
 
         # Pass 1: Universal Courtroom Rule: The Judge NEVER addresses themselves as "My Lord" or "As the Court pleases"
-        if counsel_spk is not None:
+        RE_REGISTRAR_PROTECT = re.compile(
+            r"\b(?:suit\s+no|charge\s+no|appeal\s+no|petitioner\s+is\s+present|respondent\s+is\s+absent|"
+            r"reminded\s+of\s+(?:his|her)\s+oath|witnesses\s+are\s+ordered\s+out|take\s+the\s+witness\s+stand|"
+            r"do\s+you\s+swear\s+that\s+the\s+evidence|nothing\s+but\s+the\s+truth)\b",
+            re.IGNORECASE,
+        )
+        if counsel_spk is not None and judge_spk is not None and judge_spk != "SPEAKER_COURT":
             for seg in processed_segments:
-                if judge_spk is not None and seg["speaker"] == judge_spk:
+                if seg["speaker"] == judge_spk:
                     txt = seg["text"].lower()
+                    if RE_REGISTRAR_PROTECT.search(txt):
+                        continue
                     if any(p.search(txt) for p in re_counsel_honorifics) and not RE_BENCH_INQUIRY.search(txt):
                         orig_speakers = [w.get("speaker") for w in seg.get("words", []) if w.get("speaker") and w.get("speaker") != judge_spk]
                         if orig_speakers:
@@ -1088,8 +1125,13 @@ class InferencePipeline:
                         )
 
                         trail_has_end_punct = _has_term(trail_words[-1])
+                        trail_is_judge_phrase = (
+                            RE_BENCH_INQUIRY.search(trail_txt)
+                            or RE_JUDGE_DIRECTIVES.search(trail_txt)
+                            or any(p.search(trail_txt) for p in re_judge_authority)
+                        )
                         is_onset_bleed = False
-                        if (has_terminal or ends_formula) and not trail_has_end_punct:
+                        if (has_terminal or ends_formula) and not trail_has_end_punct and not (prev_seg["speaker"] == judge_spk and trail_is_judge_phrase):
                             if ends_formula and prev_seg["speaker"] == counsel_spk and curr_seg["speaker"] == judge_spk:
                                 if len(lead_words) <= 6:
                                     is_onset_bleed = True
@@ -1168,15 +1210,19 @@ class InferencePipeline:
                 txt_clean = seg["text"].lower().strip(".,!?;:\"' ")
 
                 # Case A: Bench Authority & Document Inquiries ("Can I see the prayer?", "Well, choose the one you want.")
-                if RE_BENCH_INQUIRY.search(txt_clean) or any(p.search(txt_clean) for p in re_judge_authority):
+                if (
+                    (RE_BENCH_INQUIRY.search(txt_clean) or any(p.search(txt_clean) for p in re_judge_authority))
+                    and not any(p.search(txt_clean) for p in re_counsel_honorifics)
+                    and not RE_REGISTRAR_PROTECT.search(txt_clean)
+                ):
                     seg["speaker"] = judge_spk
                     continue
 
                 # Case B: Submission Sandwich ("As the Court pleases", "Yes, My Lord")
-                # When Counsel submits to the Bench, the preceding segment was the Judge
-                if i > 0 and (RE_SUBMISSION.search(txt_clean) or txt_clean in {"yes, my lord", "no, my lord", "yes sir", "no sir"}):
+                # When Counsel submits to the Bench in a 2-speaker exchange, the preceding segment was the Judge
+                if i > 0 and len(speaker_total_dur) <= 2 and (RE_SUBMISSION.search(txt_clean) or txt_clean in {"yes, my lord", "no, my lord", "yes sir", "no sir"}):
                     prev_seg = processed_segments[i - 1]
-                    if prev_seg["speaker"] != judge_spk and not any(p.search(prev_seg["text"].lower()) for p in re_counsel_honorifics):
+                    if prev_seg["speaker"] == counsel_spk and not any(p.search(prev_seg["text"].lower()) for p in re_counsel_honorifics) and not RE_REGISTRAR_PROTECT.search(prev_seg["text"]):
                         prev_seg["speaker"] = judge_spk
 
                 # Case C: Clarification Sandwich ("Sir?", "My Lord?", "Pardon?")
