@@ -1032,20 +1032,17 @@ class SpeakerDiarizer:
             if uses_neural_emb:
                 # Calibrated on live RunPod courtroom telemetry:
                 # - Distinct speakers in the same courtroom have centroid_sim ~ 0.45 - 0.68 (e.g. 0.568)
-                # - Identical speaker split across chunks/turns has centroid_sim >= 0.80 (e.g. 0.930)
-                if best_c_sim >= 0.80 and best_top_sim >= 0.72:
+                # - Identical speaker split across chunks/turns has centroid_sim >= 0.88 (e.g. 0.930)
+                if best_c_sim >= 0.88 and best_top_sim >= 0.82:
                     should_merge = True
-                # Minor fragmented cluster (< 4.0s and < 5% of total speech) with strong voiceprint match
-                elif dur_min < 4.0 and frac_min < 0.05 and best_c_sim >= 0.70 and best_top_sim >= 0.68:
-                    should_merge = True
-                # Ultra-short micro-glitch (< 1.2s total across entire recording)
-                elif dur_min < 1.2 and frac_min < 0.02 and best_c_sim >= 0.58:
+                # Ultra-short micro-glitch (< 1.0s total across entire recording)
+                elif dur_min < 1.0 and frac_min < 0.015 and best_c_sim >= 0.72:
                     should_merge = True
             else:
                 # Cepstral fallback thresholds
-                if best_c_sim >= 0.88 and best_top_sim >= 0.82:
+                if best_c_sim >= 0.92 and best_top_sim >= 0.88:
                     should_merge = True
-                elif dur_min < 2.5 and frac_min < 0.04 and best_c_sim >= 0.78:
+                elif dur_min < 1.0 and frac_min < 0.015 and best_c_sim >= 0.82:
                     should_merge = True
 
             if should_merge:
@@ -1066,7 +1063,7 @@ class SpeakerDiarizer:
                 "speaker": final_spk
             })
 
-        # 6. Micro-Pause Turn Stitching (same speaker with pause <= 0.55s)
+        # 6. Micro-Pause Turn Stitching (same speaker with pause <= 0.40s)
         stitched_turns = []
         for t in merged_turns:
             if not stitched_turns:
@@ -1074,7 +1071,7 @@ class SpeakerDiarizer:
             else:
                 last = stitched_turns[-1]
                 gap = t["start"] - last["end"]
-                if last["speaker"] == t["speaker"] and gap <= 0.55:
+                if last["speaker"] == t["speaker"] and gap <= 0.40:
                     last["end"] = max(last["end"], t["end"])
                 else:
                     stitched_turns.append(dict(t))

@@ -111,8 +111,8 @@ class InferencePipeline:
                     pct = 40 + int((current_sec / total_sec) * 35) # 40% to 75%
                     progress_updater("transcribing", min(75, pct))
 
-            # Always enable CTranslate2 DTW word_timestamps=True in Whisper so sliding-window seek pointers
-            # track exact word boundaries and never skip verses, choruses, or courtroom clauses
+            # Skip redundant CTranslate2 DTW word_timestamps pass when WhisperX Wav2Vec2 phoneme alignment will overwrite word timestamps
+            use_whisperx_align = getattr(WorkerConfig, "FORCE_WHISPERX_ALIGNMENT", True)
             with self._whisper_lock:
                 whisper_result = self.transcriber.transcribe(
                     wav_path,
@@ -122,7 +122,7 @@ class InferencePipeline:
                     mode=transcription_mode,
                     progress_callback=transcribe_progress_cb,
                     audio_data=audio_arr,
-                    need_word_timestamps=True
+                    need_word_timestamps=not use_whisperx_align
                 )
 
             segments = whisper_result["segments"]
@@ -131,13 +131,6 @@ class InferencePipeline:
             # 4. Stage 3 & 4: WhisperX Phoneme Forced Alignment + Speaker Diarization Stitching
             align_device = "cuda" if (torch and torch.cuda.is_available() and WorkerConfig.WHISPER_DEVICE != "cpu") else "cpu"
             aligned_result = {"segments": segments}
-
-            # Cache Whisper's native CTranslate2 DTW word timestamps before WhisperX Wav2Vec2 alignment
-            # so if Wav2Vec2 fails to backtrack on any noisy/musical segment, we restore exact DTW word timestamps!
-            orig_dtw_words_by_start = {
-                round(float(s.get("start", 0.0)), 2): [dict(w) for w in s.get("words", [])]
-                for s in segments if s.get("words")
-            }
 
             if segments and len(segments) > 0:
                 lang_code = whisper_result.get("language") or "en"
@@ -169,36 +162,32 @@ class InferencePipeline:
                     aligned_result = {"segments": segments}
 
             # Diarization & Word Midpoint Stitching
-            # Restore Whisper DTW word timestamps (or synthesize proportional fallback) for any segment where
-            # WhisperX Wav2Vec2 alignment logged 'backtrack failed, resorting to original' BEFORE calling
-            # whisperx.assign_word_speakers() so every segment receives full word-level speaker diarization!
+            # Pre-populate proportional word timestamps for any segment where WhisperX Wav2Vec2 alignment logged
+            # 'backtrack failed, resorting to original' BEFORE calling whisperx.assign_word_speakers() so every
+            # fallback segment still receives full word-level speaker diarization!
             align_segs = aligned_result.get("segments", [])
             total_align_segs = len(align_segs)
             failed_align_segs = 0
             for s in align_segs:
                 if not s.get("words"):
                     failed_align_segs += 1
-                    st_key = round(float(s.get("start", 0.0)), 2)
-                    if st_key in orig_dtw_words_by_start and orig_dtw_words_by_start[st_key]:
-                        s["words"] = orig_dtw_words_by_start[st_key]
-                    else:
-                        raw_txt = str(s.get("text", "")).strip()
-                        if raw_txt:
-                            toks = raw_txt.split()
-                            s_start = round(float(s.get("start", 0.0)), 3)
-                            s_end = round(float(s.get("end", s_start + 0.1)), 3)
-                            dur = max(0.1, s_end - s_start)
-                            step = dur / max(1, len(toks))
-                            s["words"] = [
-                                {
-                                    "word": tok,
-                                    "start": round(s_start + idx * step, 3),
-                                    "end": round(s_start + (idx + 1) * step, 3),
-                                    "score": None,
-                                }
-                                for idx, tok in enumerate(toks)
-                            ]
-            logger.info(f"[{job_id}] [DIAGNOSTIC] Alignment status: {total_align_segs - failed_align_segs}/{total_align_segs} segments aligned via Wav2Vec2 ({failed_align_segs} restored from Whisper DTW/fallback).")
+                    raw_txt = str(s.get("text", "")).strip()
+                    if raw_txt:
+                        toks = raw_txt.split()
+                        s_start = round(float(s.get("start", 0.0)), 3)
+                        s_end = round(float(s.get("end", s_start + 0.1)), 3)
+                        dur = max(0.1, s_end - s_start)
+                        step = dur / max(1, len(toks))
+                        s["words"] = [
+                            {
+                                "word": tok,
+                                "start": round(s_start + idx * step, 3),
+                                "end": round(s_start + (idx + 1) * step, 3),
+                                "score": None,
+                            }
+                            for idx, tok in enumerate(toks)
+                        ]
+            logger.info(f"[{job_id}] [DIAGNOSTIC] Alignment status: {total_align_segs - failed_align_segs}/{total_align_segs} segments aligned via Wav2Vec2 ({failed_align_segs} synthesized pre-diarization fallback words).")
 
             logger.info(f"[{job_id}] Diarization check: requested={enable_diarization}, model_loaded={self.diarizer.is_loaded}")
             if self.diarizer.is_loaded and enable_diarization:
@@ -225,46 +214,7 @@ class InferencePipeline:
                             logger.info(f"[{job_id}] [DIAGNOSTIC 1: Raw {self.diarizer.backend.upper()} intervals (first 35s)]:\n{diar_intervals}")
 
                         import whisperx
-                        # First assign only directly overlapping diarization turns (fill_nearest=False)
-                        # so words in micro-pauses are not hijacked by distant background noise turns
-                        stitched = whisperx.assign_word_speakers(diarize_df, aligned_result, fill_nearest=False)
-                        last_seen_spk = None
-                        for s in stitched.get("segments", []):
-                            s_words = s.get("words", [])
-                            assigned_in_seg = [w.get("speaker") for w in s_words if w.get("speaker")]
-                            if assigned_in_seg:
-                                # Fill unassigned words inside this segment from the nearest assigned word in the SAME segment
-                                for idx_w, w in enumerate(s_words):
-                                    if not w.get("speaker"):
-                                        chosen = None
-                                        for dist in range(1, len(s_words) + 1):
-                                            if idx_w - dist >= 0 and s_words[idx_w - dist].get("speaker"):
-                                                chosen = s_words[idx_w - dist]["speaker"]
-                                                break
-                                            if idx_w + dist < len(s_words) and s_words[idx_w + dist].get("speaker"):
-                                                chosen = s_words[idx_w + dist]["speaker"]
-                                                break
-                                        w["speaker"] = chosen or assigned_in_seg[0]
-                                s["speaker"] = max(set(assigned_in_seg), key=assigned_in_seg.count)
-                                last_seen_spk = s["speaker"]
-                            else:
-                                # Entire segment fell in a diarization gap: find nearest diarization interval within 1.5s or inherit previous speaker
-                                s_mid = 0.5 * (float(s.get("start", 0.0)) + float(s.get("end", 0.0)))
-                                best_near_spk = last_seen_spk
-                                best_near_dist = 1.5
-                                if hasattr(diarize_df, "iterrows"):
-                                    for _, drow in diarize_df.iterrows():
-                                        dst = float(drow.get("start", 0.0))
-                                        det = float(drow.get("end", 0.0))
-                                        d_dist = max(0.0, dst - s_mid, s_mid - det)
-                                        if d_dist < best_near_dist:
-                                            best_near_dist = d_dist
-                                            best_near_spk = str(drow.get("speaker", "SPEAKER_00"))
-                                fallback_spk = best_near_spk or "SPEAKER_00"
-                                s["speaker"] = fallback_spk
-                                for w in s_words:
-                                    w["speaker"] = fallback_spk
-                                last_seen_spk = fallback_spk
+                        stitched = whisperx.assign_word_speakers(diarize_df, aligned_result, fill_nearest=True)
 
                         # 2. Dump raw word speakers directly after whisperx.assign_word_speakers
                         raw_early_words = []
@@ -437,7 +387,7 @@ class InferencePipeline:
 
         STANDALONE_AFFIRMATIONS = {"yes", "no", "yeah", "nope", "sure", "correct", "sir", "true"}
 
-        # 2. Smooth acoustic jitter & mid-sentence non-backchannel speaker flickers
+        # 2. Smooth single-word acoustic jitter (< 0.35s)
         changed = True
         while changed and len(runs) > 1:
             changed = False
@@ -448,44 +398,33 @@ class InferencePipeline:
                 r_dur = r["words"][-1]["end"] - r["words"][0]["start"]
                 r_len = len(r["words"])
                 first_w_txt = r["words"][0]["word"].lower().strip(".,!?;:\"' ")
-                has_bc = bool(_find_bc_span(r["words"]))
 
                 # Intentional short response / affirmation
-                is_valid_standalone = has_bc
+                is_valid_standalone = False
                 if r_len == 1 and first_w_txt in STANDALONE_AFFIRMATIONS:
                     is_valid_standalone = True
 
                 # Preceded by a natural pause or closing punctuation
-                ends_prev_clause = False
-                gap_before = 0.0
                 if i > 0:
                     prev_last_w = runs[i-1]["words"][-1]
-                    gap_before = r["words"][0]["start"] - prev_last_w["end"]
-                    ends_prev_clause = any(prev_last_w["word"].endswith(p) for p in (".", "?", "!"))
+                    gap = r["words"][0]["start"] - prev_last_w["end"]
+                    ends_clause = any(prev_last_w["word"].endswith(p) for p in (".", "?", "!"))
+                    if ends_clause or gap >= 0.30:
+                        is_valid_standalone = True
 
-                # Case A: Sandwiched run inside a single Whisper utterance (SPEAKER_A -> SPEAKER_B -> SPEAKER_A)
-                # If not a courtroom backchannel/affirmation and < 1.6s (or <= 4 words without pause/punctuation), absorb into SPEAKER_A
-                if (
-                    i > 0
-                    and i < len(runs) - 1
-                    and runs[i - 1]["speaker"] == runs[i + 1]["speaker"]
-                    and not is_valid_standalone
-                    and (r_dur < 1.6 or (r_len <= 4 and not ends_prev_clause and gap_before < 0.35))
-                ):
-                    prev_spk = runs[i - 1]["speaker"]
-                    for w in r["words"]:
-                        w["speaker"] = prev_spk
-                    if new_runs:
+                # If 1-word island and NOT an intentional standalone, absorb as jitter
+                if r_len == 1 and r_dur < 0.35 and not is_valid_standalone:
+                    if i > 0 and i < len(runs) - 1 and runs[i-1]["speaker"] == runs[i+1]["speaker"]:
+                        # Middle jitter: absorb into surrounding speaker
+                        prev_spk = runs[i-1]["speaker"]
+                        for w in r["words"]:
+                            w["speaker"] = prev_spk
                         new_runs[-1]["words"].extend(r["words"])
-                    else:
-                        runs[i + 1]["words"] = r["words"] + runs[i + 1]["words"]
-                    changed = True
-                    i += 1
-                    continue
-
-                # Case B: Short 1-2 word edge jitter at start or end of a single Whisper utterance
-                if not is_valid_standalone and ((r_len == 1 and r_dur < 0.55) or (r_len <= 2 and r_dur < 0.45 and not ends_prev_clause)):
-                    if i == 0 and len(runs) > 1:
+                        changed = True
+                        i += 1
+                        continue
+                    elif i == 0 and len(runs) > 1:
+                        # Leading jitter
                         next_spk = runs[1]["speaker"]
                         for w in r["words"]:
                             w["speaker"] = next_spk
@@ -494,6 +433,7 @@ class InferencePipeline:
                         i += 1
                         continue
                     elif i == len(runs) - 1 and len(new_runs) > 0:
+                        # Trailing jitter
                         prev_spk = new_runs[-1]["speaker"]
                         for w in r["words"]:
                             w["speaker"] = prev_spk
@@ -1345,10 +1285,10 @@ class InferencePipeline:
                             continue
                         sim_val = float(np.dot(seg_spk_centroids[s_maj], seg_spk_centroids[s_min]))
                         # In courtroom audio, two distinct speakers on the same room mic have sim ~ 0.50-0.68,
-                        # whereas duplicate chunk clusters of the same person have sim >= 0.82.
+                        # whereas duplicate chunk clusters of the same person have sim >= 0.90.
                         # In non-courtroom audio (e.g. solo vocalist music track over beat drops), sim >= 0.50 merges the artist.
                         if is_courtroom_context:
-                            merge_thresh = 0.82 if uses_neural else 0.88
+                            merge_thresh = 0.90 if uses_neural else 0.94
                         else:
                             merge_thresh = 0.50 if uses_neural else 0.76
                         if sim_val >= merge_thresh:
@@ -1429,10 +1369,9 @@ class InferencePipeline:
                 prev_s = stitched_same_spk[-1]
                 gap = seg["start"] - prev_s["end"]
                 prev_ends_term = _has_term(prev_s["words"][-1])
-                combined_w_len = len(prev_s["words"]) + len(seg["words"])
                 if prev_s["speaker"] == seg["speaker"] and (
                     (gap <= 0.85 and not prev_ends_term) or
-                    (gap <= 0.65 and (len(prev_s["words"]) <= 5 or len(seg["words"]) <= 5) and combined_w_len <= 32)
+                    (gap <= 0.45 and (len(prev_s["words"]) <= 4 or len(seg["words"]) <= 4))
                 ):
                     prev_s["words"].extend(seg["words"])
                     _rebuild_seg(prev_s)
@@ -1471,6 +1410,16 @@ class InferencePipeline:
         # STAGE 4: Legal Terminology, Suit Citation & Digit Normalization
         # -------------------------------------------------------------------
         normalized_segments = [normalize_segment(seg) for seg in processed_segments]
+
+        # Attach 192-D NeMo TitaNet voiceprint centroid to the first segment of each speaker
+        if self.diarizer is not None and getattr(self.diarizer, "last_speaker_centroids", None):
+            centroids = self.diarizer.last_speaker_centroids
+            emitted_emb_speakers = set()
+            for seg in normalized_segments:
+                spk = seg.get("speaker")
+                if spk and spk in centroids and spk not in emitted_emb_speakers:
+                    seg["speaker_embedding"] = centroids[spk]
+                    emitted_emb_speakers.add(spk)
 
         unique_speakers = len(set(s["speaker"] for s in normalized_segments))
         logger.info(f"reconstruct_speaker_turns: {unique_speakers} unique speakers, {len(normalized_segments)} segments preserved.")

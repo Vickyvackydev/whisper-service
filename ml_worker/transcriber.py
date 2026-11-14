@@ -124,15 +124,16 @@ class Transcriber:
         if self.model is None:
             self.load_model()
 
-        # Restore e0844ce high-accuracy decoding configuration:
-        # 5-beam search and [0.0, 0.2] fallback temperature for full word recall and segment boundary accuracy.
+        # Configure decoding based on transcription mode.
+        # Avoid multi-step temperature cascade on noisy courtroom silence which causes 6x-30x slowdowns,
+        # while preserving beam search for full word recall and segment boundary accuracy.
         beam_size = 1
         temperature: Any = 0.0
         if mode == "accurate":
-            beam_size = 5
-            temperature = [0.0, 0.2]
-        elif mode == "balanced":
             beam_size = 3
+            temperature = 0.0
+        elif mode == "balanced":
+            beam_size = 2
             temperature = 0.0
 
         lang_arg = language.lower().strip() if (language and language.lower().strip() not in ("auto", "none")) else None
@@ -152,12 +153,13 @@ class Transcriber:
         logger.info(
             f"Running Whisper inference: task={task}, source_language={lang_arg}, "
             f"target_language={target_lang_arg or ('en' if task == 'translate' else lang_arg)}, "
-            f"beam_size={beam_size}, temperature={temperature}, word_timestamps=True"
+            f"beam_size={beam_size}, temperature={temperature}, word_timestamps={need_word_timestamps}"
         )
 
-        # Optimal VAD and decoding parameters from e0844ce for full word recall & preserving courtroom speech
+        # Optimal VAD and decoding parameters for high accuracy & preserving courtroom speech
+        # threshold=0.30 captures quiet remarks ("Yes, My Lord") while filtering out empty courtroom recess hum/paper rustling
         vad_params = dict(
-            threshold=0.20,                # High sensitivity: captures quick remarks, courtroom interjections & vocals
+            threshold=0.30,
             min_speech_duration_ms=100,    # Catch rapid interjections (e.g. 100ms+)
             min_silence_duration_ms=250,   # Isolate rapid micro-pauses between speaker interchanges
             speech_pad_ms=300              # Pad 300ms to preserve leading/trailing word boundaries
@@ -179,26 +181,25 @@ class Transcriber:
         info = None
         audio_input = audio_data if audio_data is not None else str(audio_path)
         est_duration = (len(audio_data) / 16000.0) if (audio_data is not None and hasattr(audio_data, "__len__")) else 0.0
-        # Use standard unbatched model.transcribe with word_timestamps=True for all normal recordings (< 45 mins)
-        # so DTW seek tracking and [0.0, 0.2] temperature fallback preserve 100% of words.
-        use_batched = (self.batched_model is not None) and (est_duration >= 2700.0)
+        use_batched = (self.batched_model is not None) and (est_duration >= 900.0)  # Use GPU batching for 15m - 10h recordings
 
         try:
             if use_batched:
                 logger.info(
                     f"Using BatchedInferencePipeline (batch_size={WorkerConfig.WHISPER_BATCH_SIZE}) "
-                    f"for ultra-long audio ({est_duration / 60.0:.1f} mins)..."
+                    f"for long audio ({est_duration / 60.0:.1f} mins)..."
                 )
                 segments_iter, info = self.batched_model.transcribe(
                     audio_input,
                     language=lang_arg,
                     task=task,
-                    beam_size=3,
+                    beam_size=max(2, beam_size - 1) if est_duration >= 5400.0 else beam_size,
                     temperature=temperature,
-                    word_timestamps=True,
+                    word_timestamps=need_word_timestamps,
                     vad_filter=True,
                     vad_parameters=vad_params,
                     condition_on_previous_text=False,
+                    repetition_penalty=1.15,
                     no_speech_threshold=0.6,
                     compression_ratio_threshold=2.4,
                     initial_prompt=prompt,
@@ -211,10 +212,11 @@ class Transcriber:
                     task=task,
                     beam_size=beam_size,
                     temperature=temperature,
-                    word_timestamps=True,
+                    word_timestamps=need_word_timestamps,
                     vad_filter=True,
                     vad_parameters=vad_params,
                     condition_on_previous_text=False,
+                    repetition_penalty=1.15,
                     no_speech_threshold=0.6,
                     compression_ratio_threshold=2.4,
                     initial_prompt=prompt
@@ -239,12 +241,13 @@ class Transcriber:
                 audio_input,
                 language=lang_arg,
                 task=task,
-                beam_size=3,
+                beam_size=2,
                 temperature=0.0,
-                word_timestamps=True,
+                word_timestamps=need_word_timestamps,
                 vad_filter=True,
                 vad_parameters=vad_params,
                 condition_on_previous_text=False,
+                repetition_penalty=1.15,
                 no_speech_threshold=0.6,
                 compression_ratio_threshold=2.4,
                 initial_prompt=prompt

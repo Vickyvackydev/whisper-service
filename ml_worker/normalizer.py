@@ -483,6 +483,29 @@ def normalize_case_numbers_and_slashes(text: str) -> str:
         lambda m: f"{m.group(1)} {m.group(2).replace('-', '/').upper()}",
         curr
     )
+    # Convert space-separated suit numbers after Suit No. / Charge No. / Case No. / Appeal No.
+    # (e.g. "Suit No. E 57D 2023" -> "Suit No. E/57D/2023", "Charge No. FHC L CR 118 2026" -> "Charge No. FHC/L/CR/118/2026")
+    curr = re.sub(
+        r'(?i)\b(Suit\s+No\.?|Case\s+No\.?|Charge\s+No\.?|Appeal\s+No\.?|Appeals\s+No\.?|Matter\s+No\.?)\s+([A-Za-z]{1,6})\s+([A-Za-z]{1,6})\s+([A-Za-z]{1,6})\s+(\d+[A-Za-z]?)\s+((?:19|20)\d{2})\b',
+        lambda m: f"{m.group(1)} {m.group(2).upper()}/{m.group(3).upper()}/{m.group(4).upper()}/{m.group(5).upper()}/{m.group(6)}",
+        curr
+    )
+    curr = re.sub(
+        r'(?i)\b(Suit\s+No\.?|Case\s+No\.?|Charge\s+No\.?|Appeal\s+No\.?|Appeals\s+No\.?|Matter\s+No\.?)\s+([A-Za-z]{1,6})\s+([A-Za-z]{1,6})\s+(\d+[A-Za-z]?)\s+((?:19|20)\d{2})\b',
+        lambda m: f"{m.group(1)} {m.group(2).upper()}/{m.group(3).upper()}/{m.group(4).upper()}/{m.group(5)}",
+        curr
+    )
+    curr = re.sub(
+        r'(?i)\b(Suit\s+No\.?|Case\s+No\.?|Charge\s+No\.?|Appeal\s+No\.?|Appeals\s+No\.?|Matter\s+No\.?)\s+([A-Za-z]{1,6})\s+(\d+[A-Za-z]?)\s+((?:19|20)\d{2})\b',
+        lambda m: f"{m.group(1)} {m.group(2).upper()}/{m.group(3).upper()}/{m.group(4)}",
+        curr
+    )
+    # Also handle standalone Nigerian court prefix space-separated suit numbers (e.g. "FHC 22A 2024" -> "FHC/22A/2024")
+    curr = re.sub(
+        r'\b(FHC|NICN|CA|SC|FAC|TAS|FCT|LD|ID|IKJ|ABJ|LAG|EN|PH|IB|KD|KN)\s+([A-Za-z]{1,5}\s+)?(\d+[A-Za-z]?)\s+((?:19|20)\d{2})\b',
+        lambda m: f"{m.group(1).upper()}/{m.group(2).strip().upper() + '/' if m.group(2) else ''}{m.group(3).upper()}/{m.group(4)}",
+        curr
+    )
 
     # --------------------------------------------------------------------------
     # 2. Slashes: "The word slash should appear as / (no space before and after)"
